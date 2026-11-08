@@ -81,6 +81,7 @@
         >操作
         <select id="action">
           <option value="repair">触发修复</option>
+          <option value="inspect">快照恢复预检</option>
           <option value="snapshot">导出快照</option>
           <option value="restore">恢复回收条目</option>
           <option value="purge">清理回收条目</option>
@@ -138,7 +139,7 @@
         el("panels").replaceChildren();
         for (const key of [
           "health",
-          "pending_writes",
+
           "targets",
           "policies",
           "trash",
@@ -156,7 +157,6 @@
           heading.textContent =
             {
               health: "副本健康",
-              pending_writes: "写入未确认",
               targets: "存储目标",
               policies: "目录策略",
               trash: "回收站",
@@ -176,6 +176,10 @@
     }
     const forms = {
       repair: [],
+      inspect: [
+        ["path", "快照文件", "/mnt/backup/tier.json"],
+        ["roots", "本地设备目录（可留空，多个用逗号分隔）", "optional"],
+      ],
       archive: [
         ["name", "归档名称", "cloud1"],
         ["url", "WebDAV 地址", "https://nas.example/dav/tier"],
@@ -192,8 +196,10 @@
       backup_schedule: [
         ["directories", "备份目录（逗号分隔）", "/mnt/a/backup,/mnt/b/backup"],
         ["seconds", "触发间隔（秒）", "30"],
-        ["changes", "累计变更数", "100"],
-        ["keep", "每目录保留份数", "20"],
+        ["changes", "累计元数据提交数", "100"],
+        ["keep", "最近保留份数", "20"],
+        ["hourly", "按小时保留的窗口（小时）", "0"],
+        ["daily", "按天保留的窗口（天）", "0"],
       ],
       snapshot: [["path", "快照目的文件", "/mnt/backup/tier.json"]],
       restore: [
@@ -213,6 +219,7 @@
         ["trash_ttl_secs", "回收保留时间（秒）", "604800"],
         ["manual_repair", "手动修复", "checkbox"],
         ["repair_grace_secs", "故障修复宽限期（秒）", "0"],
+        ["fallback_count", "直写确认份数（默认与长期份数相同）", "optional-number"],
         ["direct_fallback", "暂存不足时直接写长期池", "checkbox"],
       ],
       target: [
@@ -233,6 +240,12 @@
         else {
           input.placeholder = hint === "optional" ? "" : hint;
           input.required = hint !== "optional";
+          if (hint === "optional-number") {
+            input.type = "number";
+            input.required = false;
+            input.min = 1;
+            input.placeholder = "";
+          }
           if (/^\d+$/.test(hint)) {
             input.type = "number";
             input.min = 0;
@@ -264,20 +277,22 @@
                 e.name,
                 e.type === "checkbox"
                   ? e.checked
-                  : ["front", "long", "targets", "directories"].includes(e.name)
+                  : ["front", "long", "targets", "directories","roots"].includes(e.name)
                     ? e.value
                         .split(",")
                         .map((x) => x.trim())
                         .filter(Boolean)
                     : e.type === "number"
-                      ? Number(e.value)
+                      ? (e.value === "" ? null : Number(e.value))
                       : e.value,
               ]),
             ),
           }),
         });
         const result = await res.json();
-        el("result").textContent = res.ok ? "操作已完成" : result.error;
+        el("result").textContent = !res.ok ? result.error
+          : el("action").value === "inspect" ? JSON.stringify(result, null, 2)
+          : "操作已完成";
         await refresh();
       } catch (e) {
         el("result").textContent = e.message;

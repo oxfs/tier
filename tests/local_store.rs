@@ -197,5 +197,19 @@ fn confirmation_and_direct_fallback_require_every_requested_copy() -> anyhow::Re
     engine.put("/fallback", b"two")?;
     assert_eq!(engine.get("/fallback")?, b"two");
     assert_eq!(engine.snapshot()?["copies"].as_array().unwrap().len(), 4);
+    fs::rename(tmp.path().join("b"), tmp.path().join("b-offline"))?;
+    engine.set_policy(
+        "/",
+        &Policy {
+            front: vec!["cache".into()],
+            long: vec!["a".into(), "b".into()],
+            long_count: 2,
+            direct_fallback: true,
+            fallback_count: Some(1),
+            ..Policy::default()
+        },
+    )?;
+    engine.put("/one-now", b"durable")?;
+    assert_eq!(engine.snapshot()?["copies"].as_array().unwrap().len(), 5);
     Ok(())
 }

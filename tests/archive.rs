@@ -81,11 +81,18 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
     corrupt.store(false, Ordering::Relaxed);
     engine.archive_tick()?;
     assert!(engine.snapshot()?["copies"].as_array().unwrap().is_empty());
+    let archived = engine.snapshot()?;
+    let report = tier::recovery::preflight(&archived, std::slice::from_ref(&disk))?;
+    assert_eq!(report["verified_remote"].as_array().unwrap().len(), 1);
+    assert_eq!(report["missing"], json!([]));
     drop(engine);
     let reopened = Engine::open(&db)?;
     assert_eq!(reopened.get("/photo")?, b"photo bytes");
     corrupt.store(true, Ordering::Relaxed);
     assert!(reopened.get("/photo").is_err());
+    let report = tier::recovery::preflight(&archived, std::slice::from_ref(&disk))?;
+    assert_eq!(report["missing"], json!(["photo"]));
+    assert_eq!(report["remote_errors"].as_array().unwrap().len(), 1);
     reopened.set_cloud_policy(
         "/",
         &CloudPolicy {
@@ -113,6 +120,45 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
             .is_empty()
     );
     assert_eq!(reopened.get("/photo")?, b"photo bytes");
+    let long = work.path().join("long");
+    fs::create_dir(&long)?;
+    reopened.register_target("long", &long, None, true)?;
+    reopened.set_policy(
+        "/",
+        &serde_json::from_value(
+            json!({"front":["disk"],"front_count":1,"long":["long"],"long_count":1,"delay_secs":0}),
+        )?,
+    )?;
+    reopened.reconcile()?;
+    let snapshot = reopened.snapshot()?;
+    let replica = snapshot["copies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["target"] == "long")
+        .unwrap();
+    fs::write(
+        long.join(replica["object"].as_str().unwrap()),
+        b"wrong bytes",
+    )?;
+    reopened.set_cloud_policy(
+        "/",
+        &CloudPolicy {
+            targets: vec!["remote".into()],
+            copies: 1,
+            delay_secs: 0,
+            retain_local: 1,
+        },
+    )?;
+    reopened.archive_tick()?;
+    assert!(
+        reopened.snapshot()?["copies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["target"] == "disk"),
+        "a corrupt preferred target cannot displace the last healthy local copy"
+    );
     done.store(true, Ordering::Relaxed);
     worker.join().unwrap()?;
     Ok(())

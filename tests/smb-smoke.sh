@@ -57,6 +57,7 @@ lock directory = $tmp/lock
 state directory = $tmp/state
 cache directory = $tmp/cache
 pid directory = $tmp/run
+ncalrpc dir = $tmp/run/ncalrpc
 log file = $tmp/smb.log
 EOF
 sed -e "s|/srv/tier/share|$tmp/mnt|" -e "s/guest ok = no/guest ok = yes/" deploy/samba-share.conf >> "$tmp/smb.conf"

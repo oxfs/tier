@@ -3,6 +3,8 @@ use serde_json::{Value, json};
 use std::{net::SocketAddr, sync::Arc};
 use tiny_http::{Header, Method, Request, Response, Server};
 
+pub static WORKER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub trait Admin: Send + Sync {
     fn state(&self) -> Result<Value>;
     fn execute(&self, action: &str, input: Value) -> Result<Value>;
@@ -106,9 +108,11 @@ impl Admin for std::sync::Mutex<crate::core::Engine> {
             .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
         match action {
             "repair" => {
+                let _work = WORKER
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("worker unavailable"))?;
                 engine.reconcile()?;
                 engine.archive_tick()?;
-                engine.backup_tick()?;
             }
             "restore" => engine.restore(entry()?, string("path")?)?,
             "purge" => engine.purge(entry()?)?,
@@ -131,6 +135,14 @@ impl Admin for std::sync::Mutex<crate::core::Engine> {
                 engine.set_cloud_policy(string("path")?, &serde_json::from_value(input.clone())?)?
             }
             "backup_schedule" => engine.schedule(&serde_json::from_value(input)?)?,
+            "inspect" => {
+                let roots: Vec<std::path::PathBuf> =
+                    serde_json::from_value(input["roots"].clone())?;
+                return crate::recovery::preflight(
+                    &crate::recovery::load(Path::new(string("path")?))?,
+                    &roots,
+                );
+            }
             "snapshot" => {
                 let destination = Path::new(string("path")?);
                 ensure!(destination.is_absolute(), "use an absolute snapshot path");
@@ -203,6 +215,8 @@ mod tests {
         let snapshot = tmp.path().join("metadata.json");
         engine.execute("snapshot", json!({"path":snapshot}))?;
         assert_eq!(recovery::load(&snapshot)?["targets"][0]["name"], "ssd");
+        let report = engine.execute("inspect", json!({"path":snapshot,"roots":[target]}))?;
+        assert!(report["verified"].as_array().unwrap().is_empty());
         Ok(())
     }
 }

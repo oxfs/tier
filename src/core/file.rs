@@ -45,10 +45,11 @@ impl Engine {
          -> Result<Vec<(String, String)>> {
             let mut copies = Vec::new();
             let mut failures = Vec::new();
+            let mut full = false;
             for t in targets {
                 let result = (|| {
                     if let Some(threshold) = watermark {
-                        self.relieve_pressure(t, threshold)?;
+                        self.relieve_pressure(t, threshold, Some(size))?;
                     }
                     self.store(t, &id, data)
                 })();
@@ -59,21 +60,31 @@ impl Engine {
                             return Ok(copies);
                         }
                     }
-                    Err(error) => failures.push(format!("{t}: {error}")),
+                    Err(error) => {
+                        full |= error
+                            .downcast_ref::<io::Error>()
+                            .and_then(io::Error::raw_os_error)
+                            == Some(libc::ENOSPC);
+                        failures.push(format!("{t}: {error:#}"));
+                    }
                 }
             }
             self.discard_objects(&copies);
-            bail!(
+            let message = format!(
                 "only {} of {} confirmation targets available: {}",
                 copies.len(),
                 required,
                 failures.join("; ")
-            )
+            );
+            if full {
+                return Err(io::Error::from_raw_os_error(libc::ENOSPC)).context(message);
+            }
+            bail!(message)
         };
         let mut confirmations = confirmations;
         let copies = match confirmations(&p.front, p.front_count, Some(p.high_water)) {
-            Err(_) if p.direct_fallback && p.long_count > 0 => {
-                confirmations(&p.long, p.long_count, None)?
+            Err(_) if p.direct_fallback => {
+                confirmations(&p.long, p.fallback_count.unwrap_or(p.long_count), None)?
             }
             result => result?,
         };
@@ -88,7 +99,10 @@ impl Engine {
                 current.as_ref().map(|n| n.id.as_str()) == was_present.then_some(id.as_str()),
                 "path changed during write"
             );
-            tx.execute("INSERT INTO nodes(id,parent,name,dir,size,hash,mtime) VALUES(?,?,?,0,?,?,?) ON CONFLICT(id) DO UPDATE SET size=excluded.size,hash=excluded.hash,mtime=excluded.mtime,display_mtime=NULL",params![id,parent.id,name,size,hash,now()?])?;
+            let sql = "INSERT INTO nodes(id, parent, name, dir, size, hash, mtime)
+                VALUES(?, ?, ?, 0, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET size=excluded.size, hash=excluded.hash, mtime=excluded.mtime, display_mtime=NULL";
+            tx.execute(sql, params![id, parent.id, name, size, hash, now()?])?;
             for (t, key) in &copies {
                 tx.execute(
                     "INSERT OR REPLACE INTO copies VALUES(?,?,?,?)",

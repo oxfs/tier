@@ -38,7 +38,19 @@ pub struct CloudPolicy {
 }
 
 fn policy(db: &Connection, id: &str) -> Result<Option<CloudPolicy>> {
-    let settings: Option<String> = db.query_row("WITH RECURSIVE a(id,parent,depth) AS (SELECT id,parent,0 FROM nodes WHERE id=? UNION ALL SELECT n.id,n.parent,a.depth+1 FROM nodes n JOIN a ON n.id=a.parent) SELECT settings FROM cloud_policy JOIN a ON a.id=node ORDER BY depth LIMIT 1",[id],|r|r.get(0)).optional()?;
+    let sql = "WITH RECURSIVE a(id, parent, depth) AS (
+        SELECT id, parent, 0
+        FROM nodes
+        WHERE id=?
+        UNION ALL
+        SELECT n.id, n.parent, a.depth+1
+        FROM nodes n
+        JOIN a ON n.id=a.parent)
+        SELECT settings
+        FROM cloud_policy
+        JOIN a ON a.id=node
+        ORDER BY depth LIMIT 1";
+    let settings: Option<String> = db.query_row(sql, [id], |r| r.get(0)).optional()?;
     Ok(settings.map(|s| serde_json::from_str(&s)).transpose()?)
 }
 
@@ -48,6 +60,13 @@ fn client(db: &Connection, target: &str) -> Result<Archive> {
         [target],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
+    configured_client(&url, user.as_deref(), pass.as_deref())
+}
+pub(crate) fn configured_client(
+    url: &str,
+    user: Option<&str>,
+    pass: Option<&str>,
+) -> Result<Archive> {
     let credentials = user
         .zip(pass)
         .map(|(u, p)| {
@@ -58,21 +77,38 @@ fn client(db: &Connection, target: &str) -> Result<Archive> {
         })
         .transpose()?;
     Archive::new(
-        &url,
+        url,
         credentials.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
     )
 }
 
 fn copies(db: &Connection, id: &str) -> Result<Vec<(String, String, String)>> {
-    Ok(db.prepare("SELECT target,key,c.hash FROM cloud_copies c JOIN nodes n ON n.id=c.node AND n.hash=c.hash WHERE node=?")?.query_map([id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<_>>()?)
+    let sql = "SELECT target, key, c.hash
+        FROM cloud_copies c
+        JOIN nodes n ON n.id=c.node AND n.hash=c.hash
+        WHERE node=?";
+    Ok(db
+        .prepare(sql)?
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 pub fn recall_to(db: &Connection, id: &str, out: &mut fs::File) -> Result<()> {
     let mut errors = Vec::new();
     for (target, key, hash) in copies(db, id)? {
         out.set_len(0)?;
+        let size: i64 = db.query_row("SELECT size FROM nodes WHERE id=?", [id], |r| r.get(0))?;
+        ensure!(size >= 0, "invalid file size");
+        if size > 0 {
+            use std::os::fd::AsRawFd;
+            let error = unsafe { libc::posix_fallocate(out.as_raw_fd(), 0, size) };
+            if error != 0 {
+                return Err(std::io::Error::from_raw_os_error(error))
+                    .context("reserving space before archive recall");
+            }
+        }
         out.rewind()?;
-        match client(db, &target).and_then(|a| a.read_to(&key, &hash, out)) {
+        match client(db, &target).and_then(|a| a.read_to(&key, &hash, size as u64, out)) {
             Ok(()) => {
                 out.rewind()?;
                 return Ok(());
@@ -92,7 +128,7 @@ pub fn retained(db: &Connection, id: &str, default: usize) -> Result<usize> {
         .filter(|(t, _, _)| p.targets.contains(t))
         .count();
     Ok(if p.copies > 0 && count >= p.copies {
-        p.retain_local.min(default)
+        p.retain_local
     } else {
         default
     })
@@ -136,7 +172,26 @@ impl Engine {
         Ok(())
     }
     pub fn archive_tick(&self) -> Result<()> {
-        let rows=self.db.prepare("WITH RECURSIVE live(id) AS (VALUES('root') UNION ALL SELECT n.id FROM nodes n JOIN live ON n.parent=live.id) SELECT id,hash,mtime FROM nodes JOIN live USING(id) WHERE dir=0")?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u64>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let sql = "WITH RECURSIVE live(id) AS (VALUES('root')
+            UNION ALL
+            SELECT n.id
+            FROM nodes n
+            JOIN live ON n.parent=live.id)
+            SELECT id, hash, mtime
+            FROM nodes
+            JOIN live USING(id)
+            WHERE dir=0";
+        let rows = self
+            .db
+            .prepare(sql)?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, u64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let mut errors = Vec::new();
         for (id, h, mtime) in rows {
@@ -266,7 +321,7 @@ impl Engine {
         let local_policy = self.policy(id)?;
         let mut readable: Vec<_> = locals
             .into_iter()
-            .filter(|(t, k)| self.target(t).is_ok_and(|root| root.join(k).is_file()))
+            .filter(|(t, k)| self.verified_copy(t, k, h))
             .collect();
         readable.sort_by_key(|(target, _)| !local_policy.long.contains(target));
         let selected: Vec<_> = current
@@ -279,8 +334,11 @@ impl Engine {
             return Ok(());
         }
         // Verify the currently selected remote objects immediately before eviction.
+        let size: u64 = self
+            .db
+            .query_row("SELECT size FROM nodes WHERE id=?", [id], |r| r.get(0))?;
         for (t, key, hash) in &selected {
-            client(&self.db, t)?.read_to(key, hash, &mut io::sink())?;
+            client(&self.db, t)?.read_to(key, hash, size, &mut io::sink())?;
         }
         let tx = self.db.unchecked_transaction()?;
         let latest: String =

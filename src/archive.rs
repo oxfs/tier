@@ -52,23 +52,30 @@ impl Archive {
     pub fn upload(&self, file: &mut File, digest: &str) -> Result<String> {
         let key = Uuid::new_v4().to_string();
         file.rewind()?;
+        let size = file.metadata()?.len();
         let response = self
             .request("PUT", &key)?
-            .set("Content-Length", &file.metadata()?.len().to_string())
+            .set("Content-Length", &size.to_string())
             .send(file)?;
         ensure!(
             (200..300).contains(&response.status()),
             "PUT returned {}",
             response.status()
         );
-        if let Err(error) = self.read_to(&key, digest, &mut io::sink()) {
+        if let Err(error) = self.read_to(&key, digest, size, &mut io::sink()) {
             let _ = self.remove(&key);
             return Err(error.context("verifying archived object"));
         }
         Ok(key)
     }
 
-    pub fn read_to(&self, key: &str, digest: &str, output: &mut impl Write) -> Result<()> {
+    pub fn read_to(
+        &self,
+        key: &str,
+        digest: &str,
+        size: u64,
+        output: &mut impl Write,
+    ) -> Result<()> {
         let response = self.request("GET", key)?.call()?;
         ensure!(
             response.status() == 200,
@@ -78,14 +85,18 @@ impl Archive {
         let mut input = response.into_reader();
         let mut buffer = vec![0; 128 * 1024];
         let mut hash = Sha256::new();
+        let mut received = 0_u64;
         loop {
             let n = input.read(&mut buffer).context("reading WebDAV object")?;
             if n == 0 {
                 break;
             }
+            received += n as u64;
+            ensure!(received <= size, "archive exceeds expected size");
             hash.update(&buffer[..n]);
             output.write_all(&buffer[..n])?;
         }
+        ensure!(received == size, "archive length mismatch");
         ensure!(
             format!("{:x}", hash.finalize()) == digest,
             "archive checksum mismatch"

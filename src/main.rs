@@ -67,7 +67,6 @@ enum Action {
     /// Check or extract snapshot objects from the supplied read-only target roots.
     Inspect {
         snapshot: PathBuf,
-        #[arg(required = true)]
         targets: Vec<PathBuf>,
         #[arg(long)]
         extract: Option<PathBuf>,
@@ -77,6 +76,9 @@ enum Action {
         snapshot: PathBuf,
         #[arg(long = "target")]
         targets: Vec<String>,
+        /// Accept the reported offline, damaged, missing or unclaimed data.
+        #[arg(long)]
+        allow_degraded: bool,
     },
     Status,
     Mkdir {
@@ -92,17 +94,34 @@ fn main() -> Result<()> {
         extract,
     } = &cli.action
     {
-        let report = recovery::inspect(&recovery::load(snapshot)?, targets, extract.as_deref())?;
+        let data = recovery::load(snapshot)?;
+        let report = match extract {
+            Some(out) => {
+                ensure!(
+                    !targets.is_empty(),
+                    "extraction requires a local storage target"
+                );
+                recovery::inspect(&data, targets, Some(out))?
+            }
+            None => recovery::preflight(&data, targets)?,
+        };
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
-    if let Action::Import { snapshot, targets } = &cli.action {
+    if let Action::Import {
+        snapshot,
+        targets,
+        allow_degraded,
+    } = &cli.action
+    {
         let mut map = BTreeMap::new();
         for mapping in targets {
             let (name, path) = mapping.split_once('=').context("use NAME=PATH")?;
             map.insert(name.to_owned(), path.into());
         }
-        return recovery::import(&recovery::load(snapshot)?, &cli.db, &map);
+        let report = recovery::import(&recovery::load(snapshot)?, &cli.db, &map, *allow_degraded)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
     }
     let mut lock_name = cli.db.as_os_str().to_owned();
     lock_name.push(".lock");
@@ -158,18 +177,21 @@ fn serve(engine: Engine, db: &Path, path: &Path, addr: SocketAddr) -> Result<()>
     eprintln!("Tier administration: http://{address}");
     thread::spawn(move || {
         loop {
-            if let Err(e) = background.automatic_reconcile() {
-                eprintln!("storage: {e:#}")
-            }
-            if let Err(e) = background.archive_tick() {
-                eprintln!("archive: {e:#}")
+            {
+                let _worker = admin::WORKER.lock().expect("repair worker panicked");
+                if let Err(e) = background.automatic_reconcile() {
+                    eprintln!("storage: {e:#}")
+                }
+                if let Err(e) = background.archive_tick() {
+                    eprintln!("archive: {e:#}")
+                }
             }
             thread::sleep(Duration::from_secs(2));
         }
     });
     thread::spawn(move || {
         loop {
-            if let Err(e) = snapshots.backup_tick() {
+            if let Err(e) = snapshots.schedule_backups() {
                 eprintln!("snapshot: {e:#}")
             }
             thread::sleep(Duration::from_secs(1));

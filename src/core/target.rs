@@ -107,6 +107,12 @@ impl Engine {
             p.low_water < p.high_water && p.high_water <= 100,
             "invalid watermarks"
         );
+        if p.direct_fallback {
+            ensure!(
+                (1..=p.long.len()).contains(&p.fallback_count.unwrap_or(p.long_count)),
+                "invalid direct fallback count"
+            );
+        }
         ensure!(p.front_count > 0, "empty confirmation set");
         self.db.execute(
             "INSERT OR REPLACE INTO policies VALUES(?,?)",
@@ -142,14 +148,27 @@ impl Engine {
             .create_new(true)
             .write(true)
             .open(root.join(&key))?;
-        data.rewind()?;
-        if let Err(error) = io::copy(data, &mut f) {
+        let write = (|| -> Result<()> {
+            let len = data.seek(io::SeekFrom::End(0))?;
+            data.rewind()?;
+            if len > 0 {
+                // Reserve actual blocks on the verified target before copying bytes.
+                let result =
+                    unsafe { libc::posix_fallocate(f.as_raw_fd(), 0, i64::try_from(len)?) };
+                if result != 0 {
+                    return Err(io::Error::from_raw_os_error(result).into());
+                }
+            }
+            ensure!(io::copy(data, &mut f)? == len, "source length changed");
+            f.sync_all()?;
+            for d in [&dir, &root.join("objects"), &root] {
+                fs::File::open(d)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = write {
             let _ = fs::remove_file(root.join(&key));
-            return Err(error.into());
-        }
-        f.sync_all()?;
-        for d in [&dir, &root.join("objects"), &root] {
-            fs::File::open(d)?.sync_all()?;
+            return Err(error);
         }
         Ok(key)
     }
@@ -158,7 +177,12 @@ impl Engine {
             .and_then(|r| Ok(fingerprint(&mut fs::File::open(r.join(key))?)?.1 == expected))
             .unwrap_or(false)
     }
-    pub(super) fn relieve_pressure(&self, name: &str, threshold: u8) -> Result<()> {
+    pub(super) fn relieve_pressure(
+        &self,
+        name: &str,
+        threshold: u8,
+        incoming: Option<u64>,
+    ) -> Result<()> {
         use std::os::unix::ffi::OsStrExt;
         let root = self.target(name)?;
         let cpath = std::ffi::CString::new(root.as_os_str().as_bytes())?;
@@ -169,14 +193,57 @@ impl Engine {
                 return Err(std::io::Error::last_os_error().into());
             }
             let stat = unsafe { stat.assume_init() };
-            Ok(100 - stat.f_bavail.saturating_mul(100) / stat.f_blocks.max(1))
+            let required_blocks = incoming.unwrap_or(0).div_ceil(stat.f_frsize.max(1));
+            Ok(100
+                - stat
+                    .f_bavail
+                    .saturating_sub(required_blocks)
+                    .saturating_mul(100)
+                    / stat.f_blocks.max(1))
         };
         if utilization()? < threshold as u64 {
             return Ok(());
         }
-        let keys=self.db.prepare("SELECT c.node,c.object FROM copies c JOIN nodes n ON n.id=c.node WHERE c.target=? ORDER BY n.mtime")?.query_map([name],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        // Cursor is local to this connection. Each attempt inspects a bounded window.
+        self.db.execute_batch("CREATE TEMP TABLE IF NOT EXISTS reclaim_cursor(target TEXT PRIMARY KEY,node TEXT NOT NULL)")?;
+        let cursor: String = self
+            .db
+            .query_row(
+                "SELECT node FROM reclaim_cursor WHERE target=?",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let limit = if incoming.is_some() { 8 } else { 32 };
+        let keys = self
+            .db
+            .prepare(
+                "SELECT node,object FROM copies WHERE target=? AND node>? ORDER BY node LIMIT ?",
+            )?
+            .query_map(params![name, cursor, limit], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let next = if keys.len() == limit {
+            keys.last().map(|(id, _)| id.as_str()).unwrap_or("")
+        } else {
+            ""
+        };
+        self.db.execute(
+            "INSERT OR REPLACE INTO reclaim_cursor VALUES(?,?)",
+            params![name, next],
+        )?;
         for (id, key) in keys {
             let tx = self.db.unchecked_transaction()?;
+            let pending: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pending_writes WHERE node=?)",
+                [&id],
+                |r| r.get(0),
+            )?;
+            if pending {
+                continue;
+            }
             let Ok(p) = self.policy(&id) else { continue };
             if p.long.iter().any(|v| v == name) || p.long_count == 0 {
                 continue;
@@ -185,9 +252,18 @@ impl Engine {
                 tx.query_row("SELECT hash FROM nodes WHERE id=?", [&id], |r| r.get(0))?;
             let mut available = 0;
             for target in &p.long {
-                let other:Option<String>=tx.query_row("SELECT object FROM copies c JOIN nodes n ON c.node=n.id WHERE node=? AND target=? AND c.hash=n.hash",params![id,target],|r|r.get(0)).optional()?;
-                if other.is_some_and(|k| self.matches_copy(target, &k, &hash)) {
-                    available += 1
+                let sql = "SELECT object
+                    FROM copies c
+                    JOIN nodes n ON c.node=n.id
+                    WHERE node=? AND target=? AND c.hash=n.hash";
+                let other: Option<String> = tx
+                    .query_row(sql, params![id, target], |r| r.get(0))
+                    .optional()?;
+                if other.is_some_and(|k| self.cached_verified(target, &k, &hash)) {
+                    available += 1;
+                    if available >= p.long_count {
+                        break;
+                    }
                 }
             }
             if available < p.long_count {
@@ -200,11 +276,14 @@ impl Engine {
             {
                 tx.commit()?;
                 fs::remove_file(root.join(key))?;
+                if incoming.is_none() {
+                    return Ok(());
+                }
             }
             if utilization()? < threshold as u64 {
                 return Ok(());
             }
         }
-        bail!("target above watermark")
+        Err(io::Error::from_raw_os_error(libc::ENOSPC)).context("target above watermark")
     }
 }

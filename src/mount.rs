@@ -15,6 +15,12 @@ const TTL: Duration = Duration::from_secs(0);
 fn errno(error: std::io::Error) -> i32 {
     error.raw_os_error().unwrap_or(EIO)
 }
+fn storage_errno(error: anyhow::Error) -> i32 {
+    error
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        .unwrap_or(EIO)
+}
 struct Handle {
     ino: u64,
     data: File,
@@ -23,6 +29,7 @@ struct Handle {
     append: bool,
     synchronous: bool,
     error: Option<i32>,
+    writer: Option<crate::core::Writer>,
 }
 struct Fs {
     engine: Arc<Mutex<Engine>>,
@@ -99,7 +106,7 @@ impl Fs {
         if write && self.handles.values().any(|h| h.ino == ino && h.writable) {
             return Err(EBUSY);
         }
-        if write {
+        let writer = if write {
             let engine = self.engine.lock().map_err(|_| EIO)?;
             let node = engine
                 .stat(self.paths.get(&ino).ok_or(ENOENT)?)
@@ -115,7 +122,10 @@ impl Fs {
             if pending {
                 return Err(EIO);
             }
-        }
+            Some(crate::core::Writer::new(node.id))
+        } else {
+            None
+        };
         let truncate = write && flags & libc::O_TRUNC != 0;
         let path = self.paths.get(&ino).ok_or(ENOENT)?;
         let data = if let Some(handle) = self.handles.values().find(|handle| handle.ino == ino) {
@@ -127,7 +137,7 @@ impl Fs {
                     .lock()
                     .map_err(|_| EIO)?
                     .copy_to(path, &mut file)
-                    .map_err(|_| EIO)?;
+                    .map_err(storage_errno)?;
             }
             file
         };
@@ -148,6 +158,7 @@ impl Fs {
                 writable: write,
                 dirty: truncate,
                 error: None,
+                writer,
                 append: flags & libc::O_APPEND != 0,
                 synchronous: flags & (libc::O_SYNC | libc::O_DSYNC) != 0,
             },
@@ -165,7 +176,12 @@ impl Fs {
                     .lock()
                     .map_err(|_| EIO)?
                     .put_from(path, &mut h.data)
-                    .map_err(|_| EIO)?;
+                    .map_err(|error| {
+                        let code = storage_errno(error);
+                        h.writer.take();
+                        h.error = Some(code);
+                        code
+                    })?;
             }
             h.dirty = false;
         }
@@ -312,7 +328,11 @@ impl Filesystem for Fs {
             if self.attr(&p).is_ok() {
                 return Err(EEXIST);
             }
-            self.engine.lock().unwrap().put(&p, &[]).map_err(|_| EIO)?;
+            self.engine
+                .lock()
+                .unwrap()
+                .put(&p, &[])
+                .map_err(storage_errno)?;
             let a = self.attr(&p)?;
             let fh = self.open_file(a.ino, flags)?;
             Ok((a, fh))
@@ -397,6 +417,7 @@ impl Filesystem for Fs {
         }
         if let Err(e) = h.data.write_all_at(data, start) {
             let error = errno(e);
+            h.writer.take();
             h.error = Some(error);
             return r.error(error);
         }
@@ -519,10 +540,10 @@ impl Filesystem for Fs {
                 } else {
                     let engine = self.engine.lock().unwrap();
                     let mut data = tempfile::tempfile().map_err(errno)?;
-                    engine.copy_to(&p, &mut data).map_err(|_| EIO)?;
+                    engine.copy_to(&p, &mut data).map_err(storage_errno)?;
                     engine.begin_write(&p).map_err(|_| EIO)?;
                     data.set_len(size).map_err(errno)?;
-                    engine.put_from(&p, &mut data).map_err(|_| EIO)?
+                    engine.put_from(&p, &mut data).map_err(storage_errno)?
                 }
             }
             if let Some(value) = mtime {

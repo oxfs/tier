@@ -1,6 +1,6 @@
 [package]
 name = "tier"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Policy-driven storage for home Samba shares"
 
@@ -10,7 +10,7 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 fuser = { version = "0.14", default-features = false }
 libc = "0.2"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

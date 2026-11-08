@@ -46,9 +46,10 @@ fn restore_namespace_from_snapshot_with_a_single_surviving_disk() -> Result<()> 
         &data,
         &recovered,
         &BTreeMap::from([("disk-a".into(), moved)]),
+        true,
     )?;
     assert_eq!(Engine::open(&recovered)?.get("/albums/image")?, b"new");
-    assert!(recovery::import(&data, &recovered, &BTreeMap::new()).is_err());
+    assert!(recovery::import(&data, &recovered, &BTreeMap::new(), false).is_err());
     Ok(())
 }
 
@@ -67,6 +68,8 @@ fn snapshots_continue_when_one_destination_is_offline() -> Result<()> {
         seconds: 30,
         changes: 1,
         keep: 1,
+        hourly: 0,
+        daily: 0,
     })?;
     engine.backup_tick()?;
     let latest = |dir: &Path| -> Result<Vec<_>> {

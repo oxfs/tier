@@ -60,7 +60,16 @@ impl Engine {
         let (p, name) = split(to)?;
         let p = self.stat(p)?;
         ensure!(p.is_dir, "not a directory");
-        let cycle:bool=self.db.query_row("WITH RECURSIVE tree(id) AS (VALUES(?) UNION ALL SELECT n.id FROM nodes n JOIN tree ON n.parent=tree.id) SELECT EXISTS(SELECT 1 FROM tree WHERE id=?)",params![n.id,p.id],|r|r.get(0))?;
+        let sql = "WITH RECURSIVE tree(id) AS (VALUES(?)
+            UNION ALL
+            SELECT n.id
+            FROM nodes n
+            JOIN tree ON n.parent=tree.id)
+            SELECT EXISTS(
+            SELECT 1
+            FROM tree
+            WHERE id=?)";
+        let cycle: bool = self.db.query_row(sql, params![n.id, p.id], |r| r.get(0))?;
         ensure!(!cycle, "directory cycle");
         let tx = self.db.unchecked_transaction()?;
         if let Ok(dst) = self.stat(to)

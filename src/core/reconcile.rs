@@ -7,7 +7,17 @@ impl Engine {
         self.run_reconcile(false)
     }
     fn drain_garbage(&self) -> Result<()> {
-        let rows=self.db.prepare("SELECT target,object FROM garbage WHERE NOT EXISTS(SELECT 1 FROM copies WHERE copies.target=garbage.target AND copies.object=garbage.object)")?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let sql = "SELECT target, object
+            FROM garbage
+            WHERE NOT EXISTS(
+            SELECT 1
+            FROM copies
+            WHERE copies.target=garbage.target AND copies.object=garbage.object)";
+        let rows = self
+            .db
+            .prepare(sql)?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         for (target, key) in rows {
             if let Ok(root) = self.target(&target) {
                 match fs::remove_file(root.join(&key)) {
@@ -33,7 +43,20 @@ impl Engine {
         for id in expired {
             self.purge(id)?;
         }
-        let mut nodes=self.db.prepare("WITH RECURSIVE live(id) AS (VALUES('root') UNION ALL SELECT n.id FROM nodes n JOIN live ON n.parent=live.id) SELECT id,mtime,hash FROM nodes JOIN live USING(id) WHERE dir=0 AND NOT EXISTS(SELECT 1 FROM pending_writes w WHERE w.node=nodes.id)")?;
+        let sql = "WITH RECURSIVE live(id) AS (VALUES('root')
+            UNION ALL
+            SELECT n.id
+            FROM nodes n
+            JOIN live ON n.parent=live.id)
+            SELECT id, mtime, hash
+            FROM nodes
+            JOIN live USING(id)
+            WHERE dir=0
+            AND NOT EXISTS(
+            SELECT 1
+            FROM pending_writes w
+            WHERE w.node=nodes.id)";
+        let mut nodes = self.db.prepare(sql)?;
         let mut errors = vec![];
         let pending = nodes
             .query_map([], |r| {
@@ -45,6 +68,7 @@ impl Engine {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(nodes);
+        let mut cache_pools = std::collections::BTreeMap::<String, u8>::new();
         for (id, mtime, h) in pending {
             let p = self.policy(&id)?;
             let (targets, count, placement) = placement(&p, &id, &h)?;
@@ -79,7 +103,7 @@ impl Engine {
                     && (if manual {
                         self.matches_copy(t, &key, &h)
                     } else {
-                        self.target(t).is_ok_and(|root| root.join(key).is_file())
+                        self.verified_copy(t, &key, &h)
                     })
                 {
                     chosen.insert(t.clone());
@@ -106,7 +130,23 @@ impl Engine {
                     let tx = self.db.unchecked_transaction()?;
                     let current: String =
                         tx.query_row("SELECT hash FROM nodes WHERE id=?", [&id], |r| r.get(0))?;
-                    let eligible:bool=tx.query_row("WITH RECURSIVE ancestors(id,parent) AS (SELECT id,parent FROM nodes WHERE id=? UNION ALL SELECT n.id,n.parent FROM nodes n JOIN ancestors a ON n.id=a.parent) SELECT EXISTS(SELECT 1 FROM ancestors WHERE id='root') AND NOT EXISTS(SELECT 1 FROM pending_writes WHERE node=?)",params![id,id],|r|r.get(0))?;
+                    let sql = "WITH RECURSIVE ancestors(id, parent) AS (
+                        SELECT id, parent
+                        FROM nodes
+                        WHERE id=?
+                        UNION ALL
+                        SELECT n.id, n.parent
+                        FROM nodes n
+                        JOIN ancestors a ON n.id=a.parent)
+                        SELECT EXISTS(
+                        SELECT 1
+                        FROM ancestors
+                        WHERE id='root')
+                        AND NOT EXISTS(
+                        SELECT 1
+                        FROM pending_writes
+                        WHERE node=?)";
+                    let eligible: bool = tx.query_row(sql, params![id, id], |r| r.get(0))?;
                     if eligible && current == h && self.policy(&id)?.desired().0.contains(t) {
                         let previous: Option<String> = tx
                             .query_row(
@@ -129,6 +169,7 @@ impl Engine {
                         good += 1;
                     } else if let Ok(root) = self.target(t) {
                         let _ = fs::remove_file(root.join(key));
+                        super::report::cancelled(&id)?;
                     }
                 }
             }
@@ -143,9 +184,15 @@ impl Engine {
                     self.trim_obsolete(&id, &h, &p, &chosen)?;
                 }
                 for t in &p.front {
-                    let _ = self.relieve_pressure(t, p.low_water);
+                    cache_pools
+                        .entry(t.clone())
+                        .and_modify(|low| *low = (*low).min(p.low_water))
+                        .or_insert(p.low_water);
                 }
             }
+        }
+        for (target, low) in cache_pools {
+            let _ = self.relieve_pressure(&target, low, None);
         }
         if !errors.is_empty() {
             return Err(anyhow!("under-replicated: {}", errors.join(", ")));
@@ -164,7 +211,14 @@ impl Engine {
         if chosen.is_empty() || &policy != expected {
             return Ok(());
         }
-        let confirmed:bool=tx.query_row("SELECT hash=? AND NOT EXISTS(SELECT 1 FROM pending_writes WHERE node=?) FROM nodes WHERE id=?",params![hash,id,id],|r|r.get(0))?;
+        let sql = "SELECT hash=?
+            AND NOT EXISTS(
+            SELECT 1
+            FROM pending_writes
+            WHERE node=?)
+            FROM nodes
+            WHERE id=?";
+        let confirmed: bool = tx.query_row(sql, params![hash, id, id], |r| r.get(0))?;
         if !confirmed {
             return Ok(());
         }

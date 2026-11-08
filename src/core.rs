@@ -2,6 +2,7 @@ mod catalog;
 mod file;
 mod reconcile;
 mod report;
+pub(crate) use report::Writer;
 mod target;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -25,6 +26,8 @@ pub struct Policy {
     pub delay_secs: u64,
     #[serde(default)]
     pub direct_fallback: bool,
+    #[serde(default)]
+    pub fallback_count: Option<usize>,
     #[serde(default)]
     pub manual_repair: bool,
     #[serde(default)]
@@ -54,6 +57,7 @@ impl Default for Policy {
             long_count: 0,
             delay_secs: 0,
             direct_fallback: false,
+            fallback_count: None,
             manual_repair: false,
             repair_grace_secs: 0,
             low_water: default_low(),
@@ -108,6 +112,7 @@ fn rank(names: &mut [String], id: &str) {
 impl Engine {
     pub fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path)?;
+        crate::backup::configure(&db)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA recursive_triggers=ON; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;
       CREATE TABLE IF NOT EXISTS nodes(id TEXT PRIMARY KEY,parent TEXT REFERENCES nodes(id),name TEXT COLLATE NOCASE NOT NULL,dir INTEGER NOT NULL,size INTEGER NOT NULL DEFAULT 0,hash TEXT,mtime INTEGER NOT NULL DEFAULT 0,display_mtime INTEGER,UNIQUE(parent,name));
       INSERT OR IGNORE INTO nodes(id,name,dir) VALUES('root','',1);
@@ -116,6 +121,7 @@ impl Engine {
       CREATE TABLE IF NOT EXISTS garbage(target TEXT NOT NULL,object TEXT NOT NULL,PRIMARY KEY(target,object));
       CREATE TRIGGER IF NOT EXISTS retire_deleted AFTER DELETE ON copies BEGIN INSERT OR IGNORE INTO garbage VALUES(old.target,old.object); END;
       CREATE TRIGGER IF NOT EXISTS retire_updated AFTER UPDATE OF object ON copies WHEN old.object!=new.object BEGIN INSERT OR IGNORE INTO garbage VALUES(old.target,old.object); END;
+      CREATE INDEX IF NOT EXISTS copies_by_target ON copies(target,node);
       CREATE TABLE IF NOT EXISTS policies(node TEXT PRIMARY KEY REFERENCES nodes(id),policy TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS system_identity(id INTEGER PRIMARY KEY CHECK(id=1),uuid TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS pending_writes(node TEXT PRIMARY KEY REFERENCES nodes(id));
@@ -133,7 +139,21 @@ impl Engine {
 }
 
 fn inherited_policy(db: &Connection, id: &str) -> Result<Policy> {
-    let raw:String=db.query_row("WITH RECURSIVE ancestors(id,parent,d) AS (SELECT id,parent,0 FROM nodes WHERE id=? UNION ALL SELECT n.id,n.parent,d+1 FROM nodes n JOIN ancestors a ON n.id=a.parent) SELECT p.policy FROM ancestors a JOIN policies p ON p.node=a.id ORDER BY d LIMIT 1",[id],|r|r.get(0)).context("no applicable storage policy")?;
+    let sql = "WITH RECURSIVE ancestors(id, parent, d) AS (
+        SELECT id, parent, 0
+        FROM nodes
+        WHERE id=?
+        UNION ALL
+        SELECT n.id, n.parent, d+1
+        FROM nodes n
+        JOIN ancestors a ON n.id=a.parent)
+        SELECT p.policy
+        FROM ancestors a
+        JOIN policies p ON p.node=a.id
+        ORDER BY d LIMIT 1";
+    let raw: String = db
+        .query_row(sql, [id], |r| r.get(0))
+        .context("no applicable storage policy")?;
     Ok(serde_json::from_str(&raw)?)
 }
 fn placement(policy: &Policy, id: &str, hash: &str) -> Result<(Vec<String>, usize, String)> {
@@ -144,7 +164,23 @@ fn placement(policy: &Policy, id: &str, hash: &str) -> Result<(Vec<String>, usiz
     Ok((targets, count, signature))
 }
 pub(crate) fn placement_confirmed(db: &Connection, id: &str, hash: &str) -> Result<bool> {
-    let active:bool=db.query_row("WITH RECURSIVE chain(id,parent) AS (SELECT id,parent FROM nodes WHERE id=?1 AND hash=?2 UNION ALL SELECT n.id,n.parent FROM nodes n JOIN chain c ON n.id=c.parent) SELECT EXISTS(SELECT 1 FROM chain WHERE id='root') AND NOT EXISTS(SELECT 1 FROM pending_writes WHERE node=?1)",params![id,hash],|r|r.get(0))?;
+    let sql = "WITH RECURSIVE chain(id, parent) AS (
+        SELECT id, parent
+        FROM nodes
+        WHERE id=?1 AND hash=?2
+        UNION ALL
+        SELECT n.id, n.parent
+        FROM nodes n
+        JOIN chain c ON n.id=c.parent)
+        SELECT EXISTS(
+        SELECT 1
+        FROM chain
+        WHERE id='root')
+        AND NOT EXISTS(
+        SELECT 1
+        FROM pending_writes
+        WHERE node=?1)";
+    let active: bool = db.query_row(sql, params![id, hash], |r| r.get(0))?;
     if !active {
         return Ok(false);
     }
