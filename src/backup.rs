@@ -66,6 +66,11 @@ pub fn init(engine: &Engine) -> Result<()> {
     WHEN EXISTS(SELECT 1 FROM backup_schedule)
     BEGIN INSERT INTO backup_changes VALUES(unixepoch(),NEW.seq)
           ON CONFLICT(second) DO UPDATE SET seq=NEW.seq; END;")?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS backup_lineage(id INTEGER PRIMARY KEY CHECK(id=1),uuid TEXT NOT NULL)")?;
+    tx.execute(
+        "INSERT OR IGNORE INTO backup_lineage VALUES(1,?)",
+        [uuid::Uuid::new_v4().to_string()],
+    )?;
     if installed {
         tx.commit()?;
         return Ok(());
@@ -158,6 +163,11 @@ impl Engine {
             .query_row("SELECT seq FROM revision WHERE id=1", [], |r| r.get(0))?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let marker = self.backup_marker()?;
+        let lineage: String =
+            self.db
+                .query_row("SELECT uuid FROM backup_lineage WHERE id=1", [], |r| {
+                    r.get(0)
+                })?;
         let mut image = None;
         let database = PathBuf::from(
             self.db
@@ -209,13 +219,15 @@ impl Engine {
             let marker = marker.clone();
             let database = database.clone();
             let settings = Arc::clone(&s);
+            let lineage = lineage.clone();
             let job = thread::Builder::new()
                 .name("tier-backup".into())
                 .spawn(move || {
                     let _ticket = ticket;
                     let result = (|| -> Result<()> {
                         let db = rusqlite::Connection::open(database)?;
-                        let result = publish_to(&dir, &data, &marker, &settings, captured, now);
+                        let result =
+                            publish_to(&dir, &data, &marker, &settings, captured, now, &lineage);
                         let (saved, at, error) = match result {
                             Ok(()) => (
                                 captured,
@@ -256,9 +268,10 @@ fn publish_to(
     settings: &Schedule,
     captured: u64,
     now: u64,
+    lineage: &str,
 ) -> Result<()> {
     let prefix = format!(
-        "tier-{}-",
+        "tier-{}-{lineage}-",
         data["system_id"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing system identity"))?
@@ -378,8 +391,14 @@ mod tests {
         })?;
         let image = engine.snapshot()?;
         let first = image["seq"].as_u64().unwrap();
+        let lineage: String =
+            engine
+                .db
+                .query_row("SELECT uuid FROM backup_lineage WHERE id=1", [], |r| {
+                    r.get(0)
+                })?;
         let fifo = slow.join(format!(
-            "tier-{}-{first:020}.json",
+            "tier-{}-{lineage}-{first:020}.json",
             image["system_id"].as_str().unwrap()
         ));
         ensure!(

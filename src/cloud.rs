@@ -15,6 +15,8 @@ pub fn init(db: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS cloud_copies(node TEXT REFERENCES nodes(id) ON DELETE CASCADE,target TEXT REFERENCES cloud_targets(name),key TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(node,target));
         CREATE TABLE IF NOT EXISTS cloud_gc(target TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(target,key));
         CREATE TABLE IF NOT EXISTS archive_errors(node TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,error TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS archive_checks(key TEXT PRIMARY KEY,checked INTEGER NOT NULL,failed_since INTEGER,error TEXT);
+        CREATE INDEX IF NOT EXISTS cloud_object_keys ON cloud_copies(key);
         CREATE TRIGGER IF NOT EXISTS gc_cloud_copy AFTER DELETE ON cloud_copies BEGIN INSERT OR IGNORE INTO cloud_gc VALUES(OLD.target,OLD.key); END;")?;
     Ok(())
 }
@@ -123,9 +125,18 @@ pub fn retained(db: &Connection, id: &str, default: usize) -> Result<usize> {
     let Some(p) = policy(db, id)? else {
         return Ok(default);
     };
-    let count = copies(db, id)?
+    let mut query = db.prepare(
+        "SELECT c.target FROM cloud_copies c
+        JOIN nodes n ON n.id=c.node AND n.hash=c.hash
+        LEFT JOIN archive_checks a ON a.key=c.key
+        WHERE c.node=? AND a.error IS NULL",
+    )?;
+    let healthy = query
+        .query_map([id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let count = healthy
         .iter()
-        .filter(|(t, _, _)| p.targets.contains(t))
+        .filter(|name| p.targets.contains(name))
         .count();
     Ok(if p.copies > 0 && count >= p.copies {
         p.retain_local
@@ -172,6 +183,12 @@ impl Engine {
         Ok(())
     }
     pub fn archive_tick(&self) -> Result<()> {
+        self.run_archive(true)
+    }
+    pub fn automatic_archive(&self) -> Result<()> {
+        self.run_archive(false)
+    }
+    fn run_archive(&self, manual: bool) -> Result<()> {
         let sql = "WITH RECURSIVE live(id) AS (VALUES('root')
             UNION ALL
             SELECT n.id
@@ -193,9 +210,13 @@ impl Engine {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        self.db.execute(
+            "DELETE FROM archive_checks WHERE NOT EXISTS(SELECT 1 FROM cloud_copies c WHERE c.key=archive_checks.key)",
+            [],
+        )?;
         let mut errors = Vec::new();
         for (id, h, mtime) in rows {
-            match self.archive_one(&id, &h, now.saturating_sub(mtime)) {
+            match self.archive_one(&id, &h, now.saturating_sub(mtime), manual, now) {
                 Ok(()) => {
                     self.db
                         .execute("DELETE FROM archive_errors WHERE node=?", [&id])?;
@@ -229,7 +250,7 @@ impl Engine {
         Ok(())
     }
 
-    fn archive_one(&self, id: &str, h: &str, age: u64) -> Result<()> {
+    fn archive_one(&self, id: &str, h: &str, age: u64, manual: bool, now: u64) -> Result<()> {
         let configured = policy(&self.db, id)?;
         if configured.as_ref().is_none_or(|p| p.copies == 0) {
             return self.release_archives(id, h, configured.as_ref());
@@ -237,13 +258,66 @@ impl Engine {
         let Some(p) = configured else {
             return Ok(());
         };
-        if age < p.delay_secs
-            || p.copies == 0
-            || !crate::core::placement_confirmed(&self.db, id, h)?
+        let mut current = copies(&self.db, id)?;
+        let first = current.is_empty();
+        if !crate::core::current_file(&self.db, id, h)?
+            || (first
+                && (age < p.delay_secs || !crate::core::placement_confirmed(&self.db, id, h)?))
         {
             return Ok(());
         }
-        let mut current = copies(&self.db, id)?;
+        let size: u64 = self
+            .db
+            .query_row("SELECT size FROM nodes WHERE id=?", [id], |r| r.get(0))?;
+        let mut damaged = HashSet::new();
+        for (target, key, hash) in &current {
+            if !p.targets.contains(target) {
+                continue;
+            }
+            let last: Option<(u64, Option<u64>, Option<String>)> = self
+                .db
+                .query_row(
+                    "SELECT checked,failed_since,error FROM archive_checks WHERE key=?",
+                    [key],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if !manual
+                && let Some((checked, _, error)) = &last
+                && now.saturating_sub(*checked) < if error.is_some() { 60 } else { 3600 }
+            {
+                if let Some(e) = error {
+                    bail!("{target}: {e}");
+                }
+                continue;
+            }
+            match client(&self.db, target).and_then(|c| c.read_to(key, hash, size, &mut io::sink()))
+            {
+                Ok(()) => {
+                    self.db.execute(
+                        "INSERT OR REPLACE INTO archive_checks VALUES(?,?,NULL,NULL)",
+                        params![key, now],
+                    )?;
+                }
+                Err(error) => {
+                    let first = last.and_then(|(_, first, _)| first).unwrap_or(now);
+                    self.db.execute(
+                        "INSERT OR REPLACE INTO archive_checks VALUES(?,?,?,?)",
+                        params![key, now, first, error.to_string()],
+                    )?;
+                    let local = self.policy(id)?;
+                    if !manual && local.manual_repair {
+                        return Err(error.context("archive requires manual repair"));
+                    }
+                    if !manual && now.saturating_sub(first) < local.repair_grace_secs {
+                        return Err(error.context("archive in repair grace period"));
+                    }
+                    damaged.insert(target.clone());
+                }
+            }
+        }
+        // Keep the registered object until a replacement has passed read-back verification.
+        current.retain(|(target, _, _)| !damaged.contains(target));
         let mut count = current
             .iter()
             .filter(|(t, _, _)| p.targets.contains(t))
@@ -278,7 +352,8 @@ impl Engine {
             let valid: String =
                 tx.query_row("SELECT hash FROM nodes WHERE id=?", [id], |r| r.get(0))?;
             if valid != h
-                || !crate::core::placement_confirmed(&tx, id, h)?
+                || !crate::core::current_file(&tx, id, h)?
+                || (first && !crate::core::placement_confirmed(&tx, id, h)?)
                 || policy(&tx, id)?.as_ref() != Some(&p)
             {
                 drop(tx);
@@ -295,6 +370,10 @@ impl Engine {
             tx.execute(
                 "INSERT OR REPLACE INTO cloud_copies VALUES(?,?,?,?)",
                 params![id, t, key, h],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO archive_checks VALUES(?,?,NULL,NULL)",
+                params![key, now],
             )?;
             if let Some(old) = old {
                 tx.execute(
@@ -329,14 +408,15 @@ impl Engine {
             .filter(|(t, _, _)| p.targets.contains(t))
             .take(p.copies)
             .collect();
-        let obsolete: Vec<_> = current.iter().filter(|c| !selected.contains(c)).collect();
+        let registered = copies(&self.db, id)?;
+        let obsolete: Vec<_> = registered
+            .iter()
+            .filter(|c| !selected.contains(c))
+            .collect();
         if readable.len() <= p.retain_local && obsolete.is_empty() {
             return Ok(());
         }
         // Verify the currently selected remote objects immediately before eviction.
-        let size: u64 = self
-            .db
-            .query_row("SELECT size FROM nodes WHERE id=?", [id], |r| r.get(0))?;
         for (t, key, hash) in &selected {
             client(&self.db, t)?.read_to(key, hash, size, &mut io::sink())?;
         }

@@ -125,6 +125,8 @@ impl Admin for std::sync::Mutex<crate::core::Engine> {
             "policy" => {
                 engine.set_policy(string("path")?, &serde_json::from_value(input.clone())?)?
             }
+            "inherit" => engine
+                .inherit_policy(string("path")?, input["archive"].as_bool().unwrap_or(false))?,
             "archive" => engine.add_archive(
                 string("name")?,
                 string("url")?,

@@ -25,6 +25,7 @@ struct Handle {
     ino: u64,
     data: File,
     writable: bool,
+    detached: bool,
     dirty: bool,
     append: bool,
     synchronous: bool,
@@ -45,7 +46,7 @@ impl Fs {
     }
     fn child(&self, parent: u64, name: &OsStr) -> Result<String, i32> {
         let name = name.to_str().ok_or(EINVAL)?;
-        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        if !crate::core::safe_name(name) {
             return Err(EINVAL);
         }
         Ok(format!(
@@ -74,7 +75,7 @@ impl Fs {
         let size = self
             .handles
             .values()
-            .find(|h| h.ino == ino && h.dirty)
+            .find(|h| h.ino == ino && h.dirty && !h.detached)
             .and_then(|h| h.data.metadata().ok())
             .map(|s| s.len())
             .unwrap_or(node.size);
@@ -103,7 +104,12 @@ impl Fs {
     }
     fn open_file(&mut self, ino: u64, flags: i32) -> Result<u64, i32> {
         let write = flags & libc::O_ACCMODE != libc::O_RDONLY;
-        if write && self.handles.values().any(|h| h.ino == ino && h.writable) {
+        if write
+            && self
+                .handles
+                .values()
+                .any(|h| h.ino == ino && h.writable && !h.detached)
+        {
             return Err(EBUSY);
         }
         let writer = if write {
@@ -128,7 +134,11 @@ impl Fs {
         };
         let truncate = write && flags & libc::O_TRUNC != 0;
         let path = self.paths.get(&ino).ok_or(ENOENT)?;
-        let data = if let Some(handle) = self.handles.values().find(|handle| handle.ino == ino) {
+        let data = if let Some(handle) = self
+            .handles
+            .values()
+            .find(|handle| handle.ino == ino && !handle.detached)
+        {
             handle.data.try_clone().map_err(errno)?
         } else {
             let mut file = tempfile::tempfile().map_err(errno)?;
@@ -156,6 +166,7 @@ impl Fs {
                 ino,
                 data,
                 writable: write,
+                detached: false,
                 dirty: truncate,
                 error: None,
                 writer,
@@ -171,21 +182,80 @@ impl Fs {
             return Err(error);
         }
         if h.dirty {
-            if let Some(path) = self.paths.get(&h.ino) {
-                self.engine
-                    .lock()
-                    .map_err(|_| EIO)?
-                    .put_from(path, &mut h.data)
-                    .map_err(|error| {
-                        let code = storage_errno(error);
-                        h.writer.take();
-                        h.error = Some(code);
-                        code
-                    })?;
-            }
+            let path = self.paths.get(&h.ino).ok_or(libc::ESTALE)?;
+            self.engine
+                .lock()
+                .map_err(|_| EIO)?
+                .put_from(path, &mut h.data)
+                .map_err(|error| {
+                    let code = storage_errno(error);
+                    h.writer.take();
+                    h.error = Some(code);
+                    code
+                })?;
             h.dirty = false;
         }
         Ok(())
+    }
+    fn save_before_detach(&mut self, ino: u64) -> Result<(), i32> {
+        let writer = self
+            .handles
+            .iter()
+            .find(|(_, h)| h.ino == ino && !h.detached && h.dirty && h.error.is_none())
+            .map(|(&fh, _)| fh);
+        if let Some(fh) = writer {
+            self.save(fh)?;
+        }
+        Ok(())
+    }
+    fn detach(&mut self, ino: u64) {
+        self.paths.remove(&ino);
+        for handle in self.handles.values_mut().filter(|h| h.ino == ino) {
+            handle.detached = true;
+            handle.writer.take();
+        }
+    }
+    fn resize(&mut self, ino: u64, fh: Option<u64>, size: u64) -> Result<(), i32> {
+        let path = self.paths.get(&ino).cloned().ok_or(libc::ESTALE)?;
+        let temporary = fh.is_none();
+        let handle = match fh {
+            Some(id) => id,
+            None => self.open_file(ino, libc::O_WRONLY)?,
+        };
+        let result = (|| {
+            let h = self.handles.get_mut(&handle).ok_or(EINVAL)?;
+            if h.detached {
+                return Err(libc::ESTALE);
+            }
+            if h.ino != ino || !h.writable {
+                return Err(EACCES);
+            }
+            if let Some(error) = h.error {
+                return Err(error);
+            }
+            if !h.dirty {
+                self.engine
+                    .lock()
+                    .map_err(|_| EIO)?
+                    .begin_write(&path)
+                    .map_err(|_| EIO)?;
+            }
+            if let Err(error) = h.data.set_len(size) {
+                let code = errno(error);
+                h.writer.take();
+                h.error = Some(code);
+                return Err(code);
+            }
+            h.dirty = true;
+            if temporary || h.synchronous {
+                self.save(handle)?;
+            }
+            Ok(())
+        })();
+        if temporary {
+            self.handles.remove(&handle);
+        }
+        result
     }
     fn remove_entry(&mut self, p: u64, n: &OsStr, dir: bool) -> Result<(), i32> {
         let path = self.child(p, n)?;
@@ -196,12 +266,14 @@ impl Fs {
         if !dir && a.kind == FileType::Directory {
             return Err(EISDIR);
         }
+        self.save_before_detach(a.ino)?;
         let engine = self.engine.lock().map_err(|_| EIO)?;
         if dir && !engine.list(&path).map_err(|_| EIO)?.is_empty() {
             return Err(ENOTEMPTY);
         }
         engine.remove(&path).map_err(|_| EIO)?;
-        self.paths.remove(&a.ino);
+        drop(engine);
+        self.detach(a.ino);
         Ok(())
     }
 }
@@ -216,30 +288,24 @@ macro_rules! respond {
 impl Filesystem for Fs {
     fn statfs(&mut self, _: &Request, _: u64, reply: ReplyStatfs) {
         // Report one backing filesystem; multiple configured targets can share a disk.
-        let target = self.engine.lock().map_err(|_| EIO).and_then(|engine| {
-            engine
+        let filesystem = (|| -> Result<_> {
+            let engine = self
+                .engine
+                .lock()
+                .map_err(|_| anyhow!("storage unavailable"))?;
+            let mut targets = engine
                 .db
-                .query_row(
-                    "SELECT path FROM targets ORDER BY name LIMIT 1",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .map_err(|_| EIO)
-        });
-        let path = match target.and_then(|p| std::ffi::CString::new(p).map_err(|_| EINVAL)) {
-            Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+                .prepare("SELECT name FROM targets ORDER BY name")?;
+            for name in targets.query_map([], |row| row.get::<_, String>(0))? {
+                if let Ok(stat) = engine.target_stat(&name?) {
+                    return Ok(stat);
+                }
+            }
+            anyhow::bail!("no online storage target")
+        })();
+        let Ok(v) = filesystem else {
+            return reply.error(EIO);
         };
-        let mut info = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        // statvfs initializes the entire output structure when it returns zero.
-        if unsafe { libc::statvfs(path.as_ptr(), info.as_mut_ptr()) } != 0 {
-            return reply.error(
-                std::io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(EIO),
-            );
-        }
-        let v = unsafe { info.assume_init() };
         reply.statfs(
             v.f_blocks,
             v.f_bfree,
@@ -389,6 +455,9 @@ impl Filesystem for Fs {
         if !h.writable {
             return r.error(EACCES);
         }
+        if h.detached {
+            return r.error(libc::ESTALE);
+        }
         let Ok(mut start) = u64::try_from(offset) else {
             return r.error(EINVAL);
         };
@@ -480,13 +549,16 @@ impl Filesystem for Fs {
             if flags == 1 && destination.is_some() {
                 return Err(EEXIST);
             }
+            if let Some(ino) = destination.filter(|ino| *ino != source) {
+                self.save_before_detach(ino)?;
+            }
             self.engine
                 .lock()
                 .unwrap()
                 .rename(&a, &b)
                 .map_err(|_| EIO)?;
             if let Some(overwritten) = destination.filter(|ino| *ino != source) {
-                self.paths.remove(&overwritten);
+                self.detach(overwritten);
             }
             for p in self.paths.values_mut() {
                 if p == &a || p.strip_prefix(&a).is_some_and(|s| s.starts_with('/')) {
@@ -518,33 +590,7 @@ impl Filesystem for Fs {
         let result = (|| {
             let p = self.paths.get(&i).cloned().ok_or(ENOENT)?;
             if let Some(size) = size {
-                let id = fh.or_else(|| {
-                    self.handles
-                        .iter()
-                        .find(|(_, h)| h.ino == i && h.writable)
-                        .map(|(k, _)| *k)
-                });
-                if let Some(h) = id.and_then(|id| self.handles.get_mut(&id)) {
-                    if !h.writable {
-                        return Err(EACCES);
-                    }
-                    if !h.dirty {
-                        self.engine
-                            .lock()
-                            .map_err(|_| EIO)?
-                            .begin_write(&p)
-                            .map_err(|_| EIO)?;
-                    }
-                    h.data.set_len(size).map_err(errno)?;
-                    h.dirty = true
-                } else {
-                    let engine = self.engine.lock().unwrap();
-                    let mut data = tempfile::tempfile().map_err(errno)?;
-                    engine.copy_to(&p, &mut data).map_err(storage_errno)?;
-                    engine.begin_write(&p).map_err(|_| EIO)?;
-                    data.set_len(size).map_err(errno)?;
-                    engine.put_from(&p, &mut data).map_err(storage_errno)?
-                }
+                self.resize(i, fh, size)?;
             }
             if let Some(value) = mtime {
                 let time = match value {

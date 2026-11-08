@@ -20,6 +20,8 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
     let url = format!("http://{}/dav", http.server_addr());
     let corrupt = Arc::new(AtomicBool::new(true));
     let bad = corrupt.clone();
+    let unavailable = Arc::new(std::sync::Mutex::new(String::new()));
+    let missing = unavailable.clone();
     let done = Arc::new(AtomicBool::new(false));
     let stop = done.clone();
     let worker = thread::spawn(move || -> Result<()> {
@@ -37,6 +39,7 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
                     (201, vec![])
                 }
                 Method::Get => match objects.get(&key) {
+                    _ if *missing.lock().unwrap() == key => (404, vec![]),
                     None => (404, vec![]),
                     Some(_) if bad.load(Ordering::Relaxed) => (200, b"corrupt".to_vec()),
                     Some(data) => (200, data.clone()),
@@ -159,6 +162,38 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
             .any(|c| c["target"] == "disk"),
         "a corrupt preferred target cannot displace the last healthy local copy"
     );
+    let state = reopened.snapshot()?;
+    let old = state["cloud_copies"][0]["key"].as_str().unwrap();
+    *unavailable.lock().unwrap() = format!("/dav/{old}");
+    reopened.archive_tick()?;
+    assert_ne!(reopened.snapshot()?["cloud_copies"][0]["key"], old);
+    let state = reopened.snapshot()?;
+    let repaired = state["cloud_copies"][0]["key"].as_str().unwrap();
+    let settings = |manual| {
+        serde_json::from_value(
+            json!({"front":["disk"],"front_count":1,"long":["long"],"long_count":1,"delay_secs":0,"manual_repair":manual,"repair_grace_secs":300}),
+        )
+    };
+    reopened.set_policy("/", &settings(true)?)?;
+    *unavailable.lock().unwrap() = format!("/dav/{repaired}");
+    let clock = rusqlite::Connection::open(&db)?;
+    // Advance the cached probe deadline without making the test wait an hour.
+    clock.execute(
+        "UPDATE archive_checks SET checked=0 WHERE key=?",
+        [repaired],
+    )?;
+    assert!(reopened.automatic_archive().is_err());
+    drop(reopened);
+    let restarted = Engine::open(&db)?;
+    assert!(restarted.automatic_archive().is_err());
+    assert_eq!(restarted.snapshot()?["cloud_copies"][0]["key"], repaired);
+    restarted.set_policy("/", &settings(false)?)?;
+    clock.execute(
+        "UPDATE archive_checks SET checked=0,failed_since=1 WHERE key=?",
+        [repaired],
+    )?;
+    restarted.automatic_archive()?;
+    assert_ne!(restarted.snapshot()?["cloud_copies"][0]["key"], repaired);
     done.store(true, Ordering::Relaxed);
     worker.join().unwrap()?;
     Ok(())

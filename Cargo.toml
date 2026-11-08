@@ -1,6 +1,6 @@
 [package]
 name = "tier"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Policy-driven storage for home Samba shares"
 
@@ -10,7 +10,7 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 fuser = { version = "0.14", default-features = false }
 libc = "0.2"
-rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
+rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks", "collation"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -18,3 +18,4 @@ tiny_http = "0.12"
 uuid = { version = "1", features = ["v4"] }
 ureq = "2.12"
 tempfile = "3"
+unicase = "2"

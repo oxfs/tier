@@ -13,7 +13,7 @@ impl Engine {
         let parent = self.stat(parent)?;
         self.db
             .query_row(
-                "SELECT id,dir,size,coalesce(display_mtime,mtime) FROM nodes WHERE parent=? AND name=?",
+                "SELECT id,dir,size,coalesce(display_mtime,mtime) FROM nodes WHERE parent=? AND name=? COLLATE tier_name",
                 params![parent.id, name],
                 |r| {
                     Ok(Node {
@@ -30,7 +30,7 @@ impl Engine {
         ensure!(node.is_dir, "not a directory");
         let mut st = self
             .db
-            .prepare("SELECT name FROM nodes WHERE parent=? ORDER BY name")?;
+            .prepare("SELECT name FROM nodes WHERE parent=? ORDER BY name COLLATE tier_name")?;
         let items = st
             .query_map([node.id], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -42,6 +42,21 @@ impl Engine {
             "UPDATE nodes SET display_mtime=? WHERE id=?",
             params![seconds, node.id],
         )?;
+        Ok(())
+    }
+    pub fn inherit_policy(&self, path: &str, archive: bool) -> Result<()> {
+        let directory = self.stat(path)?;
+        ensure!(directory.is_dir, "policy requires a directory");
+        let sql = if archive {
+            "DELETE FROM cloud_policy WHERE node=?"
+        } else {
+            ensure!(
+                directory.id != "root",
+                "the root directory requires a local policy"
+            );
+            "DELETE FROM policies WHERE node=?"
+        };
+        self.db.execute(sql, [directory.id])?;
         Ok(())
     }
     pub fn mkdir(&self, path: &str) -> Result<()> {

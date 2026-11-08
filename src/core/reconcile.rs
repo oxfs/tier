@@ -87,7 +87,8 @@ impl Engine {
             let needed = crate::cloud::retained(&self.db, &id, count)?;
             let mut good = 0;
             let mut chosen = HashSet::new();
-            for t in &targets {
+            let mut candidates = self.candidates(&targets)?;
+            while let Some((t, domain)) = candidates.next() {
                 if good >= needed {
                     break;
                 }
@@ -107,6 +108,7 @@ impl Engine {
                     })
                 {
                     chosen.insert(t.clone());
+                    candidates.confirmed(domain);
                     good += 1;
                     continue;
                 }
@@ -166,6 +168,7 @@ impl Engine {
                             let _ = fs::remove_file(root.join(previous));
                         }
                         chosen.insert(t.clone());
+                        candidates.confirmed(domain);
                         good += 1;
                     } else if let Ok(root) = self.target(t) {
                         let _ = fs::remove_file(root.join(key));

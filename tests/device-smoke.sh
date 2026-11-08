@@ -26,6 +26,7 @@ mountpoint -q "$base/share" || { cat "$base/tier.log"; exit 1; }
 printf 'two independent copies\n' > "$base/input"
 cp "$base/input" "$base/share/saved"
 umount "$base/a"
+[[ $(stat -f -c %b "$base/share") == "$(stat -f -c %b "$base/b")" ]]
 cmp "$base/input" "$base/share/saved"
 if cp "$base/input" "$base/share/insufficient"; then exit 1; fi
 [[ -z $(ls -A "$base/a") && ! -e "$base/share/insufficient" ]]

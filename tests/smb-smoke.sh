@@ -21,6 +21,7 @@ mountpoint -q "$tmp/mnt" || { cat "$tmp/tier.log" >&2; exit 1; }
 python3 - "$tmp/mnt" <<'PY'
 import errno
 import os
+import sqlite3
 import sys
 from pathlib import Path
 root = Path(sys.argv[1])
@@ -42,6 +43,34 @@ with path.open("rb") as reader:
     assert reader.read() == b"first"
 assert path.read_bytes() == b"second"
 path.unlink()
+for replace in (False, True):
+    path = root / "detach-test"
+    path.write_bytes(b"original")
+    with path.open("r+b", buffering=0) as writer:
+        writer.write(b"modified")
+        try:
+            os.truncate(path, 2)
+        except OSError as error:
+            assert error.errno == errno.EBUSY, error
+        else:
+            raise AssertionError("path truncation bypassed the writer")
+        if replace:
+            other = root / "replacement"
+            other.write_bytes(b"new")
+            other.replace(path)
+        else:
+            path.unlink()
+        try:
+            writer.write(b"lost")
+        except OSError as error:
+            assert error.errno == errno.ESTALE, error
+        else:
+            raise AssertionError("detached handle acknowledged a write")
+    with sqlite3.connect(root.parent / "tier.db") as db:
+        key, = db.execute("SELECT c.object FROM trash t JOIN copies c ON c.node=t.node WHERE original='/detach-test' ORDER BY t.id DESC LIMIT 1").fetchone()
+    assert (root.parent / "objects" / key).read_bytes() == b"modified"
+    if replace:
+        assert path.read_bytes() == b"new"
 PY
 chmod 755 "$tmp"
 cat > "$tmp/smb.conf" <<EOF

@@ -88,15 +88,12 @@ pub struct Engine {
 fn now() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
+pub(crate) fn safe_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '\\', '\0']) && name != "." && name != ".."
+}
 fn split(path: &str) -> Result<(&str, &str)> {
-    ensure!(
-        path.starts_with('/') && path != "/" && !path.contains('\0'),
-        "invalid path"
-    );
-    ensure!(
-        path[1..].split('/').all(|s| !matches!(s, "" | "." | "..")),
-        "invalid path"
-    );
+    ensure!(path.starts_with('/') && path != "/", "invalid path");
+    ensure!(path[1..].split('/').all(safe_name), "invalid path");
     let (parent, name) = path.rsplit_once('/').unwrap();
     Ok((if parent.is_empty() { "/" } else { parent }, name))
 }
@@ -112,6 +109,9 @@ fn rank(names: &mut [String], id: &str) {
 impl Engine {
     pub fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path)?;
+        db.create_collation("tier_name", |a, b| {
+            unicase::UniCase::new(a).cmp(&unicase::UniCase::new(b))
+        })?;
         crate::backup::configure(&db)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA recursive_triggers=ON; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;
       CREATE TABLE IF NOT EXISTS nodes(id TEXT PRIMARY KEY,parent TEXT REFERENCES nodes(id),name TEXT COLLATE NOCASE NOT NULL,dir INTEGER NOT NULL,size INTEGER NOT NULL DEFAULT 0,hash TEXT,mtime INTEGER NOT NULL DEFAULT 0,display_mtime INTEGER,UNIQUE(parent,name));
@@ -131,6 +131,8 @@ impl Engine {
             "INSERT OR IGNORE INTO system_identity VALUES(1,?)",
             [Uuid::new_v4().to_string()],
         )?;
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS namespace_names ON nodes(parent,name COLLATE tier_name)",[])
+            .context("creating Unicode name index; sibling names must be distinct after case folding")?;
         crate::cloud::init(&db)?;
         let engine = Self { db };
         crate::backup::init(&engine)?;
@@ -163,7 +165,7 @@ fn placement(policy: &Policy, id: &str, hash: &str) -> Result<(Vec<String>, usiz
     let signature = serde_json::to_string(&(hash, count, &targets))?;
     Ok((targets, count, signature))
 }
-pub(crate) fn placement_confirmed(db: &Connection, id: &str, hash: &str) -> Result<bool> {
+pub(crate) fn current_file(db: &Connection, id: &str, hash: &str) -> Result<bool> {
     let sql = "WITH RECURSIVE chain(id, parent) AS (
         SELECT id, parent
         FROM nodes
@@ -180,8 +182,10 @@ pub(crate) fn placement_confirmed(db: &Connection, id: &str, hash: &str) -> Resu
         SELECT 1
         FROM pending_writes
         WHERE node=?1)";
-    let active: bool = db.query_row(sql, params![id, hash], |r| r.get(0))?;
-    if !active {
+    Ok(db.query_row(sql, params![id, hash], |r| r.get(0))?)
+}
+pub(crate) fn placement_confirmed(db: &Connection, id: &str, hash: &str) -> Result<bool> {
+    if !current_file(db, id, hash)? {
         return Ok(false);
     }
     let policy = inherited_policy(db, id)?;

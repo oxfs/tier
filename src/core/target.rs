@@ -1,4 +1,39 @@
 use super::*;
+pub(super) struct Candidates<'a> {
+    remaining: Vec<(&'a String, String)>,
+    used: HashSet<String>,
+}
+impl<'a> Candidates<'a> {
+    pub(super) fn next(&mut self) -> Option<(&'a String, String)> {
+        if self.remaining.is_empty() {
+            return None;
+        }
+        let index = self
+            .remaining
+            .iter()
+            .position(|(_, domain)| !self.used.contains(domain))
+            .unwrap_or(0);
+        Some(self.remaining.remove(index))
+    }
+    pub(super) fn confirmed(&mut self, domain: String) {
+        self.used.insert(domain);
+    }
+}
+impl Engine {
+    pub(super) fn candidates<'a>(&self, targets: &'a [String]) -> Result<Candidates<'a>> {
+        let mut query = self
+            .db
+            .prepare_cached("SELECT domain FROM targets WHERE name=?")?;
+        let remaining = targets
+            .iter()
+            .map(|name| Ok((name, query.query_row([name], |r| r.get(0))?)))
+            .collect::<Result<_>>()?;
+        Ok(Candidates {
+            remaining,
+            used: HashSet::new(),
+        })
+    }
+}
 fn detect_domain(device: u64) -> String {
     let number = format!("{}:{}", libc::major(device), libc::minor(device));
     let Ok(block) = fs::canonicalize(format!("/sys/dev/block/{number}")) else {

@@ -86,6 +86,7 @@
           <option value="restore">恢复回收条目</option>
           <option value="purge">清理回收条目</option>
           <option value="policy">配置策略</option>
+          <option value="inherit">恢复策略继承</option>
           <option value="target">配置本地目标</option>
           <option value="archive">配置 WebDAV 归档目标</option>
           <option value="cloud_policy">目录归档策略</option>
@@ -221,6 +222,10 @@
         ["repair_grace_secs", "故障修复宽限期（秒）", "0"],
         ["fallback_count", "直写确认份数（默认与长期份数相同）", "optional-number"],
         ["direct_fallback", "暂存不足时直接写长期池", "checkbox"],
+      ],
+      inherit: [
+        ["path", "目录", "/照片"],
+        ["archive", "恢复归档策略继承（不选则恢复本地策略继承）", "checkbox"],
       ],
       target: [
         ["name", "目标名称", "disk1"],

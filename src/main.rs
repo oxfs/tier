@@ -49,6 +49,12 @@ enum Action {
         path: String,
         json: String,
     },
+    /// Remove a directory override and resume inheritance from its parent.
+    Inherit {
+        path: String,
+        #[arg(long)]
+        archive: bool,
+    },
     /// Set the metadata snapshot schedule (JSON).
     Schedule {
         json: String,
@@ -151,6 +157,7 @@ fn main() -> Result<()> {
         Action::ArchivePolicy { path, json } => {
             engine.set_cloud_policy(&path, &serde_json::from_str::<cloud::CloudPolicy>(&json)?)
         }
+        Action::Inherit { path, archive } => engine.inherit_policy(&path, archive),
         Action::Schedule { json } => engine.schedule(&serde_json::from_str(&json)?),
         Action::Snapshot { output } => recovery::write_snapshot(&engine, &output),
         Action::Repair => {
@@ -182,7 +189,7 @@ fn serve(engine: Engine, db: &Path, path: &Path, addr: SocketAddr) -> Result<()>
                 if let Err(e) = background.automatic_reconcile() {
                     eprintln!("storage: {e:#}")
                 }
-                if let Err(e) = background.archive_tick() {
+                if let Err(e) = background.automatic_archive() {
                     eprintln!("archive: {e:#}")
                 }
             }

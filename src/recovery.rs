@@ -1,4 +1,4 @@
-use crate::core::Engine;
+use crate::core::{Engine, safe_name};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{params_from_iter, types::Value as Sql};
 use serde_json::{Value, json};
@@ -60,9 +60,6 @@ fn rows<'a>(snapshot: &'a Value, table: &str) -> Result<&'a Vec<Value>> {
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     v[key].as_str().with_context(|| format!("missing {key}"))
 }
-fn safe_name(name: &str) -> bool {
-    !name.is_empty() && !name.contains(['/', '\\', '\0']) && name != "." && name != ".."
-}
 fn object_key(v: &Value) -> Result<&str> {
     let key = field(v, "object")?;
     let parts: Vec<_> = key.split('/').collect();
@@ -93,6 +90,7 @@ impl Entry {
 fn tree(snapshot: &Value) -> Result<BTreeMap<String, Entry>> {
     let mut links = BTreeMap::new();
     let mut directories = HashSet::new();
+    let mut siblings = HashSet::new();
     for row in rows(snapshot, "nodes")? {
         let id = field(row, "id")?;
         match row["dir"].as_i64() {
@@ -101,6 +99,11 @@ fn tree(snapshot: &Value) -> Result<BTreeMap<String, Entry>> {
             }
             Some(0) => {
                 ensure!(row["size"].as_u64().is_some(), "invalid file size");
+                let hash = field(row, "hash")?;
+                ensure!(
+                    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "invalid file digest"
+                );
             }
             _ => bail!("invalid node type"),
         }
@@ -113,6 +116,12 @@ fn tree(snapshot: &Value) -> Result<BTreeMap<String, Entry>> {
                 Uuid::parse_str(id).is_ok() && safe_name(field(row, "name")?),
                 "invalid namespace entry"
             )
+        }
+        if let Some(parent) = row["parent"].as_str() {
+            ensure!(
+                siblings.insert((parent, unicase::UniCase::new(field(row, "name")?))),
+                "duplicate sibling name"
+            );
         }
         ensure!(
             links
@@ -318,6 +327,12 @@ pub fn import(
     drop(engine);
     temp.as_file().sync_all()?;
     temp.persist_noclobber(dest)?;
+    fs::File::open(
+        dest.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )?
+    .sync_all()?;
     Ok(report)
 }
 
@@ -330,7 +345,11 @@ pub fn inspect(snapshot: &Value, roots: &[PathBuf], destination: Option<&Path>) 
             .iter()
             .find(|v| v["identity"] == id.trim())
             .context("unknown target ID")?;
-        devices.insert(field(target, "name")?.to_owned(), fs::canonicalize(path)?);
+        let previous = devices.insert(field(target, "name")?.to_owned(), fs::canonicalize(path)?);
+        ensure!(
+            previous.is_none(),
+            "duplicate target identity in recovery devices"
+        );
     }
     if let Some(dest) = destination {
         let parent = dest

@@ -20,7 +20,7 @@ impl Engine {
         let existing = self
             .db
             .query_row(
-                "SELECT id,dir FROM nodes WHERE parent=? AND name=?",
+                "SELECT id,dir FROM nodes WHERE parent=? AND name=? COLLATE tier_name",
                 params![parent.id, name],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)),
             )
@@ -46,7 +46,8 @@ impl Engine {
             let mut copies = Vec::new();
             let mut failures = Vec::new();
             let mut full = false;
-            for t in targets {
+            let mut candidates = self.candidates(targets)?;
+            while let Some((t, domain)) = candidates.next() {
                 let result = (|| {
                     if let Some(threshold) = watermark {
                         self.relieve_pressure(t, threshold, Some(size))?;
@@ -55,6 +56,7 @@ impl Engine {
                 })();
                 match result {
                     Ok(key) => {
+                        candidates.confirmed(domain);
                         copies.push((t.clone(), key));
                         if copies.len() == required {
                             return Ok(copies);

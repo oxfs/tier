@@ -31,6 +31,26 @@ struct Signature(u64, u64, i64, i64, u64);
 type VerificationCache = HashMap<(PathBuf, String), (Signature, bool, std::time::Instant)>;
 static VERIFIED: LazyLock<Mutex<VerificationCache>> = LazyLock::new(Mutex::default);
 impl Engine {
+    pub(crate) fn target_stat(&self, name: &str) -> Result<libc::statvfs> {
+        use std::os::fd::AsRawFd;
+        let (path, expected): (String, String) = self.db.query_row(
+            "SELECT path,identity FROM targets WHERE name=?",
+            [name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let directory = fs::File::open(path)?;
+        let marker = format!("/proc/self/fd/{}/.tier-id", directory.as_raw_fd());
+        ensure!(
+            fs::read_to_string(marker)?.trim() == expected,
+            "target identity mismatch"
+        );
+        let mut stat = std::mem::MaybeUninit::uninit();
+        // The descriptor pins the same directory whose marker was checked above.
+        if unsafe { libc::fstatvfs(directory.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(unsafe { stat.assume_init() })
+    }
     pub(crate) fn verified_copy(&self, target: &str, key: &str, expected: &str) -> bool {
         self.verify(target, key, expected, true)
     }
@@ -216,14 +236,22 @@ impl Engine {
         }
         for row in state["targets"].as_array_mut().context("invalid targets")? {
             use std::os::unix::fs::MetadataExt;
+            let stats = row["name"].as_str().and_then(|n| self.target_stat(n).ok());
             row["device"] = row["path"]
                 .as_str()
+                .filter(|_| stats.is_some())
                 .and_then(|p| fs::metadata(p).ok())
                 .map(|m| m.dev())
                 .into();
-            row["online"] = serde_json::Value::Bool(
-                row["name"].as_str().is_some_and(|n| self.target(n).is_ok()),
-            );
+            row["online"] = stats.is_some().into();
+            row["total_bytes"] = stats
+                .as_ref()
+                .map(|v| v.f_blocks.saturating_mul(v.f_frsize))
+                .into();
+            row["available_bytes"] = stats
+                .as_ref()
+                .map(|v| v.f_bavail.saturating_mul(v.f_frsize))
+                .into();
         }
         Ok(state)
     }
