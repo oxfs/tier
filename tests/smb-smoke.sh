@@ -104,5 +104,17 @@ cmp "$tmp/input" "$tmp/output"
 printf '\0\377Apple metadata\0' > "$tmp/stream"
 "${client[@]}" -c "put $tmp/stream photos/final:AFP_AfpInfo; get photos/final:AFP_AfpInfo $tmp/returned-stream"
 cmp "$tmp/stream" "$tmp/returned-stream"
+"${client[@]}" -c "setmode photos +h; allinfo photos" > "$tmp/dir-info"
+grep -Ei 'attributes:.*H' "$tmp/dir-info"
+"${client[@]}" -c "setmode photos/final +rha; allinfo photos/final" > "$tmp/file-info"
+grep -Ei 'attributes:.*R' "$tmp/file-info"
+"${client[@]}" -c "setmode photos/final -rha; setmode photos -h"
+python3 - "$tmp/mnt/photos" <<'PY'
+import os,sys
+times=(1_689_123_456_123_456_700,1_689_123_456_765_432_100)
+os.utime(sys.argv[1],ns=times)
+info=os.stat(sys.argv[1])
+assert (info.st_atime_ns,info.st_mtime_ns)==times
+PY
 "${client[@]}" -c "del photos/final; rmdir photos"
 [[ ! -e "$tmp/mnt/photos" ]]

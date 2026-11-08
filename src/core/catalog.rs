@@ -1,27 +1,57 @@
 use super::*;
+use std::time::Duration;
+fn unix_timestamp(seconds: i64, nanos: u32) -> SystemTime {
+    if seconds < 0 {
+        UNIX_EPOCH - Duration::from_secs(seconds.unsigned_abs())
+            + Duration::from_nanos(nanos.into())
+    } else {
+        UNIX_EPOCH + Duration::new(seconds as u64, nanos)
+    }
+}
+fn timestamp_parts(time: SystemTime) -> (i64, u32) {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+        Err(error) => {
+            let d = error.duration();
+            let nanos = d.subsec_nanos();
+            if nanos == 0 {
+                (-(d.as_secs() as i64), 0)
+            } else {
+                (-(d.as_secs() as i64) - 1, 1_000_000_000 - nanos)
+            }
+        }
+    }
+}
 impl Engine {
     pub fn stat(&self, path: &str) -> Result<Node> {
+        const SELECT: &str = "SELECT id,dir,size,coalesce(display_mtime,mtime),coalesce(display_mtime_nsec,0),display_atime,coalesce(display_atime_nsec,0) FROM nodes";
+        fn decode(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
+            let mtime = unix_timestamp(row.get(3)?, row.get(4)?);
+            let nanos = row.get(6)?;
+            let atime = row
+                .get::<_, Option<i64>>(5)?
+                .map(|s| unix_timestamp(s, nanos))
+                .unwrap_or(mtime);
+            Ok(Node {
+                id: row.get(0)?,
+                is_dir: row.get(1)?,
+                size: row.get(2)?,
+                mtime,
+                atime,
+            })
+        }
         if path == "/" {
-            return Ok(Node {
-                id: "root".into(),
-                is_dir: true,
-                size: 0,
-                mtime: 0,
-            });
+            return Ok(self
+                .db
+                .query_row(&format!("{SELECT} WHERE id='root'"), [], decode)?);
         }
         let (parent, name) = split(path)?;
         let parent = self.stat(parent)?;
         self.db
             .query_row(
-                "SELECT id,dir,size,coalesce(display_mtime,mtime) FROM nodes WHERE parent=? AND name=? COLLATE tier_name",
+                &format!("{SELECT} WHERE parent=? AND name=? COLLATE tier_name"),
                 params![parent.id, name],
-                |r| {
-                    Ok(Node {
-                        id: r.get(0)?,
-                        is_dir: r.get(1)?,
-                        size: r.get(2)?,mtime:r.get(3)?,
-                    })
-                },
+                decode,
             )
             .with_context(|| format!("lookup {path}"))
     }
@@ -36,12 +66,16 @@ impl Engine {
             .collect::<rusqlite::Result<_>>()?;
         Ok(items)
     }
-    pub fn set_mtime(&self, path: &str, seconds: u64) -> Result<()> {
-        let node = self.stat(path)?;
-        self.db.execute(
-            "UPDATE nodes SET display_mtime=? WHERE id=?",
-            params![seconds, node.id],
-        )?;
+    pub(crate) fn set_times(
+        &self,
+        id: &str,
+        atime: Option<SystemTime>,
+        mtime: Option<SystemTime>,
+    ) -> Result<()> {
+        let a = atime.map(timestamp_parts);
+        let m = mtime.map(timestamp_parts);
+        self.db.execute("UPDATE nodes SET display_atime=coalesce(?1,display_atime),display_atime_nsec=coalesce(?2,display_atime_nsec),display_mtime=coalesce(?3,display_mtime),display_mtime_nsec=coalesce(?4,display_mtime_nsec) WHERE id=?5",
+            params![a.map(|t|t.0),a.map(|t|t.1),m.map(|t|t.0),m.map(|t|t.1),id])?;
         Ok(())
     }
     pub fn inherit_policy(&self, path: &str, archive: bool) -> Result<()> {

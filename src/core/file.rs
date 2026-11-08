@@ -110,7 +110,7 @@ impl Engine {
             );
             let sql = "INSERT INTO nodes(id, parent, name, dir, size, hash, mtime)
                 VALUES(?, ?, ?, 0, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET size=excluded.size, hash=excluded.hash, mtime=excluded.mtime, display_mtime=NULL";
+                ON CONFLICT(id) DO UPDATE SET size=excluded.size, hash=excluded.hash, mtime=excluded.mtime, display_mtime=NULL,display_mtime_nsec=NULL";
             tx.execute(sql, params![id, parent.id, name, size, hash, now()?])?;
             for (t, key) in &copies {
                 tx.execute(

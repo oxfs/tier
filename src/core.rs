@@ -86,7 +86,8 @@ pub struct Node {
     pub id: String,
     pub is_dir: bool,
     pub size: u64,
-    pub mtime: u64,
+    pub mtime: SystemTime,
+    pub atime: SystemTime,
 }
 pub struct Engine {
     pub(crate) db: Connection,
@@ -131,9 +132,6 @@ impl Engine {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA recursive_triggers=ON; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;
       CREATE TABLE IF NOT EXISTS nodes(id TEXT PRIMARY KEY,parent TEXT REFERENCES nodes(id),name TEXT COLLATE NOCASE NOT NULL,dir INTEGER NOT NULL,size INTEGER NOT NULL DEFAULT 0,hash TEXT,mtime INTEGER NOT NULL DEFAULT 0,display_mtime INTEGER,UNIQUE(parent,name));
       INSERT OR IGNORE INTO nodes(id,name,dir) VALUES('root','',1);
-      CREATE TABLE IF NOT EXISTS xattrs(node TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-      name TEXT NOT NULL CHECK(name GLOB 'user.DosStream.?*' AND length(CAST(name AS BLOB))<=255 AND instr(name,char(0))=0),
-      value BLOB NOT NULL CHECK(typeof(value)='blob' AND length(value)<=65536),PRIMARY KEY(node,name));
       CREATE TABLE IF NOT EXISTS targets(name TEXT PRIMARY KEY,path TEXT UNIQUE NOT NULL,identity TEXT UNIQUE NOT NULL,domain TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS copies(node TEXT REFERENCES nodes(id),target TEXT REFERENCES targets(name),object TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(node,target));
       CREATE TABLE IF NOT EXISTS garbage(target TEXT NOT NULL,object TEXT NOT NULL,PRIMARY KEY(target,object));
@@ -153,6 +151,7 @@ impl Engine {
             .context("creating Unicode name index; sibling names must be distinct after case folding")?;
         crate::archive::init(&db)?;
         let engine = Self { db };
+        xattr::init(&engine)?;
         crate::backup::init(&engine)?;
         Ok(engine)
     }

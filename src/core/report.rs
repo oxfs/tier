@@ -348,6 +348,15 @@ impl Engine {
                 let mut obj = serde_json::Map::new();
                 for (i, n) in names.iter().enumerate() {
                     use rusqlite::types::ValueRef;
+                    if table == "nodes"
+                        && matches!(
+                            n.as_str(),
+                            "display_mtime_nsec" | "display_atime" | "display_atime_nsec"
+                        )
+                        && r.get_ref(i)? == ValueRef::Null
+                    {
+                        continue;
+                    }
                     obj.insert(
                         n.clone(),
                         match r.get_ref(i)? {

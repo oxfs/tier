@@ -80,12 +80,12 @@ impl Fs {
             .and_then(|h| h.data.metadata().ok())
             .map(|s| s.len())
             .unwrap_or(node.size);
-        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(node.mtime);
+        let time = node.mtime;
         Ok(FileAttr {
             ino,
             size,
             blocks: size.div_ceil(512),
-            atime: time,
+            atime: node.atime,
             mtime: time,
             ctime: time,
             crtime: time,
@@ -624,7 +624,7 @@ impl Filesystem for Fs {
         _: Option<u32>,
         _: Option<u32>,
         size: Option<u64>,
-        _: Option<TimeOrNow>,
+        atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _: Option<SystemTime>,
         fh: Option<u64>,
@@ -639,16 +639,18 @@ impl Filesystem for Fs {
             if let Some(size) = size {
                 self.resize(i, fh, size)?;
             }
-            if let Some(value) = mtime {
-                let time = match value {
+            if mtime.is_some() || atime.is_some() {
+                let time = |value| match value {
                     TimeOrNow::Now => SystemTime::now(),
                     TimeOrNow::SpecificTime(t) => t,
                 };
-                let seconds = time
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map_err(|_| EINVAL)?
-                    .as_secs();
-                self.engine.set_mtime(&p, seconds).map_err(|_| EIO)?;
+                self.engine
+                    .set_times(
+                        self.ids.get(&i).ok_or(ENOENT)?,
+                        atime.map(time),
+                        mtime.map(time),
+                    )
+                    .map_err(storage_errno)?;
             }
             self.attr(&p)
         })();

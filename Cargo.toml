@@ -1,6 +1,6 @@
 [package]
 name = "tier"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 description = "Policy-driven storage for home Samba shares"
 
