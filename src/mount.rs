@@ -1,3 +1,4 @@
+mod shutdown;
 use crate::core::Engine;
 use anyhow::{Result, anyhow};
 use fuser::*;
@@ -15,10 +16,14 @@ fn errno(error: std::io::Error) -> i32 {
     error.raw_os_error().unwrap_or(EIO)
 }
 fn storage_errno(error: anyhow::Error) -> i32 {
-    error
+    let code = error
         .downcast_ref::<std::io::Error>()
         .and_then(std::io::Error::raw_os_error)
-        .unwrap_or(EIO)
+        .unwrap_or(EIO);
+    if matches!(code, EIO | libc::ENOSPC | libc::EROFS) {
+        tracing::warn!(errno = code, error = %format_args!("{error:#}"), "storage operation failed");
+    }
+    code
 }
 struct Handle {
     ino: u64,
@@ -35,6 +40,7 @@ struct Fs {
     engine: Engine,
     paths: HashMap<u64, String>,
     inodes: HashMap<String, u64>,
+    ids: HashMap<u64, String>,
     handles: HashMap<u64, Handle>,
     next: u64,
 }
@@ -61,6 +67,7 @@ impl Fs {
             None => {
                 let ino = self.alloc();
                 self.inodes.insert(node.id.clone(), ino);
+                self.ids.insert(ino, node.id.clone());
                 self.paths.insert(ino, path.to_owned());
                 ino
             }
@@ -144,7 +151,7 @@ impl Fs {
             file
         };
         if truncate {
-            self.engine.begin_write(path).map_err(|_| EIO)?;
+            self.engine.begin_write(path).map_err(storage_errno)?;
             data.set_len(0).map_err(errno)?;
         }
         let id = self.alloc();
@@ -172,7 +179,7 @@ impl Fs {
         if h.dirty {
             let path = self.paths.get(&h.ino).ok_or(libc::ESTALE)?;
             self.engine.put_from(path, &mut h.data).map_err(|error| {
-                let code = storage_errno(error);
+                let code = storage_errno(error.context(format!("publish {path}")));
                 h.writer.take();
                 h.error = Some(code);
                 code
@@ -218,7 +225,7 @@ impl Fs {
                 return Err(error);
             }
             if !h.dirty {
-                self.engine.begin_write(&path).map_err(|_| EIO)?;
+                self.engine.begin_write(&path).map_err(storage_errno)?;
             }
             if let Err(error) = h.data.set_len(size) {
                 let code = errno(error);
@@ -264,7 +271,82 @@ macro_rules! respond {
         }
     };
 }
+fn xattr_reply(result: Result<Vec<u8>, i32>, size: u32, r: ReplyXattr) {
+    match result {
+        Err(e) => r.error(e),
+        Ok(bytes) if size == 0 => r.size(bytes.len() as u32),
+        Ok(bytes) if bytes.len() > size as usize => r.error(libc::ERANGE),
+        Ok(bytes) => r.data(&bytes),
+    }
+}
 impl Filesystem for Fs {
+    fn getxattr(&mut self, _: &Request, ino: u64, name: &OsStr, size: u32, r: ReplyXattr) {
+        let result = (|| {
+            self.engine
+                .stream_attr(
+                    self.ids.get(&ino).ok_or(ENOENT)?,
+                    name.to_str().ok_or(EINVAL)?,
+                )
+                .map_err(storage_errno)
+        })();
+        xattr_reply(result, size, r);
+    }
+    fn listxattr(&mut self, _: &Request, ino: u64, size: u32, r: ReplyXattr) {
+        let result = (|| {
+            self.engine
+                .list_stream_attrs(self.ids.get(&ino).ok_or(ENOENT)?)
+                .map_err(storage_errno)
+        })();
+        xattr_reply(result, size, r);
+    }
+    fn setxattr(
+        &mut self,
+        _: &Request,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        r: ReplyEmpty,
+    ) {
+        let result = (|| {
+            if position != 0 {
+                return Err(EINVAL);
+            }
+            self.engine
+                .set_stream_attr(
+                    self.ids.get(&ino).ok_or(ENOENT)?,
+                    name.to_str().ok_or(EINVAL)?,
+                    value,
+                    flags,
+                )
+                .map_err(storage_errno)
+        })();
+        match result {
+            Ok(()) => r.ok(),
+            Err(e) => r.error(e),
+        }
+    }
+    fn removexattr(&mut self, _: &Request, ino: u64, name: &OsStr, r: ReplyEmpty) {
+        let result = (|| {
+            self.engine
+                .remove_stream_attr(
+                    self.ids.get(&ino).ok_or(ENOENT)?,
+                    name.to_str().ok_or(EINVAL)?,
+                )
+                .map_err(storage_errno)
+        })();
+        match result {
+            Ok(()) => r.ok(),
+            Err(e) => r.error(e),
+        }
+    }
+    fn init(&mut self, _: &Request<'_>, config: &mut KernelConfig) -> Result<(), i32> {
+        config
+            .add_capabilities(consts::FUSE_ATOMIC_O_TRUNC)
+            .map_err(|_| libc::EOPNOTSUPP)
+    }
+
     fn statfs(&mut self, _: &Request, _: u64, reply: ReplyStatfs) {
         // Report one backing filesystem; multiple configured targets can share a disk.
         let filesystem = (|| -> Result<_> {
@@ -444,9 +526,11 @@ impl Filesystem for Fs {
         }
         if !h.dirty
             && let Some(path) = self.paths.get(&h.ino)
-            && self.engine.begin_write(path).is_err()
+            && let Err(error) = self.engine.begin_write(path)
         {
-            return r.error(EIO);
+            return r.error(storage_errno(
+                error.context(format!("begin writing {path}")),
+            ));
         }
         if let Some(error) = h.error {
             return r.error(error);
@@ -574,32 +658,34 @@ impl Filesystem for Fs {
         }
     }
 }
-pub(crate) struct MountedShare(Session<Fs>);
+pub(crate) struct MountedShare(Session<Fs>, String);
 
 impl MountedShare {
     pub(crate) fn attach(engine: Engine, path: &Path) -> Result<Self> {
         let fs = Fs {
             engine,
             paths: HashMap::from([(1, "/".into())]),
+            ids: HashMap::from([(1, "root".into())]),
             inodes: HashMap::from([("root".into(), 1)]),
             handles: HashMap::new(),
             next: 1,
         };
+        let source = format!("tier-{}", uuid::Uuid::new_v4());
         Session::new(
             fs,
             path,
             &[
-                MountOption::FSName("tier".into()),
+                MountOption::FSName(source.clone()),
                 MountOption::AllowOther,
                 MountOption::DefaultPermissions,
             ],
         )
         .map_err(|e| anyhow!("mount {}: {e}", path.display()))
-        .map(Self)
+        .map(|session| Self(session, source))
     }
 
-    pub(crate) fn unmounter(&mut self) -> SessionUnmounter {
-        self.0.unmount_callable()
+    pub(crate) fn unmounter(&mut self) -> Result<shutdown::Shutdown> {
+        shutdown::Shutdown::new(self.0.unmount_callable(), self.1.clone())
     }
 
     pub(crate) fn run(&mut self) -> Result<()> {

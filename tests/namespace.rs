@@ -13,7 +13,7 @@ fn unicode_case_aliases_share_one_identity_and_policy_override_can_be_removed() 
         engine.register_target(name, &path, None, true)?;
     }
     let policy = |target: &str| Policy {
-        front: vec![target.into()],
+        write_cache: vec![target.into()],
         ..Policy::default()
     };
     engine.set_policy("/", &policy("a"))?;

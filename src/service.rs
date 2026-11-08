@@ -63,7 +63,7 @@ pub fn serve(engine: Engine, database: &Path, mountpoint: &Path, addr: SocketAdd
     let maintenance = Arc::new(Maintenance::new(database));
     let mut share = mount::MountedShare::attach(engine, mountpoint)?;
     let admin = admin::start(addr, Engine::open(database)?, maintenance.clone())?;
-    let mut unmounter = share.unmounter();
+    let unmounter = share.unmounter()?;
     let mut terminate = {
         let _guard = admin.runtime.enter();
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?
@@ -71,7 +71,7 @@ pub fn serve(engine: Engine, database: &Path, mountpoint: &Path, addr: SocketAdd
     admin.runtime.spawn(async move {
         if terminate.recv().await.is_some() {
             let result = tokio::task::spawn_blocking(move || unmounter.unmount()).await;
-            if let Err(error) = result.map_err(anyhow::Error::from).and_then(|r| Ok(r?)) {
+            if let Err(error) = result.map_err(anyhow::Error::from).and_then(|r| r) {
                 tracing::error!(%error, "failed to unmount on shutdown");
             }
         }

@@ -169,7 +169,16 @@ impl Engine {
     pub fn set_policy(&self, path: &str, p: &Policy) -> Result<()> {
         let n = self.stat(path)?;
         ensure!(n.is_dir, "policy requires directory");
-        for (names, count) in [(&p.front, p.front_count), (&p.long, p.long_count)] {
+        let mut p = p.clone();
+        if p.write_cache.is_empty() {
+            p.cache_copies = 0;
+            p.direct_fallback = false;
+            p.fallback_count = None;
+        }
+        for (names, count) in [
+            (&p.write_cache, p.cache_copies),
+            (&p.persistent_storage, p.persistent_copies),
+        ] {
             ensure!(
                 count <= names.len() && names.iter().collect::<HashSet<_>>().len() == names.len(),
                 "invalid target count"
@@ -180,19 +189,27 @@ impl Engine {
             }
         }
         ensure!(
-            p.low_water < p.high_water && p.high_water <= 100,
+            p.write_cache.is_empty() || (p.low_water < p.high_water && p.high_water <= 100),
             "invalid watermarks"
         );
         if p.direct_fallback {
             ensure!(
-                (1..=p.long.len()).contains(&p.fallback_count.unwrap_or(p.long_count)),
+                (1..=p.persistent_storage.len())
+                    .contains(&p.fallback_count.unwrap_or(p.persistent_copies)),
                 "invalid direct fallback count"
             );
         }
-        ensure!(p.front_count > 0, "empty confirmation set");
+        ensure!(
+            if p.write_cache.is_empty() {
+                p.persistent_copies > 0
+            } else {
+                p.cache_copies > 0
+            },
+            "select at least one confirmation target"
+        );
         self.db.execute(
             "INSERT OR REPLACE INTO policies VALUES(?,?)",
-            params![n.id, serde_json::to_string(p)?],
+            params![n.id, serde_json::to_string(&p)?],
         )?;
         Ok(())
     }
@@ -304,13 +321,13 @@ impl Engine {
                 continue;
             }
             let Ok(p) = self.policy(&id) else { continue };
-            if p.long.iter().any(|v| v == name) || p.long_count == 0 {
+            if p.persistent_storage.iter().any(|v| v == name) || p.persistent_copies == 0 {
                 continue;
             }
             let hash: String =
                 tx.query_row("SELECT hash FROM nodes WHERE id=?", [&id], |r| r.get(0))?;
             let mut available = 0;
-            for target in &p.long {
+            for target in &p.persistent_storage {
                 let sql = "SELECT object
                     FROM copies c
                     JOIN nodes n ON c.node=n.id
@@ -320,12 +337,12 @@ impl Engine {
                     .optional()?;
                 if other.is_some_and(|k| self.cached_verified(target, &k, &hash)) {
                     available += 1;
-                    if available >= p.long_count {
+                    if available >= p.persistent_copies {
                         break;
                     }
                 }
             }
-            if available < p.long_count {
+            if available < p.persistent_copies {
                 continue;
             }
             if tx.execute(

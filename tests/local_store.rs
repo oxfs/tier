@@ -14,9 +14,9 @@ fn local_replication_remains_readable_when_front_is_offline() -> anyhow::Result<
     db.set_policy(
         "/",
         &Policy {
-            front: vec!["ssd".into()],
-            long: vec!["hdd1".into(), "hdd2".into()],
-            long_count: 2,
+            write_cache: vec!["ssd".into()],
+            persistent_storage: vec!["hdd1".into(), "hdd2".into()],
+            persistent_copies: 2,
             ..Policy::default()
         },
     )?;
@@ -49,7 +49,7 @@ fn replacing_policy_copies_before_discarding_the_last_readable_target() -> anyho
     engine.set_policy(
         "/",
         &Policy {
-            front: vec!["old".into()],
+            write_cache: vec!["old".into()],
             ..Policy::default()
         },
     )?;
@@ -57,7 +57,7 @@ fn replacing_policy_copies_before_discarding_the_last_readable_target() -> anyho
     engine.set_policy(
         "/",
         &Policy {
-            front: vec!["new".into()],
+            write_cache: vec!["new".into()],
             ..Policy::default()
         },
     )?;
@@ -88,9 +88,9 @@ fn pending_writes_survive_restart_and_block_replication() -> anyhow::Result<()> 
     engine.set_policy(
         "/",
         &Policy {
-            front: vec!["a".into()],
-            long: vec!["b".into()],
-            long_count: 1,
+            write_cache: vec!["a".into()],
+            persistent_storage: vec!["b".into()],
+            persistent_copies: 1,
             ..Policy::default()
         },
     )?;
@@ -121,9 +121,9 @@ fn manual_mode_waits_for_operator_then_replaces_a_corrupt_copy() -> anyhow::Resu
     engine.set_policy(
         "/",
         &Policy {
-            front: vec!["front".into()],
-            long: vec!["long".into()],
-            long_count: 1,
+            write_cache: vec!["front".into()],
+            persistent_storage: vec!["long".into()],
+            persistent_copies: 1,
             manual_repair: true,
             ..Policy::default()
         },
@@ -171,8 +171,8 @@ fn confirmation_and_direct_fallback_require_every_requested_copy() -> anyhow::Re
     engine.set_policy(
         "/",
         &Policy {
-            front: vec!["a".into(), "b".into()],
-            front_count: 2,
+            write_cache: vec!["a".into(), "b".into()],
+            cache_copies: 2,
             ..Policy::default()
         },
     )?;
@@ -184,9 +184,9 @@ fn confirmation_and_direct_fallback_require_every_requested_copy() -> anyhow::Re
     engine.set_policy(
         "/",
         &Policy {
-            front: vec!["cache".into()],
-            long: vec!["a".into(), "b".into()],
-            long_count: 2,
+            write_cache: vec!["cache".into()],
+            persistent_storage: vec!["a".into(), "b".into()],
+            persistent_copies: 2,
             direct_fallback: true,
             ..Policy::default()
         },
@@ -201,9 +201,9 @@ fn confirmation_and_direct_fallback_require_every_requested_copy() -> anyhow::Re
     engine.set_policy(
         "/",
         &Policy {
-            front: vec!["cache".into()],
-            long: vec!["a".into(), "b".into()],
-            long_count: 2,
+            write_cache: vec!["cache".into()],
+            persistent_storage: vec!["a".into(), "b".into()],
+            persistent_copies: 2,
             direct_fallback: true,
             fallback_count: Some(1),
             ..Policy::default()
@@ -211,5 +211,17 @@ fn confirmation_and_direct_fallback_require_every_requested_copy() -> anyhow::Re
     )?;
     engine.put("/one-now", b"durable")?;
     assert_eq!(engine.snapshot()?["copies"].as_array().unwrap().len(), 5);
+    Ok(())
+}
+
+#[test]
+fn legacy_cache_only_policy_serializes_with_current_names() -> anyhow::Result<()> {
+    let old = serde_json::json!({"front":["ssd"],"front_count":1,"long":[],"long_count":0,"delay_secs":12});
+    let policy: Policy = serde_json::from_value(old)?;
+    assert_eq!(policy.write_cache, ["ssd"]);
+    assert_eq!(policy.persist_delay_secs, 12);
+    let value = serde_json::to_value(policy)?;
+    assert_eq!(value["cache_copies"], 1);
+    assert!(value.get("front").is_none());
     Ok(())
 }

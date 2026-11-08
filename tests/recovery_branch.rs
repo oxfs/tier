@@ -14,6 +14,7 @@ fn restore_into_the_original_backup_directory_preserves_both_histories() -> Resu
         seconds: 3600,
         changes: 1,
         keep: 4,
+        retain_days: 0,
         hourly: 0,
         daily: 0,
     })?;

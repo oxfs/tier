@@ -86,7 +86,7 @@ impl Engine {
             WHERE id=?)";
         let cycle: bool = self.db.query_row(sql, params![n.id, p.id], |r| r.get(0))?;
         ensure!(!cycle, "directory cycle");
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.write_transaction()?;
         if let Ok(dst) = self.stat(to)
             && dst.id != n.id
         {
@@ -117,7 +117,7 @@ impl Engine {
     pub fn remove(&self, path: &str) -> Result<()> {
         let n = self.stat(path)?;
         ensure!(n.id != "root", "cannot remove root");
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.write_transaction()?;
         self.detach(&n.id, path)?;
         tx.commit()?;
         Ok(())
@@ -126,7 +126,7 @@ impl Engine {
         let (p, name) = split(path)?;
         let p = self.stat(p)?;
         ensure!(p.is_dir, "not directory");
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.write_transaction()?;
         ensure!(
             tx.execute(
                 "UPDATE nodes SET parent=?,name=? WHERE id=(SELECT node FROM trash WHERE id=?)",
@@ -139,7 +139,7 @@ impl Engine {
         Ok(())
     }
     pub fn purge(&self, id: i64) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.write_transaction()?;
         let node: String = tx.query_row("SELECT node FROM trash WHERE id=?", [id], |r| r.get(0))?;
         let tree = "WITH RECURSIVE subtree(id) AS (VALUES(?) UNION ALL SELECT nodes.id FROM nodes JOIN subtree ON parent=subtree.id)";
         let mut objects = vec![];

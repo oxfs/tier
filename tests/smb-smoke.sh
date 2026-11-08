@@ -13,7 +13,7 @@ cleanup() {
 }
 trap cleanup EXIT
 "$tier" --db "$tmp/tier.db" target main "$tmp/objects"
-"$tier" --db "$tmp/tier.db" policy / '{"front":["main"],"front_count":1,"long":["main"],"long_count":1,"delay_secs":0}'
+"$tier" --db "$tmp/tier.db" policy / '{"write_cache":["main"],"cache_copies":1,"persistent_storage":["main"],"persistent_copies":1,"persist_delay_secs":0}'
 "$tier" --db "$tmp/tier.db" serve "$tmp/mnt" --admin 127.0.0.1:0 > "$tmp/tier.log" 2>&1 &
 tier_pid=$!
 for _ in {1..100}; do mountpoint -q "$tmp/mnt" && break; sleep .1; done
@@ -26,6 +26,9 @@ import sys
 from pathlib import Path
 root = Path(sys.argv[1])
 path = root / "lock-test"
+path.write_bytes(b"previous content")
+path.write_bytes(b"new")
+assert path.read_bytes() == b"new"
 with path.open("wb") as writer:
     writer.write(b"first")
     writer.flush()
@@ -98,5 +101,8 @@ for _ in {1..100}; do "${client[@]}" -c ls >/dev/null 2>&1 && break; sleep .1; d
 printf 'tier smb round trip\n' > "$tmp/input"
 "${client[@]}" -c "mkdir photos; put $tmp/input photos/draft; rename photos/draft photos/final; get photos/final $tmp/output"
 cmp "$tmp/input" "$tmp/output"
+printf '\0\377Apple metadata\0' > "$tmp/stream"
+"${client[@]}" -c "put $tmp/stream photos/final:AFP_AfpInfo; get photos/final:AFP_AfpInfo $tmp/returned-stream"
+cmp "$tmp/stream" "$tmp/returned-stream"
 "${client[@]}" -c "del photos/final; rmdir photos"
 [[ ! -e "$tmp/mnt/photos" ]]

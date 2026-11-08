@@ -2,6 +2,7 @@ mod catalog;
 mod file;
 mod reconcile;
 mod report;
+mod xattr;
 pub(crate) use report::Writer;
 mod target;
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -19,11 +20,16 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Policy {
-    pub front: Vec<String>,
-    pub front_count: usize,
-    pub long: Vec<String>,
-    pub long_count: usize,
-    pub delay_secs: u64,
+    #[serde(default, alias = "front")]
+    pub write_cache: Vec<String>,
+    #[serde(default, alias = "front_count")]
+    pub cache_copies: usize,
+    #[serde(default, alias = "long")]
+    pub persistent_storage: Vec<String>,
+    #[serde(default, alias = "long_count")]
+    pub persistent_copies: usize,
+    #[serde(default, alias = "delay_secs")]
+    pub persist_delay_secs: u64,
     #[serde(default)]
     pub direct_fallback: bool,
     #[serde(default)]
@@ -41,21 +47,21 @@ pub struct Policy {
 }
 impl Policy {
     fn desired(&self) -> (&[String], usize) {
-        if self.long_count == 0 {
-            (&self.front, self.front_count)
+        if self.persistent_copies == 0 {
+            (&self.write_cache, self.cache_copies)
         } else {
-            (&self.long, self.long_count)
+            (&self.persistent_storage, self.persistent_copies)
         }
     }
 }
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            front: vec![],
-            front_count: 1,
-            long: vec![],
-            long_count: 0,
-            delay_secs: 0,
+            write_cache: vec![],
+            cache_copies: 1,
+            persistent_storage: vec![],
+            persistent_copies: 0,
+            persist_delay_secs: 0,
             direct_fallback: false,
             fallback_count: None,
             manual_repair: false,
@@ -107,6 +113,15 @@ fn rank(names: &mut [String], id: &str) {
     names.sort_by_cached_key(|name| Sha256::digest(format!("{id}/{name}")).to_vec());
 }
 impl Engine {
+    // Reserve the writer before reading the catalog. A deferred WAL snapshot
+    // cannot be promoted after another connection commits, even with a timeout.
+    pub(crate) fn write_transaction(&self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?)
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path)?;
         db.create_collation("tier_name", |a, b| {
@@ -116,6 +131,9 @@ impl Engine {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA recursive_triggers=ON; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;
       CREATE TABLE IF NOT EXISTS nodes(id TEXT PRIMARY KEY,parent TEXT REFERENCES nodes(id),name TEXT COLLATE NOCASE NOT NULL,dir INTEGER NOT NULL,size INTEGER NOT NULL DEFAULT 0,hash TEXT,mtime INTEGER NOT NULL DEFAULT 0,display_mtime INTEGER,UNIQUE(parent,name));
       INSERT OR IGNORE INTO nodes(id,name,dir) VALUES('root','',1);
+      CREATE TABLE IF NOT EXISTS xattrs(node TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+      name TEXT NOT NULL CHECK(name GLOB 'user.DosStream.?*' AND length(CAST(name AS BLOB))<=255 AND instr(name,char(0))=0),
+      value BLOB NOT NULL CHECK(typeof(value)='blob' AND length(value)<=65536),PRIMARY KEY(node,name));
       CREATE TABLE IF NOT EXISTS targets(name TEXT PRIMARY KEY,path TEXT UNIQUE NOT NULL,identity TEXT UNIQUE NOT NULL,domain TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS copies(node TEXT REFERENCES nodes(id),target TEXT REFERENCES targets(name),object TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(node,target));
       CREATE TABLE IF NOT EXISTS garbage(target TEXT NOT NULL,object TEXT NOT NULL,PRIMARY KEY(target,object));

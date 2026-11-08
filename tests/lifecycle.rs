@@ -7,9 +7,9 @@ use tier::{
     recovery,
 };
 
-fn policy(front: &str, long: &[&str]) -> Result<Policy> {
+fn policy(write_cache: &str, persistent_storage: &[&str]) -> Result<Policy> {
     Ok(serde_json::from_value(
-        json!({"front":[front],"front_count":1,"long":long,"long_count":long.len(),"delay_secs":0}),
+        json!({"write_cache":[write_cache],"cache_copies":1,"persistent_storage":persistent_storage,"persistent_copies":persistent_storage.len(),"persist_delay_secs":0}),
     )?)
 }
 
@@ -68,6 +68,7 @@ fn snapshots_continue_when_one_destination_is_offline() -> Result<()> {
         seconds: 30,
         changes: 1,
         keep: 1,
+        retain_days: 0,
         hourly: 0,
         daily: 0,
     })?;
@@ -94,5 +95,28 @@ fn snapshots_continue_when_one_destination_is_offline() -> Result<()> {
             .iter()
             .any(|n| n["name"] == "documents")
     );
+    Ok(())
+}
+
+#[test]
+fn foreground_publish_waits_for_another_catalog_writer() -> Result<()> {
+    let work = tempdir()?;
+    let db = work.path().join("tier.db");
+    let engine = Engine::open(&db)?;
+    let disk = work.path().join("disk");
+    fs::create_dir(&disk)?;
+    engine.register_target("disk", &disk, None, false)?;
+    engine.set_policy("/", &policy("disk", &[])?)?;
+
+    let other = rusqlite::Connection::open(&db)?;
+    other.execute_batch("BEGIN IMMEDIATE")?;
+    std::thread::scope(|scope| -> Result<()> {
+        scope.spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            other.execute_batch("COMMIT").unwrap();
+        });
+        engine.put("/photo.jpg", b"latest contents")
+    })?;
+    assert_eq!(engine.get("/photo.jpg")?, b"latest contents");
     Ok(())
 }

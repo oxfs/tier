@@ -13,7 +13,7 @@ fn prefer_distinct_domains_for_confirmation_and_background_placement() -> Result
     engine.set_policy(
         "/",
         &Policy {
-            front: vec!["seed".into()],
+            write_cache: vec!["seed".into()],
             ..Policy::default()
         },
     )?;
@@ -33,10 +33,10 @@ fn prefer_distinct_domains_for_confirmation_and_background_placement() -> Result
     engine.set_policy(
         "/",
         &Policy {
-            front: pools[0].clone(),
-            front_count: 2,
-            long: pools[1].clone(),
-            long_count: 2,
+            write_cache: pools[0].clone(),
+            cache_copies: 2,
+            persistent_storage: pools[1].clone(),
+            persistent_copies: 2,
             ..Policy::default()
         },
     )?;

@@ -32,7 +32,7 @@ const filtered = computed(() =>
         <tr>
           <th>文件路径</th>
           <th>状态</th>
-          <th>长期副本</th>
+          <th>持久化副本</th>
           <th>可读设备</th>
         </tr>
       </thead>

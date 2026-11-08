@@ -19,6 +19,8 @@ pub struct Schedule {
     pub changes: u64,
     pub keep: usize,
     #[serde(default)]
+    pub retain_days: u64,
+    #[serde(default)]
     pub hourly: u64,
     #[serde(default)]
     pub daily: u64,
@@ -51,7 +53,7 @@ pub(crate) fn configure(db: &rusqlite::Connection) -> Result<()> {
 pub fn init(engine: &Engine) -> Result<()> {
     let tx = engine.db.unchecked_transaction()?;
     let installed: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='backup_transaction')",
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='revision_xattrs_INSERT')",
         [],
         |r| r.get(0),
     )?;
@@ -81,6 +83,7 @@ pub fn init(engine: &Engine) -> Result<()> {
     )?;
     for table in [
         "nodes",
+        "xattrs",
         "targets",
         "copies",
         "policies",
@@ -315,7 +318,14 @@ fn publish_to(
         files.push((seq, published, entry.path()));
     }
     files.sort_by_key(|f| std::cmp::Reverse(f.0));
-    for p in expired(&files, settings.keep, settings.hourly, settings.daily, now) {
+    for p in expired(
+        &files,
+        settings.keep,
+        settings.retain_days,
+        settings.hourly,
+        settings.daily,
+        now,
+    ) {
         fs::remove_file(p)?;
     }
     Ok(())
@@ -349,6 +359,7 @@ impl Drop for BackupTicket {
 fn expired(
     files: &[(u64, u64, PathBuf)],
     keep: usize,
+    retain_days: u64,
     hourly: u64,
     daily: u64,
     now: u64,
@@ -361,7 +372,8 @@ fn expired(
         let day = *time / 86400;
         let keep_hour = (now / 3600).saturating_sub(hour) < hourly && hours.insert(hour);
         let keep_day = (now / 86400).saturating_sub(day) < daily && days.insert(day);
-        if index >= keep && !keep_hour && !keep_day {
+        let recent = now.saturating_sub(*time) < retain_days.saturating_mul(86400);
+        if index >= keep && !recent && !keep_hour && !keep_day {
             obsolete.push(path);
         }
     }
@@ -386,6 +398,7 @@ mod tests {
             seconds: 30,
             changes: 1,
             keep: 1,
+            retain_days: 0,
             hourly: 0,
             daily: 0,
         })?;
@@ -482,6 +495,7 @@ mod tests {
             seconds: 3600,
             changes: 10,
             keep: 1,
+            retain_days: 0,
             hourly: 0,
             daily: 0,
         })?;
@@ -505,13 +519,48 @@ mod tests {
     }
 
     #[test]
+    fn rolling_retention_prunes_expired_snapshots_on_publication() -> Result<()> {
+        let temp = tempdir()?;
+        let dir = temp.path().join("snapshots");
+        fs::create_dir(&dir)?;
+        let engine = Engine::open(&temp.path().join("catalog"))?;
+        let schedule: Schedule = serde_json::from_value(serde_json::json!({
+            "directories":[dir], "seconds":3600, "changes":1, "keep":1, "retain_days":1
+        }))?;
+        engine.schedule(&schedule)?;
+        engine.backup_tick()?;
+        let saved = || -> Result<Vec<PathBuf>> {
+            let mut files = fs::read_dir(&dir)?
+                .collect::<std::io::Result<Vec<_>>>()?
+                .into_iter()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|s| s == "json"))
+                .collect::<Vec<_>>();
+            files.sort();
+            Ok(files)
+        };
+        let oldest = saved()?.pop().unwrap();
+        engine.mkdir("/second")?;
+        engine.backup_tick()?;
+        assert_eq!(saved()?.len(), 2);
+        fs::File::open(&oldest)?.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1))?;
+        engine.mkdir("/third")?;
+        engine.backup_tick()?;
+        assert!(!oldest.exists());
+        assert_eq!(saved()?.len(), 2);
+        engine.backup_tick()?;
+        assert_eq!(saved()?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
     fn retention_keeps_the_latest_snapshot_in_each_selected_bucket() {
         let times = [240, 239, 238, 225, 224, 200, 170, 160, 100];
         let files: Vec<_> = times
             .iter()
             .map(|h| (*h, *h * 3600, PathBuf::from(h.to_string())))
             .collect();
-        let removed = expired(&files, 1, 3, 4, 240 * 3600);
+        let removed = expired(&files, 1, 0, 3, 4, 240 * 3600);
         let removed: Vec<_> = removed.iter().map(|p| p.to_str().unwrap()).collect();
         assert_eq!(removed, ["225", "224", "160", "100"]);
     }

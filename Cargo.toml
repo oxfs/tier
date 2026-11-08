@@ -1,6 +1,6 @@
 [package]
 name = "tier"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Policy-driven storage for home Samba shares"
 
@@ -9,13 +9,13 @@ toml = "0.8"
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
-fuser = { version = "0.14", default-features = false }
+fuser = { version = "0.14", default-features = false, features = ["abi-7-9"] }
 libc = "0.2"
 rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks", "collation"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 tokio = { version = "1", features = ["rt", "net", "signal"] }
 uuid = { version = "1", features = ["v4"] }
 ureq = "2.12"

@@ -323,12 +323,7 @@ impl Engine {
                 continue;
             }
             let mut contents = tempfile::tempfile()?;
-            self.copy_id(id, &mut contents)?;
-            use sha2::{Digest, Sha256};
-            let mut fingerprint = Sha256::new();
-            contents.rewind()?;
-            io::copy(&mut contents, &mut fingerprint)?;
-            if format!("{:x}", fingerprint.finalize()) != h {
+            if self.stage_copy(id, &mut contents)? != h {
                 return Ok(());
             }
             let uploaded = client(&self.db, t)
@@ -394,7 +389,7 @@ impl Engine {
             .into_iter()
             .filter(|(t, k)| self.verified_copy(t, k, h))
             .collect();
-        readable.sort_by_key(|(target, _)| !local_policy.long.contains(target));
+        readable.sort_by_key(|(target, _)| !local_policy.persistent_storage.contains(target));
         let selected: Vec<_> = current
             .iter()
             .filter(|(t, _, _)| p.targets.contains(t))

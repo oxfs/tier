@@ -81,7 +81,7 @@ impl Engine {
                 )
                 .optional()?;
             let protected = tracking.is_some();
-            if !protected && now()?.saturating_sub(mtime) < p.delay_secs {
+            if !protected && now()?.saturating_sub(mtime) < p.persist_delay_secs {
                 continue;
             }
             let needed = crate::archive::retained(&self.db, &id, count)?;
@@ -124,8 +124,7 @@ impl Engine {
                 }
                 let result = (|| -> Result<String> {
                     let mut tmp = tempfile::tempfile()?;
-                    self.copy_id(&id, &mut tmp)?;
-                    ensure!(fingerprint(&mut tmp)?.1 == h, "source changed");
+                    ensure!(self.stage_copy(&id, &mut tmp)? == h, "source changed");
                     self.store(t, &id, &mut tmp)
                 })();
                 if let Ok(key) = result {
@@ -186,7 +185,7 @@ impl Engine {
                 if needed > 0 && good >= needed {
                     self.trim_obsolete(&id, &h, &p, &chosen)?;
                 }
-                for t in &p.front {
+                for t in &p.write_cache {
                     cache_pools
                         .entry(t.clone())
                         .and_modify(|low| *low = (*low).min(p.low_water))
@@ -233,7 +232,7 @@ impl Engine {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if rows
             .iter()
-            .all(|(t, _)| chosen.contains(t) || policy.front.contains(t))
+            .all(|(t, _)| chosen.contains(t) || policy.write_cache.contains(t))
         {
             return Ok(());
         }
@@ -252,7 +251,7 @@ impl Engine {
         let mut stale = vec![];
         for (t, key) in rows {
             if !chosen.contains(&t)
-                && !policy.front.contains(&t)
+                && !policy.write_cache.contains(&t)
                 && let Ok(root) = self.target(&t)
             {
                 tx.execute(

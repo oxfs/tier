@@ -222,6 +222,7 @@ pub fn import(
     )?;
     for table in [
         "nodes",
+        "xattrs",
         "targets",
         "copies",
         "policies",
@@ -233,6 +234,9 @@ pub fn import(
         "cloud_policy",
         "cloud_copies",
     ] {
+        if table == "xattrs" && snapshot.get(table).is_none() {
+            continue;
+        }
         let st = tx.prepare(&format!("SELECT * FROM {table} LIMIT 0"))?;
         let columns = st
             .column_names()
@@ -262,6 +266,14 @@ pub fn import(
                         return Ok(Sql::Text(
                             path.to_str().context("invalid target path")?.into(),
                         ));
+                    }
+                    if table == "xattrs" && key == "value" {
+                        let encoded = field(row, key)?;
+                        ensure!(encoded.len() <= 87384, "oversized extended attribute");
+                        return Ok(Sql::Blob(base64::Engine::decode(
+                            &base64::engine::general_purpose::STANDARD,
+                            encoded,
+                        )?));
                     }
                     Ok(match &row[key] {
                         Value::Null => Sql::Null,

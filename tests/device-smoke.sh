@@ -18,7 +18,7 @@ for disk in a b; do
     mount -o loop,nodev,nosuid "$base/$disk.img" "$base/$disk"
     "$tier" --db "$base/tier.db" target "$disk" "$base/$disk"
 done
-"$tier" --db "$base/tier.db" policy / '{"front":["a","b"],"front_count":2,"long":["a","b"],"long_count":2,"delay_secs":0}'
+"$tier" --db "$base/tier.db" policy / '{"write_cache":[],"cache_copies":1,"persistent_storage":["a","b"],"persistent_copies":2,"persist_delay_secs":3600,"low_water":0,"high_water":1}'
 "$tier" --db "$base/tier.db" serve "$base/share" --admin 127.0.0.1:0 > "$base/tier.log" 2>&1 &
 server=$!
 for _ in {1..100}; do mountpoint -q "$base/share" && break; sleep .1; done

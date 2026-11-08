@@ -18,9 +18,16 @@ function open(key: string, data: Record<string, unknown>) {
     >
       <p>{{ b.config.seconds }} 秒或 {{ b.config.changes }} 次提交触发</p>
       <p class="muted">
-        最近 {{ b.config.keep }} 份 · 小时窗口 {{ b.config.hourly ?? 0 }} ·
-        天窗口
-        {{ b.config.daily ?? 0 }}
+        最近 {{ b.config.keep }} 份
+        <template v-if="b.config.retain_days">
+          · 最近 {{ b.config.retain_days }} 天全部保留
+        </template>
+        <template v-if="b.config.hourly">
+          · 最近 {{ b.config.hourly }} 小时每小时一份
+        </template>
+        <template v-if="b.config.daily">
+          · 最近 {{ b.config.daily }} 天每天一份
+        </template>
       </p>
       <p>{{ (b.config.directories as string[]).join("、") }}</p>
       <button @click="open('backup_schedule', b.config)">编辑计划</button>

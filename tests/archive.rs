@@ -63,7 +63,7 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
     engine.set_policy(
         "/",
         &serde_json::from_value(
-            json!({"front":["disk"],"front_count":1,"long":["disk"],"long_count":1,"delay_secs":0}),
+            json!({"write_cache":["disk"],"cache_copies":1,"persistent_storage":["disk"],"persistent_copies":1,"persist_delay_secs":0}),
         )?,
     )?;
     engine.add_archive("remote", &url, None, None)?;
@@ -129,7 +129,7 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
     reopened.set_policy(
         "/",
         &serde_json::from_value(
-            json!({"front":["disk"],"front_count":1,"long":["long"],"long_count":1,"delay_secs":0}),
+            json!({"write_cache":["disk"],"cache_copies":1,"persistent_storage":["long"],"persistent_copies":1,"persist_delay_secs":0}),
         )?,
     )?;
     reopened.reconcile()?;
@@ -171,7 +171,7 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
     let repaired = state["cloud_copies"][0]["key"].as_str().unwrap();
     let settings = |manual| {
         serde_json::from_value(
-            json!({"front":["disk"],"front_count":1,"long":["long"],"long_count":1,"delay_secs":0,"manual_repair":manual,"repair_grace_secs":300}),
+            json!({"write_cache":["disk"],"cache_copies":1,"persistent_storage":["long"],"persistent_copies":1,"persist_delay_secs":0,"manual_repair":manual,"repair_grace_secs":300}),
         )
     };
     reopened.set_policy("/", &settings(true)?)?;

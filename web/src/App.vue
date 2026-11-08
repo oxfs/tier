@@ -12,6 +12,7 @@ import {
 } from "@lucide/vue";
 import ActionDialog from "./components/ActionDialog.vue";
 import Devices from "./components/Devices.vue";
+import TrashView from "./views/TrashView.vue";
 import ArchivesView from "./views/ArchivesView.vue";
 import BackupsView from "./views/BackupsView.vue";
 import Health from "./components/Health.vue";
@@ -19,7 +20,6 @@ import {
   pages,
   actions,
   bytes,
-  date,
   needsAttention,
   type State,
   type Page,
@@ -38,8 +38,12 @@ function navigate() {
   page.value = current();
   document.title = pages[page.value] + " · Tier";
 }
+let queuedRefresh = false;
 async function refresh() {
-  if (loading.value) return;
+  if (loading.value) {
+    queuedRefresh = true;
+    return;
+  }
   loading.value = true;
   try {
     const response = await fetch("/api/state", { cache: "no-store" });
@@ -51,6 +55,10 @@ async function refresh() {
     message.value = "状态读取失败 · " + String(e);
   } finally {
     loading.value = false;
+    if (queuedRefresh) {
+      queuedRefresh = false;
+      void refresh();
+    }
   }
 }
 onMounted(() => {
@@ -219,65 +227,34 @@ const icons = {
         <div class="grid">
           <article class="entity" v-for="p in state.policies" :key="p.node">
             <h3>{{ p.path }}</h3>
-            <p>
-              前台确认 {{ p.policy.front_count }} 份 ·
-              {{ (p.policy.front as string[]).join("、") }}
+            <p v-if="p.policy.persistent_storage.length">
+              持久化存储 {{ p.policy.persistent_copies }} 份 ·
+              {{ p.policy.persistent_storage.join("、") }}
             </p>
-            <p>
-              长期保留 {{ p.policy.long_count }} 份 ·
-              {{ (p.policy.long as string[]).join("、") || "—" }}
+            <p v-else>尚未配置持久化存储</p>
+            <p v-if="p.policy.write_cache.length">
+              写入缓存 {{ p.policy.cache_copies }} 份 ·
+              {{ p.policy.write_cache.join("、") }}
             </p>
-            <p class="muted">安静期 {{ p.policy.delay_secs }} 秒</p>
+            <p v-if="p.policy.persistent_storage.length" class="muted">
+              {{
+                p.policy.write_cache.length
+                  ? `持久化延迟 ${p.policy.persist_delay_secs} 秒`
+                  : "直接写入持久化存储"
+              }}
+            </p>
             <button @click="open('policy', { ...p.policy, path: p.path })">
               编辑策略
             </button>
           </article>
         </div>
         <p v-if="!state.policies.length" class="empty">
-          尚未绑定目录策略，请先配置共享根目录。
+          尚未绑定副本策略，请先配置共享根目录。
         </p>
       </section>
       <ArchivesView v-if="page === 'archives'" :state="state" @action="open" />
       <BackupsView v-if="page === 'backups'" :state="state" @action="open" />
-      <section class="panel" v-if="page === 'trash'">
-        <h2>删除条目</h2>
-        <div class="scroll" v-if="state.trash.length">
-          <table>
-            <thead>
-              <tr>
-                <th>原路径</th>
-                <th>逻辑大小</th>
-                <th>各设备占用</th>
-                <th>到期时间</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="t in state.trash" :key="t.id">
-                <td>{{ t.original }}</td>
-                <td>{{ bytes(t.logical_bytes) }}</td>
-                <td>
-                  <div v-for="(n, k) in t.target_bytes" :key="k">
-                    {{ k }} · {{ bytes(n) }}
-                  </div>
-                </td>
-                <td>{{ date(t.expires) }}</td>
-                <td>
-                  <div class="actions">
-                    <button
-                      @click="open('restore', { id: t.id, path: t.original })"
-                    >
-                      恢复
-                    </button>
-                    <button @click="open('purge', { id: t.id })">清理</button>
-                  </div>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <p v-else class="empty">回收站为空。</p>
-      </section>
+      <TrashView v-if="page === 'trash'" :state="state" @action="open" />
     </template>
     <p v-else-if="loading" role="status">正在读取存储状态…</p>
   </main>
@@ -285,6 +262,7 @@ const icons = {
     v-if="action"
     :action="action"
     :initial="initial"
+    :state="state"
     @close="action = ''"
     @updated="refresh"
   />

@@ -4,7 +4,7 @@ use crate::{core::Engine, service::Maintenance};
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Request, State, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, Query, Request, State, rejection::JsonRejection},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -109,23 +109,29 @@ fn router(addr: SocketAddr, backend: Backend) -> Router {
             }),
         )
         .route("/api/state", get(read_state))
+        .route("/api/trash", get(read_trash))
         .route("/api/action", post(execute))
         .layer(DefaultBodyLimit::max(65536))
-        .layer(middleware::from_fn_with_state(addr, check_origin))
+        .layer(middleware::from_fn_with_state::<
+            _,
+            _,
+            (State<SocketAddr>, Request),
+        >(addr, check_origin))
         .with_state(backend)
 }
 
-async fn check_origin(State(addr): State<SocketAddr>, request: Request, next: Next) -> Response {
-    let headers = request.headers();
+fn allowed_origin(addr: SocketAddr, request: &Request) -> bool {
     let host = addr.to_string();
-    let matches =
-        |name, expected: &str| headers.get(name).and_then(|v| v.to_str().ok()) == Some(expected);
-    if !matches(header::HOST, &host) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    if request.method() == axum::http::Method::POST
-        && !matches(header::ORIGIN, &format!("http://{host}"))
-    {
+    let matches = |name, expected: &str| {
+        request.headers().get(name).and_then(|v| v.to_str().ok()) == Some(expected)
+    };
+    matches(header::HOST, &host)
+        && (request.method() != axum::http::Method::POST
+            || matches(header::ORIGIN, &format!("http://{host}")))
+}
+
+async fn check_origin(State(addr): State<SocketAddr>, request: Request, next: Next) -> Response {
+    if !allowed_origin(addr, &request) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let mut response = next.run(request).await;
@@ -148,6 +154,23 @@ async fn blocking(operation: impl FnOnce() -> Result<Value> + Send + 'static) ->
 }
 fn bad_request(error: String) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct TrashQuery {
+    page: Option<u64>,
+    page_size: Option<u64>,
+}
+
+async fn read_trash(State(backend): State<Backend>, Query(query): Query<TrashQuery>) -> Response {
+    blocking(move || {
+        backend
+            .engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine unavailable"))?
+            .trash_page(query.page.unwrap_or(1), query.page_size.unwrap_or(25))
+    })
+    .await
 }
 
 async fn read_state(State(backend): State<Backend>) -> Response {
@@ -210,6 +233,18 @@ mod tests {
             .into_string()?;
         drop(slow);
         assert!(serde_json::from_str::<Value>(&state)?["targets"].is_array());
+        let page: Value = serde_json::from_reader(
+            ureq::get(&format!("{origin}/api/trash?page=2&page_size=1"))
+                .call()?
+                .into_reader(),
+        )?;
+        assert_eq!(page["page"], 1);
+        assert_eq!(page["page_size"], 1);
+        assert_eq!(page["items"], json!([]));
+        assert!(matches!(
+            ureq::get(&format!("{origin}/api/trash?page_size=101")).call(),
+            Err(ureq::Error::Status(400, _))
+        ));
         assert!(matches!(
             ureq::get(&origin).set("Host", "evil.invalid").call(),
             Err(ureq::Error::Status(403, _))
@@ -238,7 +273,7 @@ mod tests {
         post("target", json!({"name":"disk","path":target}), 200)?;
         post(
             "policy",
-            json!({"path":"/","front":["disk"],"front_count":1,"long":["disk"],"long_count":1,"delay_secs":0}),
+            json!({"path":"/","write_cache":["disk"],"cache_copies":1,"persistent_storage":["disk"],"persistent_copies":1,"persist_delay_secs":0}),
             200,
         )?;
         let path = root.path().join("snapshot.json");

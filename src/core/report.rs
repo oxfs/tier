@@ -134,7 +134,7 @@ impl Engine {
                 "remote_only"
             } else if long >= required {
                 "healthy"
-            } else if now()?.saturating_sub(mtime) < policy.delay_secs {
+            } else if now()?.saturating_sub(mtime) < policy.persist_delay_secs {
                 "waiting"
             } else if policy.manual_repair {
                 "needs_attention"
@@ -178,8 +178,7 @@ impl Engine {
             "SELECT json_object('name',name,'path',path,'identity',identity,'domain',domain)
             FROM targets ORDER BY name",
         )?;
-        let trash=rows("SELECT json_object('id',id,'node',node,'original',original,'deleted',deleted,'expires',expires)
-            FROM trash ORDER BY id")?;
+        let trash_count: u64 = tx.query_row("SELECT count(*) FROM trash", [], |row| row.get(0))?;
         let cloud_targets = rows(
             "SELECT json_object('name',t.name,'url',t.url,'object_count',count(c.key))
             FROM cloud_targets t LEFT JOIN cloud_copies c ON c.target=t.name
@@ -188,7 +187,7 @@ impl Engine {
         let backup_schedule =
             rows("SELECT json_object('config',json(config)) FROM backup_schedule")?;
         let mut state = serde_json::json!({
-            "seq":seq,"targets":targets,"trash":trash,"cloud_targets":cloud_targets,
+            "seq":seq,"targets":targets,"trash_count":trash_count,"cloud_targets":cloud_targets,
             "backup_schedule":backup_schedule,"policies":[],"cloud_policy":[],"archive_errors":[]
         });
         {
@@ -210,7 +209,10 @@ impl Engine {
                 let raw: &str = row.get_ref(3)?.as_str()?;
                 let mut record = serde_json::json!({"node":row.get::<_,String>(1)?,"path":row.get::<_,String>(2)?});
                 match kind {
-                    "policies" => record["policy"] = serde_json::from_str(raw)?,
+                    "policies" => {
+                        record["policy"] =
+                            serde_json::to_value(serde_json::from_str::<Policy>(raw)?)?
+                    }
                     "cloud_policy" => record["settings"] = serde_json::from_str(raw)?,
                     "archive_errors" => record["error"] = raw.into(),
                     _ => unreachable!(),
@@ -222,10 +224,22 @@ impl Engine {
         Ok(state)
     }
 
-    pub fn state(&self) -> Result<serde_json::Value> {
-        let mut state = self.status_catalog()?;
-        state["health"] = self.health()?.into();
-        for row in state["trash"].as_array_mut().context("invalid trash")? {
+    pub fn trash_page(&self, requested: u64, size: u64) -> Result<serde_json::Value> {
+        ensure!(
+            requested > 0 && (1..=100).contains(&size),
+            "invalid trash page or page size"
+        );
+        let tx = self.db.unchecked_transaction()?;
+        let total: u64 = tx.query_row("SELECT count(*) FROM trash", [], |r| r.get(0))?;
+        let pages = total.div_ceil(size);
+        let page = requested.min(pages.max(1));
+        let mut items = tx.prepare("SELECT id,node,original,deleted,expires FROM trash ORDER BY id DESC LIMIT ? OFFSET ?")?
+            .query_map(params![size,(page-1)*size], |r| Ok(serde_json::json!({
+                "id":r.get::<_,i64>(0)?, "node":r.get::<_,String>(1)?, "original":r.get::<_,String>(2)?,
+                "deleted":r.get::<_,u64>(3)?, "expires":r.get::<_,u64>(4)?
+            })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        tx.commit()?;
+        for row in &mut items {
             let node = row["node"].as_str().context("invalid trash object")?;
             let subtree = "WITH RECURSIVE tree(id) AS (VALUES(?) UNION ALL SELECT n.id FROM nodes n JOIN tree ON n.parent=tree.id)";
             let logical: u64 = self.db.query_row(
@@ -254,6 +268,14 @@ impl Engine {
             row["logical_bytes"] = logical.into();
             row["target_bytes"] = serde_json::to_value(sizes)?;
         }
+        Ok(
+            serde_json::json!({"items":items,"total":total,"page":page,"page_size":size,"pages":pages}),
+        )
+    }
+
+    pub fn state(&self) -> Result<serde_json::Value> {
+        let mut state = self.status_catalog()?;
+        state["health"] = self.health()?.into();
         let sql = "SELECT path, seq, time, error
             FROM backup_status";
         let statuses = self
@@ -305,6 +327,7 @@ impl Engine {
             })?;
         let mut out = serde_json::json!({"format":1,"seq":seq,"system_id":system_id});
         for table in [
+            "xattrs",
             "nodes",
             "copies",
             "targets",
@@ -330,6 +353,11 @@ impl Engine {
                         match r.get_ref(i)? {
                             ValueRef::Null => serde_json::Value::Null,
                             ValueRef::Integer(v) => v.into(),
+                            ValueRef::Blob(v) => base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                v,
+                            )
+                            .into(),
                             ValueRef::Text(v) => std::str::from_utf8(v)?.into(),
                             _ => bail!("unsupported snapshot field"),
                         },
@@ -337,7 +365,9 @@ impl Engine {
                 }
                 data.push(obj)
             }
-            out[table] = serde_json::to_value(data)?;
+            if table != "xattrs" || !data.is_empty() {
+                out[table] = serde_json::to_value(data)?;
+            }
         }
         tx.commit()?;
         Ok(out)
@@ -347,6 +377,41 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn trash_pages_are_bounded_sorted_and_clamped_after_purge() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = Engine::open(&tmp.path().join("db"))?;
+        let disk = tmp.path().join("disk");
+        fs::create_dir(&disk)?;
+        engine.add_target("disk", &disk)?;
+        engine.set_policy(
+            "/",
+            &Policy {
+                write_cache: vec!["disk".into()],
+                ..Default::default()
+            },
+        )?;
+        for name in ["/one", "/two", "/three"] {
+            engine.mkdir(name)?;
+            engine.put(&format!("{name}/item"), b"abc")?;
+            engine.remove(name)?;
+        }
+        let page = engine.trash_page(1, 2)?;
+        assert_eq!(page["total"], 3);
+        assert_eq!(page["items"][0]["original"], "/three");
+        assert_eq!(page["items"][0]["logical_bytes"], 3);
+        assert_eq!(page["items"][0]["target_bytes"]["disk"], 3);
+        let last = engine.trash_page(u64::MAX, 2)?;
+        assert_eq!(last["page"], 2);
+        engine.purge(last["items"][0]["id"].as_i64().unwrap())?;
+        assert_eq!(engine.trash_page(2, 2)?["page"], 1);
+        assert!(engine.trash_page(0, 25).is_err());
+        assert!(engine.trash_page(1, 101).is_err());
+        let state = engine.state()?;
+        assert_eq!(state["trash_count"], 2);
+        assert!(state.get("trash").is_none());
+        Ok(())
+    }
     #[test]
     fn dashboard_uses_resolved_paths_without_recovery_internals() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -358,7 +423,7 @@ mod tests {
         engine.set_policy(
             "/家庭",
             &Policy {
-                front: vec!["disk".into()],
+                write_cache: vec!["disk".into()],
                 ..Policy::default()
             },
         )?;
@@ -370,7 +435,7 @@ mod tests {
         )?;
         let state = engine.state()?;
         assert_eq!(state["policies"][0]["path"], "/家庭");
-        assert_eq!(state["policies"][0]["policy"]["front"][0], "disk");
+        assert_eq!(state["policies"][0]["policy"]["write_cache"][0], "disk");
         assert_eq!(state["cloud_targets"][0]["object_count"], 0);
         assert!(state["cloud_targets"][0].get("pass_env").is_none());
         for table in [
@@ -395,9 +460,9 @@ mod tests {
         engine.set_policy(
             "/",
             &Policy {
-                front: vec!["disk".into()],
-                long: vec!["disk".into()],
-                long_count: 1,
+                write_cache: vec!["disk".into()],
+                persistent_storage: vec!["disk".into()],
+                persistent_copies: 1,
                 ..Default::default()
             },
         )?;

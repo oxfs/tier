@@ -21,11 +21,11 @@ export interface Policy {
   node: string;
   path: string;
   policy: {
-    front: string[];
-    front_count: number;
-    long: string[];
-    long_count: number;
-    delay_secs: number;
+    write_cache: string[];
+    cache_copies: number;
+    persistent_storage: string[];
+    persistent_copies: number;
+    persist_delay_secs: number;
   };
 }
 export interface CloudPolicy {
@@ -71,21 +71,22 @@ export interface State {
       seconds: number;
       changes: number;
       keep: number;
+      retain_days?: number;
       hourly?: number;
       daily?: number;
       directories: string[];
     };
   }[];
   backup_status: Backup[];
-  trash: Trash[];
+  trash_count: number;
   seq: number;
 }
 export const pages = {
   overview: "存储概览",
   devices: "存储设备",
-  policies: "目录策略",
-  archives: "云端归档",
-  backups: "快照备份",
+  policies: "副本策略",
+  archives: "归档",
+  backups: "元数据",
   trash: "回收站",
 };
 export type Page = keyof typeof pages;
@@ -94,11 +95,11 @@ export const actions: Record<string, string> = {
   inspect: "恢复预检",
   archive: "添加归档目标",
   cloud_policy: "配置归档策略",
-  backup_schedule: "配置备份计划",
+  backup_schedule: "设置快照计划",
   snapshot: "导出快照",
   restore: "恢复文件",
   purge: "永久删除",
-  policy: "配置目录策略",
+  policy: "配置副本策略",
   inherit: "恢复继承",
   target: "添加存储设备",
 };

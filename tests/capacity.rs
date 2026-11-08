@@ -14,9 +14,9 @@ fn full_cache_respects_the_configured_confirmation_policy() -> Result<()> {
     fs::create_dir(&disk)?;
     db.add_target("disk", &disk)?;
     let mut policy = Policy {
-        front: vec!["cache".into()],
-        long: vec!["disk".into()],
-        long_count: 1,
+        write_cache: vec!["cache".into()],
+        persistent_storage: vec!["disk".into()],
+        persistent_copies: 1,
         low_water: 85,
         high_water: 90,
         ..Policy::default()
@@ -46,8 +46,8 @@ fn full_cache_respects_the_configured_confirmation_policy() -> Result<()> {
     assert_eq!(db.get("/first")?, blob);
     assert_eq!(db.get("/third")?, blob);
     policy.direct_fallback = true;
-    policy.front = vec!["disk".into()];
-    policy.long = vec!["cache".into()];
+    policy.write_cache = vec!["disk".into()];
+    policy.persistent_storage = vec!["cache".into()];
     db.set_policy("/", &policy)?;
     fs::rename(&disk, work.path().join("offline"))?;
     let error = db.put("/oversized", &vec![0; 9 * 1024 * 1024]).unwrap_err();

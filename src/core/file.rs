@@ -32,8 +32,8 @@ impl Engine {
             None => Uuid::new_v4().to_string(),
         };
         let mut p = self.policy(&parent.id)?;
-        rank(&mut p.front, &id);
-        rank(&mut p.long, &id);
+        rank(&mut p.write_cache, &id);
+        rank(&mut p.persistent_storage, &id);
         if was_present {
             self.db
                 .execute("INSERT OR IGNORE INTO pending_writes VALUES(?)", [&id])?;
@@ -84,17 +84,24 @@ impl Engine {
             bail!(message)
         };
         let mut confirmations = confirmations;
-        let copies = match confirmations(&p.front, p.front_count, Some(p.high_water)) {
-            Err(_) if p.direct_fallback => {
-                confirmations(&p.long, p.fallback_count.unwrap_or(p.long_count), None)?
+        let copies = if p.write_cache.is_empty() {
+            ensure!(p.persistent_copies > 0, "no persistent storage configured");
+            confirmations(&p.persistent_storage, p.persistent_copies, None)?
+        } else {
+            match confirmations(&p.write_cache, p.cache_copies, Some(p.high_water)) {
+                Err(_) if p.direct_fallback => confirmations(
+                    &p.persistent_storage,
+                    p.fallback_count.unwrap_or(p.persistent_copies),
+                    None,
+                )?,
+                result => result?,
             }
-            result => result?,
         };
         let publish = (|| -> Result<()> {
-            let tx = self.db.unchecked_transaction()?;
+            let tx = self.write_transaction()?;
             let mut latest = self.policy(&parent.id)?;
-            rank(&mut latest.front, &id);
-            rank(&mut latest.long, &id);
+            rank(&mut latest.write_cache, &id);
+            rank(&mut latest.persistent_storage, &id);
             ensure!(latest == p, "policy changed during write");
             let current = self.stat(path).ok();
             ensure!(
@@ -130,9 +137,17 @@ impl Engine {
     pub fn copy_to(&self, path: &str, out: &mut fs::File) -> Result<()> {
         let n = self.stat(path)?;
         ensure!(!n.is_dir, "is directory");
-        self.copy_id(&n.id, out)
+        self.copy_id(&n.id, out).map(|_| ())
     }
-    pub(crate) fn copy_id(&self, id: &str, out: &mut fs::File) -> Result<()> {
+    pub(crate) fn stage_copy(&self, id: &str, out: &mut fs::File) -> Result<String> {
+        // Local staging already read back and verified the destination. WebDAV
+        // verified the incoming stream, so read back the staged file before reuse.
+        match self.copy_id(id, out)? {
+            Some(hash) => Ok(hash),
+            None => Ok(fingerprint(out)?.1),
+        }
+    }
+    fn copy_id(&self, id: &str, out: &mut fs::File) -> Result<Option<String>> {
         let mut st=self.db.prepare("SELECT target,object,c.hash FROM copies c JOIN nodes n ON n.id=c.node AND n.hash=c.hash WHERE node=?")?;
         let rows = st.query_map([id], |r| {
             Ok((
@@ -150,10 +165,11 @@ impl Engine {
             out.rewind()?;
             if io::copy(&mut source, out).is_ok() && fingerprint(out)?.1 == h {
                 out.rewind()?;
-                return Ok(());
+                return Ok(Some(h));
             }
         }
-        crate::archive::recall_to(&self.db, id, out)
+        crate::archive::recall_to(&self.db, id, out)?;
+        Ok(None)
     }
     pub fn get(&self, path: &str) -> Result<Vec<u8>> {
         let n = self.stat(path)?;

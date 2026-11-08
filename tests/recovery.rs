@@ -10,7 +10,7 @@ fn import_requires_confirmation_for_damaged_media() -> Result<()> {
     fs::create_dir(&disk)?;
     let engine = Engine::open(&tmp.path().join("source.db"))?;
     engine.add_target("disk", &disk)?;
-    engine.set_policy("/",&serde_json::from_value(serde_json::json!({"front":["disk"],"front_count":1,"long":["disk"],"long_count":1,"delay_secs":0}))?)?;
+    engine.set_policy("/",&serde_json::from_value(serde_json::json!({"write_cache":["disk"],"cache_copies":1,"persistent_storage":["disk"],"persistent_copies":1,"persist_delay_secs":0}))?)?;
     engine.put("/photo", b"correct")?;
     let snapshot = engine.snapshot()?;
     let object = disk.join(snapshot["copies"][0]["object"].as_str().unwrap());
@@ -32,7 +32,7 @@ fn trash_subtree_is_verified_without_restoring_deleted_paths() -> Result<()> {
     fs::create_dir(&disk)?;
     let db = Engine::open(&tmp.path().join("db"))?;
     db.add_target("local", &disk)?;
-    db.set_policy("/",&serde_json::from_value(serde_json::json!({"front":["local"],"front_count":1,"long":["local"],"long_count":1,"delay_secs":0}))?)?;
+    db.set_policy("/",&serde_json::from_value(serde_json::json!({"write_cache":["local"],"cache_copies":1,"persistent_storage":["local"],"persistent_copies":1,"persist_delay_secs":0}))?)?;
     db.mkdir("/old")?;
     db.put("/old/photo", b"abc")?;
     db.remove("/old")?;
