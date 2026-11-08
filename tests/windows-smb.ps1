@@ -29,6 +29,9 @@ try {
         if ($null -ne $other) { $other.Dispose(); throw 'second writer was not rejected' }
     } finally {$writer.Dispose()}
     if ([Convert]::ToHexString([IO.File]::ReadAllBytes($target)) -ne '01090304'){throw 'partial write mismatch'}
+    $timestamp = [DateTime]::new(2024,1,2,3,4,5,[DateTimeKind]::Utc).AddTicks(1234567)
+    [IO.File]::SetLastWriteTimeUtc($target,$timestamp)
+    if ([IO.File]::GetLastWriteTimeUtc($target) -ne $timestamp) { throw 'SMB modification time lost precision' }
     $reader=[IO.File]::Open($target,'Open','Read',$open)
     try {
         [IO.File]::WriteAllBytes($temp,[byte[]](7,8,9))

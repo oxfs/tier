@@ -37,6 +37,7 @@ struct Handle {
     writer: Option<crate::core::Writer>,
 }
 struct Fs {
+    mounted_at: SystemTime,
     engine: Engine,
     paths: HashMap<u64, String>,
     inodes: HashMap<String, u64>,
@@ -87,7 +88,8 @@ impl Fs {
             blocks: size.div_ceil(512),
             atime: node.atime,
             mtime: time,
-            ctime: time,
+            // Samba probes the share root to determine timestamp precision.
+            ctime: if ino == 1 { self.mounted_at } else { time },
             crtime: time,
             kind: if node.is_dir {
                 FileType::Directory
@@ -665,6 +667,7 @@ pub(crate) struct MountedShare(Session<Fs>, String);
 impl MountedShare {
     pub(crate) fn attach(engine: Engine, path: &Path) -> Result<Self> {
         let fs = Fs {
+            mounted_at: SystemTime::now(),
             engine,
             paths: HashMap::from([(1, "/".into())]),
             ids: HashMap::from([(1, "root".into())]),
