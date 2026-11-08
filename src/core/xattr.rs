@@ -44,11 +44,8 @@ impl Engine {
     pub(crate) fn stream_attr(&self, node: &str, name: &str) -> Result<Vec<u8>> {
         check_name(name)?;
         self.db
-            .query_row(
-                "SELECT value FROM xattrs WHERE node=? AND name=?",
-                (node, name),
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT value FROM xattrs WHERE node=? AND name=?")?
+            .query_row((node, name), |r| r.get(0))
             .optional()?
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODATA).into())
     }
@@ -68,13 +65,24 @@ impl Engine {
             libc::XATTR_CREATE => {
                 "INSERT INTO xattrs(node,name,value) VALUES(?,?,?) ON CONFLICT(node,name) DO NOTHING"
             }
-            libc::XATTR_REPLACE => "UPDATE xattrs SET value=?3 WHERE node=?1 AND name=?2",
+            libc::XATTR_REPLACE => {
+                if self.stream_attr(node, name)? == value {
+                    return Ok(());
+                }
+                "UPDATE xattrs SET value=?3 WHERE node=?1 AND name=?2"
+            }
             0 => {
-                "INSERT INTO xattrs(node,name,value) VALUES(?,?,?) ON CONFLICT(node,name) DO UPDATE SET value=excluded.value"
+                "INSERT INTO xattrs(node,name,value) VALUES(?,?,?) ON CONFLICT(node,name) DO UPDATE SET value=excluded.value WHERE value != excluded.value"
             }
             _ => return Err(io::Error::from_raw_os_error(libc::EINVAL).into()),
         };
-        if self.db.execute(query, (node, name, value))? == 0 {
+        if self
+            .db
+            .prepare_cached(query)?
+            .execute((node, name, value))?
+            == 0
+            && flags != 0
+        {
             return Err(
                 io::Error::from_raw_os_error(if flags == libc::XATTR_CREATE {
                     libc::EEXIST
@@ -90,7 +98,7 @@ impl Engine {
         let mut names = Vec::new();
         let mut st = self
             .db
-            .prepare("SELECT name FROM xattrs WHERE node=? ORDER BY name")?;
+            .prepare_cached("SELECT name FROM xattrs WHERE node=? ORDER BY name")?;
         for name in st.query_map([node], |r| r.get::<_, String>(0))? {
             names.extend_from_slice(name?.as_bytes());
             names.push(0);
@@ -155,6 +163,21 @@ mod tests {
                 .is_err()
         );
         engine.set_stream_attr(&node, "user.DOSATTRIB", &bytes, 0)?;
+        let revision = engine.snapshot()?["seq"].clone();
+        engine.set_stream_attr(&node, name, &bytes, 0)?;
+        engine.set_stream_attr(&node, name, &bytes, libc::XATTR_REPLACE)?;
+        assert_eq!(engine.snapshot()?["seq"], revision);
+        assert!(
+            engine
+                .set_stream_attr(&node, "user.DosStream.absent", &[], libc::XATTR_REPLACE)
+                .is_err()
+        );
+        let time = SystemTime::now();
+        engine.set_times(&node, Some(time), Some(time))?;
+        let revision = engine.snapshot()?["seq"].clone();
+        engine.set_times(&node, Some(time), None)?;
+        engine.set_times(&node, None, Some(time))?;
+        assert_eq!(engine.snapshot()?["seq"], revision);
         let after = engine.snapshot()?;
         assert!(after["seq"].as_u64() > before["seq"].as_u64());
         crate::recovery::import(&after, &tmp.path().join("new"), &Default::default(), false)?;

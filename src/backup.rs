@@ -51,18 +51,16 @@ pub(crate) fn configure(db: &rusqlite::Connection) -> Result<()> {
 }
 
 pub fn init(engine: &Engine) -> Result<()> {
-    let tx = engine.db.unchecked_transaction()?;
+    let tx = engine.write_transaction()?;
     let installed: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='revision_xattrs_INSERT')",
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='revision_xattrs_INSERT') AND NOT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='backup_transaction')",
         [],
         |r| r.get(0),
     )?;
-    tx.execute_batch("CREATE TABLE IF NOT EXISTS revision(id INTEGER PRIMARY KEY CHECK(id=1),seq INTEGER NOT NULL);
-    INSERT OR IGNORE INTO revision VALUES(1,0);
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS revision(id INTEGER PRIMARY KEY CHECK(id=1),seq INTEGER NOT NULL,token TEXT NOT NULL DEFAULT '');
+    INSERT OR IGNORE INTO revision(id,seq) VALUES(1,0);
     CREATE TABLE IF NOT EXISTS backup_schedule(id INTEGER PRIMARY KEY CHECK(id=1),config TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS backup_status(path TEXT PRIMARY KEY,seq INTEGER NOT NULL,time INTEGER NOT NULL,error TEXT);
-    CREATE TABLE IF NOT EXISTS backup_transaction(id INTEGER PRIMARY KEY CHECK(id=1),token TEXT NOT NULL);
-    INSERT OR IGNORE INTO backup_transaction VALUES(1,'');
     CREATE TABLE IF NOT EXISTS backup_changes(second INTEGER PRIMARY KEY,seq INTEGER NOT NULL);
     CREATE TRIGGER IF NOT EXISTS track_backup_revision AFTER UPDATE OF seq ON revision
     WHEN EXISTS(SELECT 1 FROM backup_schedule)
@@ -76,6 +74,13 @@ pub fn init(engine: &Engine) -> Result<()> {
     if installed {
         tx.commit()?;
         return Ok(());
+    }
+    if !tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('revision') WHERE name='token')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        tx.execute_batch("ALTER TABLE revision ADD COLUMN token TEXT NOT NULL DEFAULT ''")?;
     }
     tx.execute(
         "INSERT OR IGNORE INTO backup_changes SELECT unixepoch(),seq FROM revision",
@@ -99,14 +104,14 @@ pub fn init(engine: &Engine) -> Result<()> {
             tx.execute_batch(&format!(
                 "DROP TRIGGER IF EXISTS revision_{table}_{event};
                 CREATE TRIGGER revision_{table}_{event} AFTER {event} ON {table}
-                WHEN (SELECT token FROM backup_transaction WHERE id=1) != tier_transaction()
+                WHEN (SELECT token FROM revision WHERE id=1) != tier_transaction()
                 BEGIN
-                    UPDATE revision SET seq=seq+1 WHERE id=1;
-                    UPDATE backup_transaction SET token=tier_transaction() WHERE id=1;
+                    UPDATE revision SET seq=seq+1,token=tier_transaction() WHERE id=1;
                 END;"
             ))?;
         }
     }
+    tx.execute_batch("DROP TABLE IF EXISTS backup_transaction")?;
     tx.commit()?;
     Ok(())
 }
@@ -384,6 +389,28 @@ fn expired(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    #[test]
+    fn legacy_transaction_marker_moves_without_resetting_revision() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("legacy.sqlite");
+        rusqlite::Connection::open(&path)?.execute_batch(
+            "CREATE TABLE revision(id INTEGER PRIMARY KEY, seq INTEGER NOT NULL);
+             INSERT INTO revision VALUES(1,17);
+             CREATE TABLE backup_transaction(id INTEGER PRIMARY KEY, token TEXT NOT NULL);
+             INSERT INTO backup_transaction VALUES(1,'old-connection');",
+        )?;
+        let engine = Engine::open(&path)?;
+        assert_eq!(engine.snapshot()?["seq"], 17);
+        let old: bool = engine.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='backup_transaction')",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(!old);
+        engine.mkdir("/next")?;
+        assert_eq!(engine.snapshot()?["seq"], 18);
+        Ok(())
+    }
     #[test]
     fn stalled_device_does_not_delay_new_revisions_on_another_device() -> Result<()> {
         use std::time::{Duration, Instant};

@@ -22,37 +22,52 @@ fn timestamp_parts(time: SystemTime) -> (i64, u32) {
         }
     }
 }
+const NODE_COLUMNS: &str = "id,dir,size,coalesce(display_mtime,mtime),coalesce(display_mtime_nsec,0),display_atime,coalesce(display_atime_nsec,0)";
+fn decode_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
+    let mtime = unix_timestamp(row.get(3)?, row.get(4)?);
+    let nanos = row.get(6)?;
+    let atime = row
+        .get::<_, Option<i64>>(5)?
+        .map(|s| unix_timestamp(s, nanos))
+        .unwrap_or(mtime);
+    Ok(Node {
+        id: row.get(0)?,
+        is_dir: row.get(1)?,
+        size: row.get(2)?,
+        mtime,
+        atime,
+    })
+}
 impl Engine {
+    pub(crate) fn stat_id(&self, id: &str) -> Result<Node> {
+        Ok(self
+            .db
+            .prepare_cached(&format!("SELECT {NODE_COLUMNS} FROM nodes WHERE id=?"))?
+            .query_row([id], decode_node)?)
+    }
+    pub(crate) fn stat_child(&self, parent: &str, name: &str) -> Result<Node> {
+        Ok(self
+            .db
+            .prepare_cached(&format!(
+                "SELECT {NODE_COLUMNS} FROM nodes WHERE parent=? AND name=? COLLATE tier_name"
+            ))?
+            .query_row(params![parent, name], decode_node)?)
+    }
+    pub(crate) fn children(&self, parent: &str) -> Result<Vec<(String, Node)>> {
+        Ok(self
+            .db
+            .prepare_cached(
+                &format!("SELECT {NODE_COLUMNS},name FROM nodes WHERE parent=? ORDER BY name COLLATE tier_name"),
+            )?
+            .query_map([parent], |r| Ok((r.get(7)?, decode_node(r)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
     pub fn stat(&self, path: &str) -> Result<Node> {
-        const SELECT: &str = "SELECT id,dir,size,coalesce(display_mtime,mtime),coalesce(display_mtime_nsec,0),display_atime,coalesce(display_atime_nsec,0) FROM nodes";
-        fn decode(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
-            let mtime = unix_timestamp(row.get(3)?, row.get(4)?);
-            let nanos = row.get(6)?;
-            let atime = row
-                .get::<_, Option<i64>>(5)?
-                .map(|s| unix_timestamp(s, nanos))
-                .unwrap_or(mtime);
-            Ok(Node {
-                id: row.get(0)?,
-                is_dir: row.get(1)?,
-                size: row.get(2)?,
-                mtime,
-                atime,
-            })
-        }
         if path == "/" {
-            return Ok(self
-                .db
-                .query_row(&format!("{SELECT} WHERE id='root'"), [], decode)?);
+            return self.stat_id("root");
         }
         let (parent, name) = split(path)?;
-        let parent = self.stat(parent)?;
-        self.db
-            .query_row(
-                &format!("{SELECT} WHERE parent=? AND name=? COLLATE tier_name"),
-                params![parent.id, name],
-                decode,
-            )
+        self.stat_child(&self.stat(parent)?.id, name)
             .with_context(|| format!("lookup {path}"))
     }
     pub fn list(&self, path: &str) -> Result<Vec<String>> {
@@ -74,8 +89,18 @@ impl Engine {
     ) -> Result<()> {
         let a = atime.map(timestamp_parts);
         let m = mtime.map(timestamp_parts);
-        self.db.execute("UPDATE nodes SET display_atime=coalesce(?1,display_atime),display_atime_nsec=coalesce(?2,display_atime_nsec),display_mtime=coalesce(?3,display_mtime),display_mtime_nsec=coalesce(?4,display_mtime_nsec) WHERE id=?5",
-            params![a.map(|t|t.0),a.map(|t|t.1),m.map(|t|t.0),m.map(|t|t.1),id])?;
+        let sql = "UPDATE nodes SET display_atime=coalesce(?1,display_atime),
+            display_atime_nsec=coalesce(?2,display_atime_nsec),
+            display_mtime=coalesce(?3,display_mtime),display_mtime_nsec=coalesce(?4,display_mtime_nsec)
+            WHERE id=?5 AND ((?1 IS NOT NULL AND (display_atime IS NOT ?1 OR display_atime_nsec IS NOT ?2))
+            OR (?3 IS NOT NULL AND (display_mtime IS NOT ?3 OR display_mtime_nsec IS NOT ?4)))";
+        self.db.prepare_cached(sql)?.execute(params![
+            a.map(|t| t.0),
+            a.map(|t| t.1),
+            m.map(|t| t.0),
+            m.map(|t| t.1),
+            id
+        ])?;
         Ok(())
     }
     pub fn inherit_policy(&self, path: &str, archive: bool) -> Result<()> {

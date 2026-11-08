@@ -81,6 +81,7 @@ impl Engine {
                 )
                 .optional()?;
             let protected = tracking.is_some();
+            let mut incident = tracking.flatten();
             if !protected && now()?.saturating_sub(mtime) < p.persist_delay_secs {
                 continue;
             }
@@ -113,11 +114,17 @@ impl Engine {
                     continue;
                 }
                 if protected && !manual {
-                    let first = tracking.flatten().unwrap_or(now()?);
-                    self.db.execute(
-                        "UPDATE protection SET incident=? WHERE node=? AND incident IS NULL",
-                        params![first, id],
-                    )?;
+                    let first = if let Some(first) = incident {
+                        first
+                    } else {
+                        let first = now()?;
+                        self.db.execute(
+                            "UPDATE protection SET incident=? WHERE node=? AND incident IS NULL",
+                            params![first, id],
+                        )?;
+                        incident = Some(first);
+                        first
+                    };
                     if p.manual_repair || now()?.saturating_sub(first) < p.repair_grace_secs {
                         continue;
                     }
@@ -178,10 +185,12 @@ impl Engine {
             if good < needed {
                 errors.push(id)
             } else {
-                self.db.execute(
+                if !protected || incident.is_some() {
+                    self.db.execute(
                     "INSERT INTO protection VALUES(?,?,NULL) ON CONFLICT(node) DO UPDATE SET hash=excluded.hash,incident=NULL WHERE protection.hash!=excluded.hash OR protection.incident IS NOT NULL",
                     params![id, placement],
-                )?;
+                    )?;
+                }
                 if needed > 0 && good >= needed {
                     self.trim_obsolete(&id, &h, &p, &chosen)?;
                 }
@@ -265,6 +274,61 @@ impl Engine {
         for (root, key) in stale {
             let _ = root.remove_object(&key);
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[test]
+    fn healthy_tick_is_read_only_and_stale_archive_work_is_processed() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let engine = Engine::open(&dir.path().join("db"))?;
+        let disk = dir.path().join("disk");
+        fs::create_dir(&disk)?;
+        engine.add_target("disk", &disk)?;
+        engine.set_policy(
+            "/",
+            &Policy {
+                persistent_storage: vec!["disk".into()],
+                persistent_copies: 1,
+                ..Default::default()
+            },
+        )?;
+        engine.put("/photo", b"image")?;
+        engine.automatic_reconcile()?;
+        let commits = Arc::new(AtomicUsize::new(0));
+        let observed = commits.clone();
+        engine.db.commit_hook(Some(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+            false
+        }));
+        engine.automatic_reconcile()?;
+        engine.automatic_archive()?;
+        engine.archive_tick()?;
+        assert_eq!(commits.load(Ordering::Relaxed), 0);
+
+        engine.db.execute(
+            "INSERT INTO archive_checks VALUES('obsolete',0,NULL,NULL)",
+            [],
+        )?;
+        engine.db.execute(
+            "INSERT INTO archive_errors VALUES(?, 'stale')",
+            [engine.stat("/photo")?.id],
+        )?;
+        engine.automatic_archive()?;
+        let pending: i64 = engine.db.query_row(
+            "SELECT (SELECT count(*) FROM archive_checks)+(SELECT count(*) FROM archive_errors)",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(pending, 0);
         Ok(())
     }
 }

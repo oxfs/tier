@@ -181,6 +181,16 @@ impl Engine {
         self.run_archive(false)
     }
     fn run_archive(&self, manual: bool) -> Result<()> {
+        let work: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cloud_policy UNION ALL SELECT 1 FROM cloud_copies
+             UNION ALL SELECT 1 FROM archive_errors UNION ALL SELECT 1 FROM archive_checks
+             UNION ALL SELECT 1 FROM cloud_gc)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !work {
+            return Ok(());
+        }
         let sql = "WITH RECURSIVE live(id) AS (VALUES('root')
             UNION ALL
             SELECT n.id

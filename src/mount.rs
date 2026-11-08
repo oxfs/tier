@@ -63,6 +63,9 @@ impl Fs {
     }
     fn attr(&mut self, path: &str) -> Result<FileAttr, i32> {
         let node = self.engine.stat(path).map_err(|_| ENOENT)?;
+        Ok(self.node_attr(path, node))
+    }
+    fn node_attr(&mut self, path: &str, node: crate::core::Node) -> FileAttr {
         let ino = match self.inodes.get(&node.id) {
             Some(&ino) => ino,
             None => {
@@ -82,7 +85,7 @@ impl Fs {
             .map(|s| s.len())
             .unwrap_or(node.size);
         let time = node.mtime;
-        Ok(FileAttr {
+        FileAttr {
             ino,
             size,
             blocks: size.div_ceil(512),
@@ -103,7 +106,7 @@ impl Fs {
             rdev: 0,
             blksize: 4096,
             flags: 0,
-        })
+        }
     }
     fn open_file(&mut self, ino: u64, flags: i32) -> Result<u64, i32> {
         let write = flags & libc::O_ACCMODE != libc::O_RDONLY;
@@ -378,19 +381,25 @@ impl Filesystem for Fs {
         );
     }
     fn lookup(&mut self, _: &Request, p: u64, n: &OsStr, r: ReplyEntry) {
-        match self.child(p, n).and_then(|p| self.attr(&p)) {
+        match self.child(p, n).and_then(|path| {
+            let node = self
+                .engine
+                .stat_child(self.ids.get(&p).ok_or(ENOENT)?, n.to_str().ok_or(EINVAL)?)
+                .map_err(|_| ENOENT)?;
+            Ok(self.node_attr(&path, node))
+        }) {
             Ok(a) => r.entry(&TTL, &a, 0),
             Err(e) => r.error(e),
         }
     }
     fn getattr(&mut self, _: &Request, i: u64, r: ReplyAttr) {
-        match self
-            .paths
-            .get(&i)
-            .cloned()
-            .ok_or(ENOENT)
-            .and_then(|p| self.attr(&p))
-        {
+        match self.paths.get(&i).cloned().ok_or(ENOENT).and_then(|p| {
+            let node = self
+                .engine
+                .stat_id(self.ids.get(&i).ok_or(ENOENT)?)
+                .map_err(|_| ENOENT)?;
+            Ok(self.node_attr(&p, node))
+        }) {
             Ok(a) => r.attr(&TTL, &a),
             Err(e) => r.error(e),
         }
@@ -399,7 +408,10 @@ impl Filesystem for Fs {
         let Some(path) = self.paths.get(&i).cloned() else {
             return r.error(ENOENT);
         };
-        let names = match self.engine.list(&path) {
+        let Some(id) = self.ids.get(&i) else {
+            return r.error(ENOENT);
+        };
+        let names = match self.engine.children(id) {
             Ok(n) => n,
             Err(_) => return r.error(EIO),
         };
@@ -415,8 +427,9 @@ impl Filesystem for Fs {
                 "..".into(),
             ),
         ];
-        for name in names {
-            if let Ok(a) = self.child(i, OsStr::new(&name)).and_then(|p| self.attr(&p)) {
+        for (name, node) in names {
+            if let Ok(path) = self.child(i, OsStr::new(&name)) {
+                let a = self.node_attr(&path, node);
                 rows.push((a.ino, a.kind, name))
             }
         }
