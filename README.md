@@ -19,7 +19,7 @@ sudo systemctl enable --now tier
 systemctl status tier
 ```
 
-如果使用其他服务管理器，可将包内的 `tier` 放入 PATH，按示例创建配置、数据库父目录和共享挂载目录，然后以前台命令 `tier --config /etc/tier/tier.toml serve` 交由服务管理器托管。
+使用其他服务管理器时，将 `tier` 放入 PATH，安装包内的 `tier.toml` 到 `/etc/tier/`，创建数据库父目录和挂载目录。按共享示例建立 `tier` 系统组，让服务以 `root:tier` 身份运行前台命令 `tier --config /etc/tier/tier.toml serve`。这样挂载内文件的组与 Samba 的 `force group` 一致。
 
 在 NAS 本机打开 `http://127.0.0.1:9480`。从自己的电脑管理时，先执行 `ssh -L 9480:127.0.0.1:9480 用户名@NAS地址`，再打开同一地址。日志用 `journalctl -u tier -f` 查看。默认级别为 info，需要调试时可通过 systemd 服务环境变量设置 `RUST_LOG=tier=debug`。
 
