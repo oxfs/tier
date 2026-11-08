@@ -31,26 +31,6 @@ struct Signature(u64, u64, i64, i64, u64);
 type VerificationCache = HashMap<(PathBuf, String), (Signature, bool, std::time::Instant)>;
 static VERIFIED: LazyLock<Mutex<VerificationCache>> = LazyLock::new(Mutex::default);
 impl Engine {
-    pub(crate) fn target_stat(&self, name: &str) -> Result<libc::statvfs> {
-        use std::os::fd::AsRawFd;
-        let (path, expected): (String, String) = self.db.query_row(
-            "SELECT path,identity FROM targets WHERE name=?",
-            [name],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        let directory = fs::File::open(path)?;
-        let marker = format!("/proc/self/fd/{}/.tier-id", directory.as_raw_fd());
-        ensure!(
-            fs::read_to_string(marker)?.trim() == expected,
-            "target identity mismatch"
-        );
-        let mut stat = std::mem::MaybeUninit::uninit();
-        // The descriptor pins the same directory whose marker was checked above.
-        if unsafe { libc::fstatvfs(directory.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        Ok(unsafe { stat.assume_init() })
-    }
     pub(crate) fn verified_copy(&self, target: &str, key: &str, expected: &str) -> bool {
         self.verify(target, key, expected, true)
     }
@@ -61,8 +41,8 @@ impl Engine {
         let Ok(root) = self.target(target) else {
             return false;
         };
-        let path = root.join(key);
-        let Ok(mut file) = fs::File::open(&path) else {
+        let path = root.cache_key(key);
+        let Ok(mut file) = root.open_object(key) else {
             return false;
         };
         let stamp =
@@ -124,7 +104,7 @@ impl Engine {
         for (id, path, mtime, hash, pending) in files {
             let policy = self.policy(&id)?;
             let (targets, count) = policy.desired();
-            let required = crate::cloud::retained(&self.db, &id, count)?;
+            let required = crate::archive::retained(&self.db, &id, count)?;
             let mut locations = vec![];
             let mut domains = HashSet::new();
             let mut long = 0;
@@ -180,9 +160,70 @@ impl Engine {
         }
         Ok(result)
     }
+    fn status_catalog(&self) -> Result<serde_json::Value> {
+        // Read the UI's catalog in one short transaction. Device probes and
+        // content verification happen after this transaction has closed.
+        let tx = self.db.unchecked_transaction()?;
+        let seq: u64 = tx.query_row("SELECT seq FROM revision WHERE id=1", [], |r| r.get(0))?;
+        let rows = |sql: &str| -> Result<Vec<serde_json::Value>> {
+            let mut statement = tx.prepare(sql)?;
+            let mut cursor = statement.query([])?;
+            let mut values = Vec::new();
+            while let Some(row) = cursor.next()? {
+                values.push(serde_json::from_str(row.get_ref(0)?.as_str()?)?);
+            }
+            Ok(values)
+        };
+        let targets = rows(
+            "SELECT json_object('name',name,'path',path,'identity',identity,'domain',domain)
+            FROM targets ORDER BY name",
+        )?;
+        let trash=rows("SELECT json_object('id',id,'node',node,'original',original,'deleted',deleted,'expires',expires)
+            FROM trash ORDER BY id")?;
+        let cloud_targets = rows(
+            "SELECT json_object('name',t.name,'url',t.url,'object_count',count(c.key))
+            FROM cloud_targets t LEFT JOIN cloud_copies c ON c.target=t.name
+            GROUP BY t.name,t.url ORDER BY t.name",
+        )?;
+        let backup_schedule =
+            rows("SELECT json_object('config',json(config)) FROM backup_schedule")?;
+        let mut state = serde_json::json!({
+            "seq":seq,"targets":targets,"trash":trash,"cloud_targets":cloud_targets,
+            "backup_schedule":backup_schedule,"policies":[],"cloud_policy":[],"archive_errors":[]
+        });
+        {
+            let sql = "WITH RECURSIVE tree(id,path) AS (
+                VALUES('root','/')
+                UNION ALL SELECT n.id,rtrim(t.path,'/')||'/'||n.name
+                FROM nodes n JOIN tree t ON n.parent=t.id
+            ), entries(kind,node,settings) AS (
+                SELECT 'policies',node,policy FROM policies
+                UNION ALL SELECT 'cloud_policy',node,settings FROM cloud_policy
+                UNION ALL SELECT 'archive_errors',node,error FROM archive_errors
+            )
+            SELECT kind,node,path,settings FROM entries JOIN tree ON tree.id=entries.node
+            ORDER BY kind,path";
+            let mut query = tx.prepare(sql)?;
+            let mut cursor = query.query([])?;
+            while let Some(row) = cursor.next()? {
+                let kind: &str = row.get_ref(0)?.as_str()?;
+                let raw: &str = row.get_ref(3)?.as_str()?;
+                let mut record = serde_json::json!({"node":row.get::<_,String>(1)?,"path":row.get::<_,String>(2)?});
+                match kind {
+                    "policies" => record["policy"] = serde_json::from_str(raw)?,
+                    "cloud_policy" => record["settings"] = serde_json::from_str(raw)?,
+                    "archive_errors" => record["error"] = raw.into(),
+                    _ => unreachable!(),
+                }
+                state[kind].as_array_mut().unwrap().push(record);
+            }
+        }
+        tx.commit()?;
+        Ok(state)
+    }
+
     pub fn state(&self) -> Result<serde_json::Value> {
-        let mut state = self.snapshot()?;
-        state["archive_errors"] = crate::cloud::errors(&self.db)?;
+        let mut state = self.status_catalog()?;
         state["health"] = self.health()?.into();
         for row in state["trash"].as_array_mut().context("invalid trash")? {
             let node = row["node"].as_str().context("invalid trash object")?;
@@ -205,7 +246,7 @@ impl Engine {
             for (target, key) in copies {
                 let bytes = self
                     .target(&target)
-                    .and_then(|r| Ok(fs::metadata(r.join(key))?.len()))
+                    .and_then(|r| Ok(r.open_object(&key)?.metadata()?.len()))
                     .ok();
                 let value = sizes.entry(target).or_insert(Some(0u64));
                 *value = value.zip(bytes).map(|(sum, size)| sum + size);
@@ -306,6 +347,44 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dashboard_uses_resolved_paths_without_recovery_internals() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let disk = dir.path().join("disk");
+        fs::create_dir(&disk)?;
+        let engine = Engine::open(&dir.path().join("db"))?;
+        engine.add_target("disk", &disk)?;
+        engine.mkdir("/家庭")?;
+        engine.set_policy(
+            "/家庭",
+            &Policy {
+                front: vec!["disk".into()],
+                ..Policy::default()
+            },
+        )?;
+        engine.add_archive(
+            "remote",
+            "http://localhost/webdav",
+            Some("DAV_USER"),
+            Some("DAV_SECRET"),
+        )?;
+        let state = engine.state()?;
+        assert_eq!(state["policies"][0]["path"], "/家庭");
+        assert_eq!(state["policies"][0]["policy"]["front"][0], "disk");
+        assert_eq!(state["cloud_targets"][0]["object_count"], 0);
+        assert!(state["cloud_targets"][0].get("pass_env").is_none());
+        for table in [
+            "nodes",
+            "copies",
+            "cloud_copies",
+            "pending_writes",
+            "protection",
+        ] {
+            assert!(state.get(table).is_none());
+            assert!(engine.snapshot()?.get(table).is_some());
+        }
+        Ok(())
+    }
     #[test]
     fn active_writer_and_checksum_failures_are_visible() -> Result<()> {
         let tmp = tempfile::tempdir()?;

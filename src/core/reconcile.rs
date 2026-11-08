@@ -20,7 +20,7 @@ impl Engine {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (target, key) in rows {
             if let Ok(root) = self.target(&target) {
-                match fs::remove_file(root.join(&key)) {
+                match root.remove_object(&key) {
                     Ok(()) => (),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => (),
                     Err(_) => continue,
@@ -84,7 +84,7 @@ impl Engine {
             if !protected && now()?.saturating_sub(mtime) < p.delay_secs {
                 continue;
             }
-            let needed = crate::cloud::retained(&self.db, &id, count)?;
+            let needed = crate::archive::retained(&self.db, &id, count)?;
             let mut good = 0;
             let mut chosen = HashSet::new();
             let mut candidates = self.candidates(&targets)?;
@@ -165,13 +165,13 @@ impl Engine {
                         if let Some(previous) = previous
                             && let Ok(root) = self.target(t)
                         {
-                            let _ = fs::remove_file(root.join(previous));
+                            let _ = root.remove_object(&previous);
                         }
                         chosen.insert(t.clone());
                         candidates.confirmed(domain);
                         good += 1;
                     } else if let Ok(root) = self.target(t) {
-                        let _ = fs::remove_file(root.join(key));
+                        let _ = root.remove_object(&key);
                         super::report::cancelled(&id)?;
                     }
                 }
@@ -259,12 +259,12 @@ impl Engine {
                     "DELETE FROM copies WHERE node=? AND target=? AND object=?",
                     params![id, t, key],
                 )?;
-                stale.push(root.join(key));
+                stale.push((root, key));
             }
         }
         tx.commit()?;
-        for path in stale {
-            let _ = fs::remove_file(path);
+        for (root, key) in stale {
+            let _ = root.remove_object(&key);
         }
         Ok(())
     }

@@ -1,4 +1,47 @@
 use super::*;
+use std::os::fd::AsRawFd;
+
+/// Pins the directory whose identity was verified. All object operations use
+/// this descriptor even if the configured mountpoint changes underneath us.
+pub(crate) struct TargetDirectory {
+    directory: fs::File,
+    root: PathBuf,
+    registered: PathBuf,
+}
+
+impl TargetDirectory {
+    fn open(registered: PathBuf, identity: &str) -> Result<Self> {
+        let directory = fs::File::open(&registered)?;
+        let root = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        ensure!(
+            fs::read_to_string(root.join(".tier-id"))?.trim() == identity,
+            "target identity mismatch"
+        );
+        Ok(Self {
+            directory,
+            root,
+            registered,
+        })
+    }
+    pub(super) fn open_object(&self, key: &str) -> io::Result<fs::File> {
+        fs::File::open(self.root.join(key))
+    }
+    pub(super) fn remove_object(&self, key: &str) -> io::Result<()> {
+        fs::remove_file(self.root.join(key))
+    }
+    pub(super) fn cache_key(&self, key: &str) -> PathBuf {
+        self.registered.join(key)
+    }
+    pub(super) fn stat(&self) -> Result<libc::statvfs> {
+        let mut stat = std::mem::MaybeUninit::uninit();
+        // fstatvfs initializes stat on success and cannot resolve a replacement mount.
+        if unsafe { libc::fstatvfs(self.directory.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(unsafe { stat.assume_init() })
+    }
+}
+
 pub(super) struct Candidates<'a> {
     remaining: Vec<(&'a String, String)>,
     used: HashSet<String>,
@@ -112,18 +155,16 @@ impl Engine {
         )?;
         Ok(())
     }
-    pub(crate) fn target(&self, name: &str) -> Result<PathBuf> {
+    pub(crate) fn target(&self, name: &str) -> Result<TargetDirectory> {
         let (path, id): (String, String) = self.db.query_row(
             "SELECT path,identity FROM targets WHERE name=?",
             [name],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        let path = PathBuf::from(path);
-        ensure!(
-            fs::read_to_string(path.join(".tier-id"))?.trim() == id,
-            "target identity mismatch"
-        );
-        Ok(path)
+        TargetDirectory::open(path.into(), &id)
+    }
+    pub(crate) fn target_stat(&self, name: &str) -> Result<libc::statvfs> {
+        self.target(name)?.stat()
     }
     pub fn set_policy(&self, path: &str, p: &Policy) -> Result<()> {
         let n = self.stat(path)?;
@@ -164,18 +205,8 @@ impl Engine {
         id: &str,
         data: &mut R,
     ) -> Result<String> {
-        use std::os::fd::AsRawFd;
-        let (registered, identity): (String, String) = self.db.query_row(
-            "SELECT path,identity FROM targets WHERE name=?",
-            [target],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        let directory = fs::File::open(registered)?;
-        let root = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-        ensure!(
-            fs::read_to_string(root.join(".tier-id"))?.trim() == identity,
-            "target identity mismatch"
-        );
+        let target = self.target(target)?;
+        let root = &target.root;
         let dir = root.join("objects").join(id);
         fs::create_dir_all(&dir)?;
         let key = format!("objects/{id}/{}", Uuid::new_v4());
@@ -196,7 +227,7 @@ impl Engine {
             }
             ensure!(io::copy(data, &mut f)? == len, "source length changed");
             f.sync_all()?;
-            for d in [&dir, &root.join("objects"), &root] {
+            for d in [&dir, &root.join("objects"), root] {
                 fs::File::open(d)?.sync_all()?;
             }
             Ok(())
@@ -209,7 +240,7 @@ impl Engine {
     }
     pub(crate) fn matches_copy(&self, target: &str, key: &str, expected: &str) -> bool {
         self.target(target)
-            .and_then(|r| Ok(fingerprint(&mut fs::File::open(r.join(key))?)?.1 == expected))
+            .and_then(|r| Ok(fingerprint(&mut r.open_object(key)?)?.1 == expected))
             .unwrap_or(false)
     }
     pub(super) fn relieve_pressure(
@@ -218,16 +249,9 @@ impl Engine {
         threshold: u8,
         incoming: Option<u64>,
     ) -> Result<()> {
-        use std::os::unix::ffi::OsStrExt;
         let root = self.target(name)?;
-        let cpath = std::ffi::CString::new(root.as_os_str().as_bytes())?;
         let utilization = || -> Result<u64> {
-            let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-            // statvfs initializes the entire output structure on success.
-            if unsafe { libc::statvfs(cpath.as_ptr(), stat.as_mut_ptr()) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            let stat = unsafe { stat.assume_init() };
+            let stat = root.stat()?;
             let required_blocks = incoming.unwrap_or(0).div_ceil(stat.f_frsize.max(1));
             Ok(100
                 - stat
@@ -310,7 +334,7 @@ impl Engine {
             )? > 0
             {
                 tx.commit()?;
-                fs::remove_file(root.join(key))?;
+                root.remove_object(&key)?;
                 if incoming.is_none() {
                     return Ok(());
                 }
@@ -320,5 +344,35 @@ impl Engine {
             }
         }
         Err(io::Error::from_raw_os_error(libc::ENOSPC)).context("target above watermark")
+    }
+}
+
+#[cfg(test)]
+mod target_directory_tests {
+    use super::*;
+
+    #[test]
+    fn remount_cannot_redirect_reads_or_deletes() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mount = tmp.path().join("mount");
+        let original = tmp.path().join("original");
+        fs::create_dir(&mount)?;
+        fs::write(mount.join(".tier-id"), "first")?;
+        fs::write(mount.join("object"), "first")?;
+        let target = TargetDirectory::open(mount.clone(), "first")?;
+        fs::rename(&mount, &original)?;
+        fs::create_dir(&mount)?;
+        fs::write(mount.join(".tier-id"), "second")?;
+        fs::write(mount.join("object"), "second")?;
+        assert!(TargetDirectory::open(mount.clone(), "first").is_err());
+        let mut contents = String::new();
+        target
+            .open_object("object")?
+            .read_to_string(&mut contents)?;
+        assert_eq!(contents, "first");
+        target.remove_object("object")?;
+        assert!(!original.join("object").exists());
+        assert_eq!(fs::read_to_string(mount.join("object"))?, "second");
+        Ok(())
     }
 }

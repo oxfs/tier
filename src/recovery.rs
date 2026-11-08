@@ -12,46 +12,6 @@ use std::{
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
-pub fn write_snapshot(engine: &Engine, path: &Path) -> Result<()> {
-    let data = engine.snapshot()?;
-    publish(&data, path)
-}
-
-pub(crate) fn publish(data: &Value, path: &Path) -> Result<()> {
-    let checksum = format!("{:x}", Sha256::digest(serde_json::to_vec(&data)?));
-    let mut file = NamedTempFile::new_in(
-        path.parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new(".")),
-    )?;
-    serde_json::to_writer_pretty(&mut file, &json!({"checksum":checksum,"metadata":data}))?;
-    file.write_all(b"\n")?;
-    file.as_file().sync_all()?;
-    file.persist_noclobber(path)?;
-    fs::File::open(
-        path.parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new(".")),
-    )?
-    .sync_all()?;
-    Ok(())
-}
-
-pub fn load(path: &Path) -> Result<Value> {
-    let envelope: Value = serde_json::from_reader(fs::File::open(path)?)?;
-    let metadata = &envelope["metadata"];
-    ensure!(
-        envelope["checksum"].as_str()
-            == Some(&format!(
-                "{:x}",
-                Sha256::digest(serde_json::to_vec(metadata)?)
-            )),
-        "snapshot checksum mismatch"
-    );
-    ensure!(metadata["format"] == 1, "unsupported snapshot format");
-    Ok(metadata.clone())
-}
-
 fn rows<'a>(snapshot: &'a Value, table: &str) -> Result<&'a Vec<Value>> {
     snapshot[table]
         .as_array()
@@ -544,7 +504,7 @@ pub fn preflight(snapshot: &Value, roots: &[PathBuf]) -> Result<Value> {
             &mut report
         };
         let t = targets.get(target).context("unknown archived target")?;
-        let checked = crate::cloud::configured_client(
+        let checked = crate::archive::configured_client(
             field(t, "url")?,
             t["user_env"].as_str(),
             t["pass_env"].as_str(),

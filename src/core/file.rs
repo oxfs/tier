@@ -123,7 +123,7 @@ impl Engine {
     fn discard_objects(&self, objects: &[(String, String)]) {
         for (target, key) in objects {
             if let Ok(root) = self.target(target) {
-                let _ = fs::remove_file(root.join(key));
+                let _ = root.remove_object(key);
             }
         }
     }
@@ -143,10 +143,7 @@ impl Engine {
         })?;
         for row in rows {
             let (t, key, h) = row?;
-            let Ok(mut source) = self
-                .target(&t)
-                .and_then(|p| Ok(fs::File::open(p.join(key))?))
-            else {
+            let Ok(mut source) = self.target(&t).and_then(|p| Ok(p.open_object(&key)?)) else {
                 continue;
             };
             out.set_len(0)?;
@@ -156,7 +153,7 @@ impl Engine {
                 return Ok(());
             }
         }
-        crate::cloud::recall_to(&self.db, id, out)
+        crate::archive::recall_to(&self.db, id, out)
     }
     pub fn get(&self, path: &str) -> Result<Vec<u8>> {
         let n = self.stat(path)?;

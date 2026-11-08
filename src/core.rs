@@ -133,7 +133,7 @@ impl Engine {
         )?;
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS namespace_names ON nodes(parent,name COLLATE tier_name)",[])
             .context("creating Unicode name index; sibling names must be distinct after case folding")?;
-        crate::cloud::init(&db)?;
+        crate::archive::init(&db)?;
         let engine = Self { db };
         crate::backup::init(&engine)?;
         Ok(engine)

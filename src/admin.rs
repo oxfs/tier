@@ -1,224 +1,255 @@
-use anyhow::{Result, ensure};
+mod command;
+
+use crate::{core::Engine, service::Maintenance};
+use anyhow::{Context, Result, ensure};
+use axum::{
+    Json, Router,
+    extract::{DefaultBodyLimit, Request, State, rejection::JsonRejection},
+    http::{StatusCode, header},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
+    routing::{get, post},
+};
+use command::Command;
 use serde_json::{Value, json};
-use std::{net::SocketAddr, sync::Arc};
-use tiny_http::{Header, Method, Request, Response, Server};
+use std::{
+    net::{SocketAddr, TcpListener},
+    sync::{Arc, Mutex},
+};
 
-pub static WORKER: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-pub trait Admin: Send + Sync {
-    fn state(&self) -> Result<Value>;
-    fn execute(&self, action: &str, input: Value) -> Result<Value>;
+#[derive(Clone)]
+struct Backend {
+    engine: Arc<Mutex<Engine>>,
+    maintenance: Arc<Maintenance>,
 }
 
-pub fn start(addr: SocketAddr, backend: Arc<dyn Admin>) -> Result<SocketAddr> {
-    ensure!(addr.ip().is_loopback(), "admin listener must use loopback");
-    let server = Server::http(addr).map_err(|error| anyhow::anyhow!("{error}"))?;
-    let addr = server
-        .server_addr()
-        .to_ip()
-        .ok_or_else(|| anyhow::anyhow!("invalid admin listener"))?;
-    std::thread::spawn(move || {
-        for request in server.incoming_requests() {
-            if let Err(error) = respond(request, addr, backend.as_ref()) {
-                eprintln!("admin response: {error}");
-            }
+pub(crate) struct Server {
+    pub(crate) addr: SocketAddr,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
         }
-    });
-    Ok(addr)
-}
-
-fn respond(mut request: Request, addr: SocketAddr, backend: &dyn Admin) -> Result<()> {
-    let header = |key: &str| {
-        request
-            .headers()
-            .iter()
-            .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(key))
-            .map(|h| h.value.to_string())
-    };
-    let host = addr.to_string();
-    if header("host").as_deref() != Some(host.as_str()) {
-        request.respond(Response::empty(403))?;
-        return Ok(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
-    let (code, mime, body) = match (request.method(), request.url()) {
-        (&Method::Get, "/") => (
-            200,
-            "text/html; charset=utf-8",
-            include_str!("admin.html").to_owned(),
-        ),
-        (&Method::Get, "/api/state") => json_result(backend.state()),
-        (&Method::Post, "/api/action")
-            if header("origin").as_deref() == Some(format!("http://{host}").as_str())
-                && header("content-type").as_deref() == Some("application/json") =>
-        {
-            use std::io::Read;
-            let mut data = Vec::new();
-            request.as_reader().take(65537).read_to_end(&mut data)?;
-            json_result((|| {
-                ensure!(data.len() <= 65536, "request too large");
-                let value: Value = serde_json::from_slice(&data)?;
-                backend.execute(
-                    value["action"]
-                        .as_str()
-                        .ok_or_else(|| anyhow::anyhow!("missing action"))?,
-                    value["input"].clone(),
+}
+
+pub(crate) fn start(
+    addr: SocketAddr,
+    engine: Engine,
+    maintenance: Arc<Maintenance>,
+) -> Result<Server> {
+    ensure!(addr.ip().is_loopback(), "admin listener must use loopback");
+    let listener = TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    let addr = listener.local_addr()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let app = router(
+        addr,
+        Backend {
+            engine: Arc::new(Mutex::new(engine)),
+            maintenance,
+        },
+    );
+    let (stop, shutdown) = tokio::sync::oneshot::channel();
+    let thread = std::thread::Builder::new()
+        .name("tier-admin".into())
+        .spawn(move || {
+            let result = runtime.block_on(async {
+                axum::serve(tokio::net::TcpListener::from_std(listener)?, app)
+                    .with_graceful_shutdown(async {
+                        let _ = shutdown.await;
+                    })
+                    .await
+            });
+            if let Err(error) = result {
+                eprintln!("admin server: {error}");
+            }
+        })?;
+    Ok(Server {
+        addr,
+        stop: Some(stop),
+        thread: Some(thread),
+    })
+}
+
+fn router(addr: SocketAddr, backend: Backend) -> Router {
+    Router::new()
+        .route(
+            "/",
+            get(async || Html(include_str!("../web/dist/index.html"))),
+        )
+        .route(
+            "/assets/app.js",
+            get(async || {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/dist/assets/app.js"),
                 )
-            })())
-        }
-        _ => (404, "text/plain", "Not found".to_owned()),
-    };
-    let content_type = Header::from_bytes("Content-Type", mime).unwrap();
-    request.respond(
-        Response::from_string(body)
-            .with_status_code(code)
-            .with_header(content_type),
-    )?;
-    Ok(())
+            }),
+        )
+        .route(
+            "/assets/app.css",
+            get(async || {
+                (
+                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                    include_str!("../web/dist/assets/app.css"),
+                )
+            }),
+        )
+        .route("/api/state", get(read_state))
+        .route("/api/action", post(execute))
+        .layer(DefaultBodyLimit::max(65536))
+        .layer(middleware::from_fn_with_state(addr, check_origin))
+        .with_state(backend)
 }
 
-fn json_result(result: Result<Value>) -> (u16, &'static str, String) {
-    let (code, body) = match result {
-        Ok(value) => (200, value),
-        Err(error) => (400, json!({"error":error.to_string()})),
-    };
-    (code, "application/json", body.to_string())
+async fn check_origin(State(addr): State<SocketAddr>, request: Request, next: Next) -> Response {
+    let headers = request.headers();
+    let host = addr.to_string();
+    let matches =
+        |name, expected: &str| headers.get(name).and_then(|v| v.to_str().ok()) == Some(expected);
+    if !matches(header::HOST, &host) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if request.method() == axum::http::Method::POST
+        && !matches(header::ORIGIN, &format!("http://{host}"))
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    headers.insert(header::CONTENT_SECURITY_POLICY,"default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'".parse().unwrap());
+    response
 }
 
-impl Admin for std::sync::Mutex<crate::core::Engine> {
-    fn state(&self) -> Result<Value> {
-        self.lock()
+async fn blocking(operation: impl FnOnce() -> Result<Value> + Send + 'static) -> Response {
+    match tokio::task::spawn_blocking(operation)
+        .await
+        .context("admin worker failed")
+        .and_then(|r| r)
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => bad_request(error.to_string()),
+    }
+}
+fn bad_request(error: String) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response()
+}
+
+async fn read_state(State(backend): State<Backend>) -> Response {
+    blocking(move || {
+        backend
+            .engine
+            .lock()
             .map_err(|_| anyhow::anyhow!("engine unavailable"))?
             .state()
-    }
-
-    fn execute(&self, action: &str, input: Value) -> Result<Value> {
-        use std::path::Path;
-        let string = |key: &str| {
-            input[key]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing {key}"))
-        };
-        let entry = || {
-            input["id"]
-                .as_i64()
-                .ok_or_else(|| anyhow::anyhow!("missing id"))
-        };
-        let engine = self
-            .lock()
-            .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
-        match action {
-            "repair" => {
-                let _work = WORKER
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("worker unavailable"))?;
-                engine.reconcile()?;
-                engine.archive_tick()?;
-            }
-            "restore" => engine.restore(entry()?, string("path")?)?,
-            "purge" => engine.purge(entry()?)?,
-            "target" => engine.register_target(
-                string("name")?,
-                Path::new(string("path")?),
-                input["domain"].as_str(),
-                input["allow_same_domain"].as_bool().unwrap_or(false),
-            )?,
-            "policy" => {
-                engine.set_policy(string("path")?, &serde_json::from_value(input.clone())?)?
-            }
-            "inherit" => engine
-                .inherit_policy(string("path")?, input["archive"].as_bool().unwrap_or(false))?,
-            "archive" => engine.add_archive(
-                string("name")?,
-                string("url")?,
-                input["user_env"].as_str().filter(|s| !s.is_empty()),
-                input["pass_env"].as_str().filter(|s| !s.is_empty()),
-            )?,
-            "cloud_policy" => {
-                engine.set_cloud_policy(string("path")?, &serde_json::from_value(input.clone())?)?
-            }
-            "backup_schedule" => engine.schedule(&serde_json::from_value(input)?)?,
-            "inspect" => {
-                let roots: Vec<std::path::PathBuf> =
-                    serde_json::from_value(input["roots"].clone())?;
-                return crate::recovery::preflight(
-                    &crate::recovery::load(Path::new(string("path")?))?,
-                    &roots,
-                );
-            }
-            "snapshot" => {
-                let destination = Path::new(string("path")?);
-                ensure!(destination.is_absolute(), "use an absolute snapshot path");
-                crate::recovery::write_snapshot(&engine, destination)?;
-            }
-            _ => anyhow::bail!("unknown action"),
-        }
-        Ok(json!({"ok":true}))
+    })
+    .await
+}
+async fn execute(
+    State(backend): State<Backend>,
+    body: Result<Json<Command>, JsonRejection>,
+) -> Response {
+    match body {
+        Ok(Json(command)) => blocking(move || command.run(&backend)).await,
+        Err(error) => (error.status(), Json(json!({"error":error.body_text()}))).into_response(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
-    struct Demo;
-    impl Admin for Demo {
-        fn state(&self) -> Result<Value> {
-            Ok(json!({"health": []}))
-        }
-        fn execute(&self, action: &str, input: Value) -> Result<Value> {
-            Ok(json!([action, input]))
-        }
-    }
 
     #[test]
-    fn loopback_api_checks_browser_origin() -> Result<()> {
-        let server = Server::http("127.0.0.1:0").map_err(|e| anyhow::anyhow!("{e}"))?;
-        let addr = server.server_addr().to_ip().unwrap();
-        let worker = thread::spawn(move || {
-            for req in server.incoming_requests().take(3) {
-                respond(req, addr, &Demo).unwrap();
-            }
-        });
-        let origin = format!("http://{addr}");
+    fn admin_routes_enforce_origin_host_and_typed_commands() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let db = root.path().join("metadata.db");
+        let server = start(
+            "127.0.0.1:0".parse()?,
+            Engine::open(&db)?,
+            Arc::new(Maintenance::new(&db)),
+        )?;
+        let origin = format!("http://{}", server.addr);
+        let api = format!("{origin}/api/action");
+        let request = ureq::post(&api).set("Content-Type", "application/json");
+        let index = ureq::get(&origin).call()?.into_string()?;
+        for (asset, mime) in [
+            ("/assets/app.js", "text/javascript"),
+            ("/assets/app.css", "text/css"),
+        ] {
+            assert!(index.contains(&format!("\"{asset}\"")));
+            let response = ureq::get(&format!("{origin}{asset}")).call()?;
+            assert!(response.header("Content-Type").unwrap().starts_with(mime));
+            assert!(!response.into_string()?.trim().is_empty());
+        }
+        // A slow request body must not serialize unrelated reads.
+        use std::io::Write;
+        let mut slow = std::net::TcpStream::connect(server.addr)?;
+        write!(
+            slow,
+            "POST /api/action HTTP/1.1\r\nHost: {}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: 32\r\n\r\n{{",
+            server.addr
+        )?;
         let state = ureq::get(&format!("{origin}/api/state"))
+            .timeout(std::time::Duration::from_secs(3))
             .call()?
             .into_string()?;
-        assert_eq!(serde_json::from_str::<Value>(&state)?, json!({"health":[]}));
-        let url = format!("{origin}/api/action");
-        let request = ureq::post(&url).set("Content-Type", "application/json");
+        drop(slow);
+        assert!(serde_json::from_str::<Value>(&state)?["targets"].is_array());
+        assert!(matches!(
+            ureq::get(&origin).set("Host", "evil.invalid").call(),
+            Err(ureq::Error::Status(403, _))
+        ));
         assert!(matches!(
             request
                 .clone()
                 .set("Origin", "http://other")
                 .send_string("{}"),
-            Err(ureq::Error::Status(404, _))
+            Err(ureq::Error::Status(403, _))
         ));
-        let result = request
-            .set("Origin", &origin)
-            .send_string(r#"{"action":"repair","input":{}}"#)?
-            .into_string()?;
-        assert_eq!(
-            serde_json::from_str::<Value>(&result)?,
-            json!(["repair", {}])
-        );
-        worker.join().unwrap();
-        Ok(())
-    }
-    #[test]
-    fn admin_snapshot_uses_recoverable_envelope() -> Result<()> {
-        use crate::{core::Engine, recovery};
-        use std::sync::Mutex;
-        let tmp = tempfile::tempdir()?;
-        let engine = Mutex::new(Engine::open(&tmp.path().join("metadata.sqlite"))?);
-        let target = tmp.path().join("storage");
+        let post = |action: &str, input: Value, expected: u16| -> Result<ureq::Response> {
+            let result = request
+                .clone()
+                .set("Origin", &origin)
+                .send_string(&json!({"action":action,"input":input}).to_string());
+            let response = match result {
+                Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+                Err(error) => return Err(error.into()),
+            };
+            assert_eq!(response.status(), expected);
+            Ok(response)
+        };
+        let target = root.path().join("disk");
         std::fs::create_dir(&target)?;
-        engine.execute("target", json!({"name":"ssd","path":target}))?;
-        engine.execute("policy",json!({"path":"/","front":["ssd"],"front_count":1,"long":["ssd"],"long_count":1,"delay_secs":0}))?;
-        let snapshot = tmp.path().join("metadata.json");
-        engine.execute("snapshot", json!({"path":snapshot}))?;
-        assert_eq!(recovery::load(&snapshot)?["targets"][0]["name"], "ssd");
-        let report = engine.execute("inspect", json!({"path":snapshot,"roots":[target]}))?;
-        assert!(report["verified"].as_array().unwrap().is_empty());
+        post("target", json!({"name":"disk","path":target}), 200)?;
+        post(
+            "policy",
+            json!({"path":"/","front":["disk"],"front_count":1,"long":["disk"],"long_count":1,"delay_secs":0}),
+            200,
+        )?;
+        let path = root.path().join("snapshot.json");
+        post("snapshot", json!({"path":path}), 200)?;
+        assert_eq!(crate::snapshot::load(&path)?["targets"][0]["name"], "disk");
+        let report = post("inspect", json!({"path":path,"roots":[target]}), 200)?.into_string()?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&report)?["verified"],
+            json!([])
+        );
+        post("purge", json!({"id":"wrong"}), 422)?;
+        post("unknown", json!({}), 422)?;
+        post("repair", json!({"payload":"a".repeat(65536)}), 413)?;
+        post("repair", json!({}), 200)?;
         Ok(())
     }
 }

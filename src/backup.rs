@@ -1,4 +1,4 @@
-use crate::{core::Engine, recovery};
+use crate::core::Engine;
 use anyhow::{Result, ensure};
 use rusqlite::{OptionalExtension, functions::FunctionFlags, params};
 use serde::{Deserialize, Serialize};
@@ -285,11 +285,11 @@ fn publish_to(
     let file = dir.join(format!("{prefix}{captured:020}.json"));
     if file.exists() {
         ensure!(
-            recovery::load(&file)? == *data,
+            crate::snapshot::load(&file)? == *data,
             "snapshot sequence collision"
         );
     } else {
-        recovery::publish(data, &file)?;
+        crate::snapshot::publish(data, &file)?;
     }
     let mut files = Vec::new();
     for entry in fs::read_dir(&dir)? {

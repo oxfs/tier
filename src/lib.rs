@@ -1,7 +1,8 @@
-pub mod admin;
+mod admin;
 pub mod archive;
 pub mod backup;
-pub mod cloud;
 pub mod core;
-pub mod mount;
+mod mount;
 pub mod recovery;
+pub mod service;
+pub mod snapshot;

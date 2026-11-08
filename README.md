@@ -1,93 +1,48 @@
 # Tier
 
-Tier 为家庭 SMB 共享提供统一目录和可配置的分层存储。Rust 服务维护 SQLite 命名空间，把普通文件放到登记的本地目录，并可归档到 WebDAV 集合（例如 OpenList 的 WebDAV 入口）。Samba 通过 FUSE 挂载点访问 Tier。
-
-系统的数据保证与恢复边界见 [设计文档](docs/design.md)。
-
-本机已构建的 Linux 可执行文件位于 `target/release/tier`。在 Ubuntu 进入 `/mnt/d/tier` 后，可运行 `./target/release/tier --help`。
+Tier 是面向家庭 SMB 共享的分层存储服务。Rust 核心维护统一目录，并按目录策略决定写入确认份数、长期副本和 WebDAV 归档位置。Windows 通过 Samba 访问 FUSE 挂载点，管理员通过本机 Web 界面管理存储。
 
 ## 构建
 
-在 Linux 中安装稳定版 Rust、C 编译器、FUSE 3 和 Samba。WSL2 下可以直接在 Windows 编辑仓库，在 Ubuntu 构建。数据库、挂载点、临时文件和实际存储目标建议使用 Linux 文件系统。
+需要 Linux、稳定版 Rust、C 编译器、GNU Make、Node.js 22.12+ 和 npm。运行服务还需要 FUSE 和 Samba。
 
 ```sh
-cd /mnt/d/tier
-export CARGO_TARGET_DIR="$HOME/.cache/tier/build"
-cargo build --release --locked
-tier="$CARGO_TARGET_DIR/release/tier"
+make build
+./target/release/tier --help
 ```
 
-## 建立第一个共享
+前端由 Vue、TypeScript 和 Vite 构建，产物嵌入 Rust 二进制。部署主机只需运行 `tier`。设置了 `CARGO_TARGET_DIR` 时，可执行文件位于该目录的 `release/` 下。
 
-下面以两个新目录模拟暂存和长期目标。真实设备应分别挂载后再登记。默认识别文件系统和可解析的 Linux 块设备父盘；复杂 RAID、虚拟磁盘或网络挂载可用 `--domain 名称` 显式指定故障域。`--allow-same-device` 用于明确接受同盘风险。
+## 建立共享
+
+以下示例用本机两个目录演示“暂存确认一份，安静 30 秒后复制到长期盘”。真实设备应分别挂载再登记。示例中的 `--allow-same-device` 明确接受两个目标位于同一文件系统。
 
 ```sh
+tier="${CARGO_TARGET_DIR:-target}/release/tier"
 base="$HOME/tier-data"
-mkdir -p "$base"/{cache,disk,share,snapshots}
+mkdir -p "$base"/{cache,disk,share,backups}
 db="$base/tier.sqlite"
 "$tier" --db "$db" target cache "$base/cache"
 "$tier" --db "$db" target disk "$base/disk" --allow-same-device
 "$tier" --db "$db" policy / '{"front":["cache"],"front_count":1,"long":["disk"],"long_count":1,"delay_secs":30}'
-"$tier" --db "$db" schedule "{\"directories\":[\"$base/snapshots\"],\"seconds\":30,\"changes\":100,\"keep\":20}"
 "$tier" --db "$db" serve "$base/share"
 ```
 
-服务运行期间，在本机打开 `http://127.0.0.1:9480` 管理目标、策略、修复、回收站和快照。挂载使用 `allow_other`；非 root 运行时需在 `/etc/fuse.conf` 中启用 `user_allow_other`。将 `deploy/samba-share.conf` 的路径改为实际挂载点，添加到 Samba 配置，设置 Samba 用户并确保其 Unix 身份能访问挂载点。先用 `testparm` 检查；首次部署用 `sudo systemctl start smbd` 启动，正在运行的服务可重新加载配置。保留共享定义中的 `oplocks = no`，使单写者规则对 Windows 客户端生效。Windows 访问 `\\服务器地址\tier`。部署时应保证挂载成功后才开放共享，退出前先断开共享，避免访问空挂载点。
+在 `http://127.0.0.1:9480` 管理目录策略、设备、修复、回收站和快照。非 root 挂载需要在 `/etc/fuse.conf` 启用 `user_allow_other`。将 [Samba 共享配置](deploy/samba-share.conf) 中的路径替换为挂载点，配置可访问该目录的 Samba 用户，用 `testparm` 检查后启动或重新加载 `smbd`。保留 `oplocks = no`，确保 Windows 客户端遵守单写者规则。
 
-## 放置和确认
+## 数据保证
 
-| 字段 | 含义 |
-|---|---|
-| `front` / `front_count` | 可用于确认写入的目标和所需份数。双写 SSD 可将两个目标同时加入，份数设为 2。 |
-| `long` / `long_count` | 长期目标候选及所需份数。文件在不同候选目标间分布。 |
-| `delay_secs` | 最后一次修改后，允许开始长期复制的最短空闲时间。 |
-| `direct_fallback` | 前台放置失败时尝试长期目标，默认按长期份数确认。 |
-| `fallback_count` | 指定直写成功所需的长期目标份数，独立于最终长期份数。 |
-| `low_water` / `high_water` | 已用容量百分比。默认 70 / 90，后台和前台分别按水位回收有其他长期副本的暂存对象。 |
-| `repair_grace_secs` | 设备离线后，自动修复前等待的秒数；管理员仍可主动修复。 |
-| `manual_repair` | 已达到目标后发生副本损失时等待手动修复。初次放置仍自动进行。 |
-| `trash_ttl_secs` | 删除条目的保留时间，默认 7 天。 |
-
-根目录配置默认策略，显式配置的子目录整体覆盖继承策略。运行 `tier --db "$db" inherit /照片` 可移除本地覆盖；加 `--archive` 可移除归档覆盖。管理界面也提供恢复继承操作。目录移动后按新位置核对。一个文件只允许一个可写句柄；同步写和 flush 按配置确认。失败或服务退出时遗留的写入标为未确认，管理者可删除后重传。完整本地副本位于目标的 `objects/`，盘根的 `.tier-id` 用于核对设备身份。放置会优先选择不同的健康故障域。管理页按已核对身份的设备显示总容量和可用容量。文件名保留原拼写，查找和同目录唯一性使用 Unicode 大小写折叠。若旧数据库已有折叠后冲突的兄弟名称，需先在旧版将它们改成不同名称。
-
-## 归档
-
-登记已存在、可写、可读回的 WebDAV 集合。OpenList 的存储 WebDAV 策略请选择本地代理，确保 GET 直接返回文件内容；账户需要 WebDAV 访问、上传和删除权限。需要认证时，把用户名和密码放入服务环境，配置中只引用变量名。[OpenList WebDAV 文档](https://doc.oplist.org/guide/advanced/webdav)
-
-示例在停服时执行；运行中可使用管理界面配置。
-
-```sh
-"$tier" --db "$db" archive cloud https://nas.example/dav/tier --user-env TIER_DAV_USER --pass-env TIER_DAV_PASSWORD
-"$tier" --db "$db" archive-policy / '{"targets":["cloud"],"copies":1,"delay_secs":7776000,"retain_local":1}'
-```
-
-`retain_local: 0` 表示允许删除最后一个本地副本。Tier 在发布及释放前验证远端对象内容，远端不可用时保留尚未回收的本地数据。仅有远端副本的文件需要联网读回。后台定期读回已登记的远端对象，手动修复会立即复核；只有替代副本验证成功才切换记录。归档策略按目录继承，独立于本地策略。远端读取、上传和校验按块传输；挂载层和后台复制使用临时文件。请为 Ubuntu 的 `TMPDIR` 预留并发打开和复制文件的空间。
-
-## 快照调度
-
-`seconds` 从第一笔尚未备份的变更计时，`changes` 统计提交的元数据事务数。`keep` 保留最近的份数，还可设置 `hourly` 和 `daily`，分别保留最近若干 UTC 小时、天中每个时间段最新的一份。设为 0 即关闭对应的稀疏保留。各目的目录分别报告恢复点及落后量。导入旧快照会开始独立的备份历史；原历史不参与新历史的自动清理，可单独保留或人工清理。
-
-## 恢复
-
-快照以带校验和的 UTF-8 JSON 保存。正常停机或进程重启使用原数据库；元数据设备损坏时可恢复至最近成功导出的位置。快照描述当时的目录，对已被覆盖或清理的数据不承担保留历史内容的作用。
+- **写入**。flush、同步写及最终关闭按目录策略确认。`front_count: 1` 表示长期复制完成前可能只有一份。暂存达到高水位时，只回收已有足够健康副本的文件；可配置直接失败或按 `fallback_count` 直写长期池。
+- **放置**。子目录继承最近的显式策略。移动文件或改变策略会触发重新放置。目标身份及故障域用于避免误写卸载后的空目录，并优先将副本放到不同设备。
+- **归档**。OpenList 需要可读写、可删除且能直接返回内容的 WebDAV 集合。只有策略允许、远端当前对象读回校验成功时，才释放最后一份本地数据。为 `TMPDIR` 预留打开、复制和召回文件的空间。
+- **恢复**。多目标 JSON 快照保存目录和当前副本清单。它不保留被覆盖的历史文件。导入会预检设备、回收站和远端对象；遇到缺失时先审阅报告，接受后再用 `--allow-degraded`。
 
 ```sh
 "$tier" inspect snapshot.json /mnt/surviving-disk
-"$tier" inspect snapshot.json /mnt/surviving-disk --extract /tmp/new-extraction
-"$tier" --db /srv/recovered/tier.sqlite import snapshot.json --target disk=/mnt/surviving-disk
+"$tier" inspect snapshot.json /mnt/surviving-disk --extract /tmp/tier-recovered
+"$tier" --db /srv/tier/recovered.sqlite import snapshot.json --target disk=/mnt/surviving-disk
 ```
 
-导入会重新核对本地设备和已登记的远端副本。遇到离线、未确认或校验异常时，先审阅报告；明确接受缺失后才加 `--allow-degraded`。报告列出可验证、缺失、摘要不符和快照未引用的对象。管理界面可以进行只读预检。提取要求新的目的目录；导入要求新的数据库，并保留稳定 ID。脱离 Tier 时仅只读访问受管盘。
+## 开发与验证
 
-## 验证
-
-```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --locked
-sudo env TIER_BIN="$CARGO_TARGET_DIR/release/tier" bash tests/smb-smoke.sh
-```
-
-设备卸载测试使用临时 ext4 镜像，运行 `sudo env TIER_BIN="$CARGO_TARGET_DIR/release/tier" bash tests/device-smoke.sh`。8 MiB 满盘验收使用 `tests/capacity-smoke.sh`，参数为 Cargo 编译出的 `capacity` 测试可执行文件。Windows 连接已配置的共享后，在 PowerShell 7 运行 `tests/windows-smb.ps1 -Share '\\服务器\tier'`，它在独立测试目录验证局部写、冲突、目标替换和客户端退出。
-
-SMB 冒烟测试在临时目录和非标准端口启动独立 Samba，覆盖客户端上传、重命名、下载、删除，以及挂载点的句柄与替换行为。
+`make check` 构建前端并运行 rustfmt、严格 Clippy 和 Rust 测试。SMB 验收运行 `sudo env TIER_BIN="$tier" bash tests/smb-smoke.sh`。设备卸载及满盘测试分别位于 `tests/device-smoke.sh`、`tests/capacity-smoke.sh`；真实 Windows 客户端使用 `tests/windows-smb.ps1`。

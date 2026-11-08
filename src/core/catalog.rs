@@ -174,7 +174,7 @@ impl Engine {
         tx.commit()?;
         for (name, key) in objects {
             if let Ok(root) = self.target(&name) {
-                let _ = fs::remove_file(root.join(key));
+                let _ = root.remove_object(&key);
             }
         }
         Ok(())

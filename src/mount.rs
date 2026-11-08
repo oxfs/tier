@@ -8,7 +8,6 @@ use std::{
     fs::File,
     os::unix::fs::FileExt,
     path::Path,
-    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 const TTL: Duration = Duration::from_secs(0);
@@ -33,7 +32,7 @@ struct Handle {
     writer: Option<crate::core::Writer>,
 }
 struct Fs {
-    engine: Arc<Mutex<Engine>>,
+    engine: Engine,
     paths: HashMap<u64, String>,
     inodes: HashMap<String, u64>,
     handles: HashMap<u64, Handle>,
@@ -56,12 +55,7 @@ impl Fs {
         ))
     }
     fn attr(&mut self, path: &str) -> Result<FileAttr, i32> {
-        let node = self
-            .engine
-            .lock()
-            .map_err(|_| EIO)?
-            .stat(path)
-            .map_err(|_| ENOENT)?;
+        let node = self.engine.stat(path).map_err(|_| ENOENT)?;
         let ino = match self.inodes.get(&node.id) {
             Some(&ino) => ino,
             None => {
@@ -113,7 +107,7 @@ impl Fs {
             return Err(EBUSY);
         }
         let writer = if write {
-            let engine = self.engine.lock().map_err(|_| EIO)?;
+            let engine = &self.engine;
             let node = engine
                 .stat(self.paths.get(&ino).ok_or(ENOENT)?)
                 .map_err(|_| ENOENT)?;
@@ -144,19 +138,13 @@ impl Fs {
             let mut file = tempfile::tempfile().map_err(errno)?;
             if !truncate {
                 self.engine
-                    .lock()
-                    .map_err(|_| EIO)?
                     .copy_to(path, &mut file)
                     .map_err(storage_errno)?;
             }
             file
         };
         if truncate {
-            self.engine
-                .lock()
-                .map_err(|_| EIO)?
-                .begin_write(path)
-                .map_err(|_| EIO)?;
+            self.engine.begin_write(path).map_err(|_| EIO)?;
             data.set_len(0).map_err(errno)?;
         }
         let id = self.alloc();
@@ -183,16 +171,12 @@ impl Fs {
         }
         if h.dirty {
             let path = self.paths.get(&h.ino).ok_or(libc::ESTALE)?;
-            self.engine
-                .lock()
-                .map_err(|_| EIO)?
-                .put_from(path, &mut h.data)
-                .map_err(|error| {
-                    let code = storage_errno(error);
-                    h.writer.take();
-                    h.error = Some(code);
-                    code
-                })?;
+            self.engine.put_from(path, &mut h.data).map_err(|error| {
+                let code = storage_errno(error);
+                h.writer.take();
+                h.error = Some(code);
+                code
+            })?;
             h.dirty = false;
         }
         Ok(())
@@ -234,11 +218,7 @@ impl Fs {
                 return Err(error);
             }
             if !h.dirty {
-                self.engine
-                    .lock()
-                    .map_err(|_| EIO)?
-                    .begin_write(&path)
-                    .map_err(|_| EIO)?;
+                self.engine.begin_write(&path).map_err(|_| EIO)?;
             }
             if let Err(error) = h.data.set_len(size) {
                 let code = errno(error);
@@ -267,12 +247,11 @@ impl Fs {
             return Err(EISDIR);
         }
         self.save_before_detach(a.ino)?;
-        let engine = self.engine.lock().map_err(|_| EIO)?;
+        let engine = &self.engine;
         if dir && !engine.list(&path).map_err(|_| EIO)?.is_empty() {
             return Err(ENOTEMPTY);
         }
         engine.remove(&path).map_err(|_| EIO)?;
-        drop(engine);
         self.detach(a.ino);
         Ok(())
     }
@@ -289,10 +268,7 @@ impl Filesystem for Fs {
     fn statfs(&mut self, _: &Request, _: u64, reply: ReplyStatfs) {
         // Report one backing filesystem; multiple configured targets can share a disk.
         let filesystem = (|| -> Result<_> {
-            let engine = self
-                .engine
-                .lock()
-                .map_err(|_| anyhow!("storage unavailable"))?;
+            let engine = &self.engine;
             let mut targets = engine
                 .db
                 .prepare("SELECT name FROM targets ORDER BY name")?;
@@ -339,7 +315,7 @@ impl Filesystem for Fs {
         let Some(path) = self.paths.get(&i).cloned() else {
             return r.error(ENOENT);
         };
-        let names = match self.engine.lock().unwrap().list(&path) {
+        let names = match self.engine.list(&path) {
             Ok(n) => n,
             Err(_) => return r.error(EIO),
         };
@@ -372,7 +348,7 @@ impl Filesystem for Fs {
             if self.attr(&p).is_ok() {
                 return Err(EEXIST);
             }
-            self.engine.lock().unwrap().mkdir(&p).map_err(|_| EIO)?;
+            self.engine.mkdir(&p).map_err(|_| EIO)?;
             self.attr(&p)
         });
         match result {
@@ -394,11 +370,7 @@ impl Filesystem for Fs {
             if self.attr(&p).is_ok() {
                 return Err(EEXIST);
             }
-            self.engine
-                .lock()
-                .unwrap()
-                .put(&p, &[])
-                .map_err(storage_errno)?;
+            self.engine.put(&p, &[]).map_err(storage_errno)?;
             let a = self.attr(&p)?;
             let fh = self.open_file(a.ino, flags)?;
             Ok((a, fh))
@@ -472,12 +444,7 @@ impl Filesystem for Fs {
         }
         if !h.dirty
             && let Some(path) = self.paths.get(&h.ino)
-            && self
-                .engine
-                .lock()
-                .map_err(|_| EIO)
-                .and_then(|e| e.begin_write(path).map_err(|_| EIO))
-                .is_err()
+            && self.engine.begin_write(path).is_err()
         {
             return r.error(EIO);
         }
@@ -552,11 +519,7 @@ impl Filesystem for Fs {
             if let Some(ino) = destination.filter(|ino| *ino != source) {
                 self.save_before_detach(ino)?;
             }
-            self.engine
-                .lock()
-                .unwrap()
-                .rename(&a, &b)
-                .map_err(|_| EIO)?;
+            self.engine.rename(&a, &b).map_err(|_| EIO)?;
             if let Some(overwritten) = destination.filter(|ino| *ino != source) {
                 self.detach(overwritten);
             }
@@ -601,11 +564,7 @@ impl Filesystem for Fs {
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .map_err(|_| EINVAL)?
                     .as_secs();
-                self.engine
-                    .lock()
-                    .map_err(|_| EIO)?
-                    .set_mtime(&p, seconds)
-                    .map_err(|_| EIO)?;
+                self.engine.set_mtime(&p, seconds).map_err(|_| EIO)?;
             }
             self.attr(&p)
         })();
@@ -615,22 +574,31 @@ impl Filesystem for Fs {
         }
     }
 }
-pub fn mount(engine: Arc<Mutex<Engine>>, path: &Path) -> Result<()> {
-    let fs = Fs {
-        engine,
-        paths: HashMap::from([(1, "/".into())]),
-        inodes: HashMap::from([("root".into(), 1)]),
-        handles: HashMap::new(),
-        next: 1,
-    };
-    fuser::mount2(
-        fs,
-        path,
-        &[
-            MountOption::FSName("tier".into()),
-            MountOption::AllowOther,
-            MountOption::DefaultPermissions,
-        ],
-    )
-    .map_err(|e| anyhow!("mount {}: {e}", path.display()))
+pub(crate) struct MountedShare(Session<Fs>);
+
+impl MountedShare {
+    pub(crate) fn attach(engine: Engine, path: &Path) -> Result<Self> {
+        let fs = Fs {
+            engine,
+            paths: HashMap::from([(1, "/".into())]),
+            inodes: HashMap::from([("root".into(), 1)]),
+            handles: HashMap::new(),
+            next: 1,
+        };
+        Session::new(
+            fs,
+            path,
+            &[
+                MountOption::FSName("tier".into()),
+                MountOption::AllowOther,
+                MountOption::DefaultPermissions,
+            ],
+        )
+        .map_err(|e| anyhow!("mount {}: {e}", path.display()))
+        .map(Self)
+    }
+
+    pub(crate) fn run(&mut self) -> Result<()> {
+        Ok(self.0.run()?)
+    }
 }

@@ -30,13 +30,13 @@ fn restore_namespace_from_snapshot_with_a_single_surviving_disk() -> Result<()> 
     engine.automatic_reconcile()?;
     engine.rename("/photos", "/albums")?;
     let snapshot = root.join("snapshot.json");
-    recovery::write_snapshot(&engine, &snapshot)?;
+    tier::snapshot::write(&engine, &snapshot)?;
     drop(engine);
     let moved = root.join("rehomed");
     fs::rename(root.join("disk-a"), &moved)?;
     fs::rename(root.join("hot"), root.join("offline-hot"))?;
     fs::rename(root.join("disk-b"), root.join("offline-b"))?;
-    let data = recovery::load(&snapshot)?;
+    let data = tier::snapshot::load(&snapshot)?;
     let out = root.join("extract");
     let report = recovery::inspect(&data, std::slice::from_ref(&moved), Some(&out))?;
     assert_eq!(report["verified"], json!(["albums/image"]));
@@ -88,7 +88,7 @@ fn snapshots_continue_when_one_destination_is_offline() -> Result<()> {
     let files = latest(&b)?;
     assert_eq!(files.len(), 1);
     assert!(
-        recovery::load(&files[0].path())?["nodes"]
+        tier::snapshot::load(&files[0].path())?["nodes"]
             .as_array()
             .unwrap()
             .iter()

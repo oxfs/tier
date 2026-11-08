@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 use tempfile::tempdir;
-use tier::{cloud::CloudPolicy, core::Engine};
+use tier::{archive::ArchivePolicy, core::Engine};
 use tiny_http::{Method, Response, Server};
 
 #[test]
@@ -69,7 +69,7 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
     engine.add_archive("remote", &url, None, None)?;
     engine.set_cloud_policy(
         "/",
-        &CloudPolicy {
+        &ArchivePolicy {
             targets: vec!["remote".into()],
             copies: 1,
             delay_secs: 0,
@@ -98,7 +98,7 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
     assert_eq!(report["remote_errors"].as_array().unwrap().len(), 1);
     reopened.set_cloud_policy(
         "/",
-        &CloudPolicy {
+        &ArchivePolicy {
             targets: vec![],
             copies: 0,
             delay_secs: 0,
@@ -146,7 +146,7 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
     )?;
     reopened.set_cloud_policy(
         "/",
-        &CloudPolicy {
+        &ArchivePolicy {
             targets: vec!["remote".into()],
             copies: 1,
             delay_secs: 0,

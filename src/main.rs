@@ -1,15 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use std::{
-    collections::BTreeMap,
-    fs,
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    thread,
-    time::Duration,
-};
-use tier::{admin, cloud, core::Engine, mount, recovery};
+use std::{collections::BTreeMap, fs, net::SocketAddr, path::PathBuf};
+use tier::{archive, core::Engine, recovery, service};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -100,7 +92,7 @@ fn main() -> Result<()> {
         extract,
     } = &cli.action
     {
-        let data = recovery::load(snapshot)?;
+        let data = tier::snapshot::load(snapshot)?;
         let report = match extract {
             Some(out) => {
                 ensure!(
@@ -125,7 +117,12 @@ fn main() -> Result<()> {
             let (name, path) = mapping.split_once('=').context("use NAME=PATH")?;
             map.insert(name.to_owned(), path.into());
         }
-        let report = recovery::import(&recovery::load(snapshot)?, &cli.db, &map, *allow_degraded)?;
+        let report = recovery::import(
+            &tier::snapshot::load(snapshot)?,
+            &cli.db,
+            &map,
+            *allow_degraded,
+        )?;
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
@@ -154,15 +151,15 @@ fn main() -> Result<()> {
             user_env,
             pass_env,
         } => engine.add_archive(&name, &url, user_env.as_deref(), pass_env.as_deref()),
-        Action::ArchivePolicy { path, json } => {
-            engine.set_cloud_policy(&path, &serde_json::from_str::<cloud::CloudPolicy>(&json)?)
-        }
+        Action::ArchivePolicy { path, json } => engine.set_cloud_policy(
+            &path,
+            &serde_json::from_str::<archive::ArchivePolicy>(&json)?,
+        ),
         Action::Inherit { path, archive } => engine.inherit_policy(&path, archive),
         Action::Schedule { json } => engine.schedule(&serde_json::from_str(&json)?),
-        Action::Snapshot { output } => recovery::write_snapshot(&engine, &output),
+        Action::Snapshot { output } => tier::snapshot::write(&engine, &output),
         Action::Repair => {
-            engine.reconcile()?;
-            engine.archive_tick()?;
+            service::repair(&engine)?;
             engine.backup_tick()
         }
         Action::Status => {
@@ -170,39 +167,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Action::Mkdir { path } => engine.mkdir(&path),
-        Action::Serve { mountpoint, admin } => serve(engine, &cli.db, &mountpoint, admin),
+        Action::Serve { mountpoint, admin } => service::serve(engine, &cli.db, &mountpoint, admin),
         Action::Import { .. } | Action::Inspect { .. } => unreachable!(),
     }
-}
-fn serve(engine: Engine, db: &Path, path: &Path, addr: SocketAddr) -> Result<()> {
-    ensure!(path.is_dir(), "mountpoint must be an existing directory");
-    let background = Engine::open(db)?;
-    let snapshots = Engine::open(db)?;
-    let engine = Arc::new(Mutex::new(engine));
-    let panel = Arc::new(Mutex::new(Engine::open(db)?));
-    let address = admin::start(addr, panel)?;
-    eprintln!("Tier administration: http://{address}");
-    thread::spawn(move || {
-        loop {
-            {
-                let _worker = admin::WORKER.lock().expect("repair worker panicked");
-                if let Err(e) = background.automatic_reconcile() {
-                    eprintln!("storage: {e:#}")
-                }
-                if let Err(e) = background.automatic_archive() {
-                    eprintln!("archive: {e:#}")
-                }
-            }
-            thread::sleep(Duration::from_secs(2));
-        }
-    });
-    thread::spawn(move || {
-        loop {
-            if let Err(e) = snapshots.schedule_backups() {
-                eprintln!("snapshot: {e:#}")
-            }
-            thread::sleep(Duration::from_secs(1));
-        }
-    });
-    mount::mount(engine, path)
 }

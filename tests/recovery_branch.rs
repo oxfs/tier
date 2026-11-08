@@ -30,7 +30,7 @@ fn restore_into_the_original_backup_directory_preserves_both_histories() -> Resu
     for file in fs::read_dir(dir)? {
         let path = file?.path();
         if path.extension().is_some_and(|s| s == "json") {
-            let data = recovery::load(&path)?;
+            let data = tier::snapshot::load(&path)?;
             names.extend(
                 data["nodes"]
                     .as_array()
