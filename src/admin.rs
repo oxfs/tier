@@ -25,6 +25,7 @@ struct Backend {
 
 pub(crate) struct Server {
     pub(crate) addr: SocketAddr,
+    pub(crate) runtime: tokio::runtime::Handle,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -52,6 +53,7 @@ pub(crate) fn start(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    let handle = runtime.handle().clone();
     let app = router(
         addr,
         Backend {
@@ -71,11 +73,12 @@ pub(crate) fn start(
                     .await
             });
             if let Err(error) = result {
-                eprintln!("admin server: {error}");
+                tracing::error!(%error, "administration server stopped");
             }
         })?;
     Ok(Server {
         addr,
+        runtime: handle,
         stop: Some(stop),
         thread: Some(thread),
     })

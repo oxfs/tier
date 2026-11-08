@@ -1,48 +1,42 @@
 # Tier
 
-Tier 是面向家庭 SMB 共享的分层存储服务。Rust 核心维护统一目录，并按目录策略决定写入确认份数、长期副本和 WebDAV 归档位置。Windows 通过 Samba 访问 FUSE 挂载点，管理员通过本机 Web 界面管理存储。
+Tier 为家庭 NAS 提供一个 SMB 共享目录。你可以让两块 SSD 同步保存每次写入，也可以先写一块 SSD，等文件安静一段时间后复制到机械盘，再将冷文件归档到 OpenList 等 WebDAV 服务。每个子目录可以继承或覆盖上级策略。
 
-## 构建
+## 在 NAS 上安装
 
-需要 Linux、稳定版 Rust、C 编译器、GNU Make、Node.js 22.12+ 和 npm。运行服务还需要 FUSE 和 Samba。
-
-```sh
-make build
-./target/release/tier --help
-```
-
-前端由 Vue、TypeScript 和 Vite 构建，产物嵌入 Rust 二进制。部署主机只需运行 `tier`。设置了 `CARGO_TARGET_DIR` 时，可执行文件位于该目录的 `release/` 下。
-
-## 建立共享
-
-以下示例用本机两个目录演示“暂存确认一份，安静 30 秒后复制到长期盘”。真实设备应分别挂载再登记。示例中的 `--allow-same-device` 明确接受两个目标位于同一文件系统。
+发布包适用于 x86-64 Ubuntu 22.04 及更新版本，包含 Tier 二进制、内嵌 Web 控制台、systemd 服务和配置示例。主机需要 FUSE 和 Samba。先从 [GitHub Releases](https://github.com/RainMark/tier/releases/latest) 下载 `tier-linux-x86_64.tar.gz` 和 `SHA256SUMS` 到同一个空目录。私有仓库需要使用有读取权限的 GitHub 账号。
 
 ```sh
-tier="${CARGO_TARGET_DIR:-target}/release/tier"
-base="$HOME/tier-data"
-mkdir -p "$base"/{cache,disk,share,backups}
-db="$base/tier.sqlite"
-"$tier" --db "$db" target cache "$base/cache"
-"$tier" --db "$db" target disk "$base/disk" --allow-same-device
-"$tier" --db "$db" policy / '{"front":["cache"],"front_count":1,"long":["disk"],"long_count":1,"delay_secs":30}'
-"$tier" --db "$db" serve "$base/share"
+sudo apt install fuse3 samba
+sha256sum --check SHA256SUMS
+tar -xzf tier-linux-x86_64.tar.gz
+cd tier-linux-x86_64
+sudo ./install.sh
+sudo systemctl enable --now tier
+systemctl status tier
 ```
 
-在 `http://127.0.0.1:9480` 管理目录策略、设备、修复、回收站和快照。非 root 挂载需要在 `/etc/fuse.conf` 启用 `user_allow_other`。将 [Samba 共享配置](deploy/samba-share.conf) 中的路径替换为挂载点，配置可访问该目录的 Samba 用户，用 `testparm` 检查后启动或重新加载 `smbd`。保留 `oplocks = no`，确保 Windows 客户端遵守单写者规则。
+在 NAS 本机打开 `http://127.0.0.1:9480`。从自己的电脑管理时，先执行 `ssh -L 9480:127.0.0.1:9480 用户名@NAS地址`，再打开同一地址。日志用 `journalctl -u tier -f` 查看。默认级别为 info，需要调试时可通过 systemd 服务环境变量设置 `RUST_LOG=tier=debug`。
 
-## 数据保证
+## 建立第一个共享
 
-- **写入**。flush、同步写及最终关闭按目录策略确认。`front_count: 1` 表示长期复制完成前可能只有一份。暂存达到高水位时，只回收已有足够健康副本的文件；可配置直接失败或按 `fallback_count` 直写长期池。
-- **放置**。子目录继承最近的显式策略。移动文件或改变策略会触发重新放置。目标身份及故障域用于避免误写卸载后的空目录，并优先将副本放到不同设备。
-- **归档**。OpenList 需要可读写、可删除且能直接返回内容的 WebDAV 集合。只有策略允许、远端当前对象读回校验成功时，才释放最后一份本地数据。为 `TMPDIR` 预留打开、复制和召回文件的空间。
-- **恢复**。多目标 JSON 快照保存目录和当前副本清单。它不保留被覆盖的历史文件。导入会预检设备、回收站和远端对象；遇到缺失时先审阅报告，接受后再用 `--allow-degraded`。
+1. 将数据盘挂载到固定路径，在盘内建立 Tier 可写的目录。默认服务以 root 用户、tier 组访问本地磁盘。到控制台的「存储设备」登记这些目录，例如命名为 `ssd`、`disk1` 和 `disk2`。Tier 在登记时写入设备身份，拔盘后能识别目标离线。
+2. 到「目录策略」配置根目录 `/`。双 SSD 可以把两块盘都选作前台目标，写入确认份数设为 2。少量 SSD 加机械盘可以只选 `ssd` 作前台目标，确认份数设为 1，再选 `disk1`、`disk2` 作长期目标，副本数设为 2、延迟设为 300 秒。延迟期间，刚写入的内容只有 SSD 上的一份。
+3. 在「快照备份」选择位于不同设备上的备份目录和导出间隔。JSON 快照保存命名空间及副本清单；恢复文件还需要清单中的实际数据。如果启用云归档，只有远端当前对象通过读回校验，才允许释放最后一份本地数据。
+4. 将包内 `samba-share.conf` 的共享段加入 Samba 配置，为已有 Linux 用户设置 SMB 密码（`sudo smbpasswd -a 用户名`），运行 `sudo testparm -s` 和 `sudo systemctl reload smbd`。Windows 访问 `\\NAS地址\tier`。保留共享段里的挂载检查和 `oplocks = no`。
 
-```sh
-"$tier" inspect snapshot.json /mnt/surviving-disk
-"$tier" inspect snapshot.json /mnt/surviving-disk --extract /tmp/tier-recovered
-"$tier" --db /srv/tier/recovered.sqlite import snapshot.json --target disk=/mnt/surviving-disk
-```
+## 配置与数据放在哪里
 
-## 开发与验证
+| 内容 | systemd 安装 | 手动运行 |
+| --- | --- | --- |
+| 启动配置 | `/etc/tier/tier.toml` | `~/.config/tier/tier.toml` |
+| 元数据库 | `/var/lib/tier/tier.sqlite` | `~/.local/state/tier/tier.sqlite` |
+| 共享挂载点 | `/srv/tier/share` | 由 TOML 或 `serve` 参数指定 |
 
-`make check` 构建前端并运行 rustfmt、严格 Clippy 和 Rust 测试。SMB 验收运行 `sudo env TIER_BIN="$tier" bash tests/smb-smoke.sh`。设备卸载及满盘测试分别位于 `tests/device-smoke.sh`、`tests/capacity-smoke.sh`；真实 Windows 客户端使用 `tests/windows-smb.ps1`。
+手动运行遵循 `XDG_CONFIG_HOME` 和 `XDG_STATE_HOME`。TOML 定义 `db`、`mountpoint`、`admin` 三个启动参数，命令行显式参数优先，修改后重启服务。数据库旁的锁文件和 SQLite 辅助文件由 Tier 管理。文件内容存放在登记的数据设备或归档目标上。
+
+设备、目录策略、快照计划和回收站由 Tier 存入同一个 SQLite 数据库。服务运行时通过 Web 修改，立即生效；停服维护时，CLI 可以对同一数据库操作，例如 `sudo tier --config /etc/tier/tier.toml status`。恢复时先用 `tier inspect snapshot.json /mnt/surviving-disk` 检查，再用 `tier --db /path/to/new.sqlite import snapshot.json --target disk1=/mnt/surviving-disk` 导入新库。旧版若使用工作目录下的 `tier.sqlite`，升级前将 TOML 的 `db` 指向原库绝对路径。更新发布包时重新运行 `install.sh`，已有 TOML 会保留；执行 `sudo systemctl restart tier` 切换到新版本。
+
+## 从源码构建
+
+在 Linux 上安装稳定版 Rust、C 编译器、GNU Make、Node.js 22.12+ 和 npm，运行 `make build`。提交前运行 `make check`；共享语义的端到端验收见 [SMB 测试](tests/smb-smoke.sh)。

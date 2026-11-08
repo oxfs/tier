@@ -598,6 +598,10 @@ impl MountedShare {
         .map(Self)
     }
 
+    pub(crate) fn unmounter(&mut self) -> SessionUnmounter {
+        self.0.unmount_callable()
+    }
+
     pub(crate) fn run(&mut self) -> Result<()> {
         Ok(self.0.run()?)
     }

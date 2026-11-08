@@ -1,3 +1,4 @@
+mod config;
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use std::{collections::BTreeMap, fs, net::SocketAddr, path::PathBuf};
@@ -6,8 +7,12 @@ use tier::{archive, core::Engine, recovery, service};
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    #[arg(long, global = true, default_value = "tier.sqlite")]
-    db: PathBuf,
+    /// Startup TOML (default: $XDG_CONFIG_HOME/tier/tier.toml).
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    /// Override the metadata database (default: $XDG_STATE_HOME/tier/tier.sqlite).
+    #[arg(long, global = true)]
+    db: Option<PathBuf>,
     #[command(subcommand)]
     action: Action,
 }
@@ -53,9 +58,9 @@ enum Action {
     },
     /// Run the filesystem, background worker and local administration UI.
     Serve {
-        mountpoint: PathBuf,
-        #[arg(long, default_value = "127.0.0.1:9480")]
-        admin: SocketAddr,
+        mountpoint: Option<PathBuf>,
+        #[arg(long)]
+        admin: Option<SocketAddr>,
     },
     /// Run one manual repair and archive pass.
     Repair,
@@ -85,6 +90,14 @@ enum Action {
 }
 
 fn main() -> Result<()> {
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing::Level::INFO.into())
+        .from_env()?;
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_env_filter(filter)
+        .init();
     let cli = Cli::parse();
     if let Action::Inspect {
         snapshot,
@@ -106,6 +119,8 @@ fn main() -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
+    let settings = config::Settings::load(cli.config.as_deref())?;
+    let db = settings.database(cli.db)?;
     if let Action::Import {
         snapshot,
         targets,
@@ -117,16 +132,12 @@ fn main() -> Result<()> {
             let (name, path) = mapping.split_once('=').context("use NAME=PATH")?;
             map.insert(name.to_owned(), path.into());
         }
-        let report = recovery::import(
-            &tier::snapshot::load(snapshot)?,
-            &cli.db,
-            &map,
-            *allow_degraded,
-        )?;
+        let report =
+            recovery::import(&tier::snapshot::load(snapshot)?, &db, &map, *allow_degraded)?;
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
-    let mut lock_name = cli.db.as_os_str().to_owned();
+    let mut lock_name = db.as_os_str().to_owned();
     lock_name.push(".lock");
     let guard = fs::OpenOptions::new()
         .create(true)
@@ -136,7 +147,7 @@ fn main() -> Result<()> {
     guard.try_lock().context(
         "database is in use; manage a running Tier instance through its local web interface",
     )?;
-    let engine = Engine::open(&cli.db)?;
+    let engine = Engine::open(&db)?;
     match cli.action {
         Action::Target {
             name,
@@ -167,7 +178,16 @@ fn main() -> Result<()> {
             Ok(())
         }
         Action::Mkdir { path } => engine.mkdir(&path),
-        Action::Serve { mountpoint, admin } => service::serve(engine, &cli.db, &mountpoint, admin),
+        Action::Serve { mountpoint, admin } => service::serve(
+            engine,
+            &db,
+            &mountpoint
+                .or(settings.mountpoint)
+                .context("set mountpoint in tier.toml or supply it to serve")?,
+            admin
+                .or(settings.admin)
+                .unwrap_or_else(|| ([127, 0, 0, 1], 9480).into()),
+        ),
         Action::Import { .. } | Action::Inspect { .. } => unreachable!(),
     }
 }

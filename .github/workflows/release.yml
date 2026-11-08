@@ -1,0 +1,46 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - run: rustup default stable
+      - run: make check
+      - run: cargo build --release --locked
+      - name: Package Linux x86_64
+        run: |
+          test "v$(target/release/tier --version | cut -d' ' -f2)" = "$GITHUB_REF_NAME"
+          mkdir tier-linux-x86_64
+          cp target/release/tier deploy/{install.sh,tier.service,tier.toml,samba-share.conf} tier-linux-x86_64/
+          chmod 755 tier-linux-x86_64/install.sh
+          tar czf tier-linux-x86_64.tar.gz tier-linux-x86_64
+          sha256sum tier-linux-x86_64.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: |
+            tier-linux-x86_64.tar.gz
+            SHA256SUMS
+  publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+      - run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes tier-linux-x86_64.tar.gz SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -243,7 +243,7 @@ impl Engine {
                         Ok(())
                     })();
                     if let Err(error) = &result {
-                        eprintln!("snapshot {}: {error}", dir.display());
+                        tracing::warn!(path = %dir.display(), %error, "snapshot destination failed");
                     }
                     result
                 })?;

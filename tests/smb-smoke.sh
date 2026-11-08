@@ -89,7 +89,7 @@ pid directory = $tmp/run
 ncalrpc dir = $tmp/run/ncalrpc
 log file = $tmp/smb.log
 EOF
-sed -e "s|/srv/tier/share|$tmp/mnt|" -e "s/guest ok = no/guest ok = yes/" deploy/samba-share.conf >> "$tmp/smb.conf"
+sed -e "s|/srv/tier/share|$tmp/mnt|" -e "s/force group = tier/force group = root/" -e "s/guest ok = no/guest ok = yes/" deploy/samba-share.conf >> "$tmp/smb.conf"
 printf '    force user = root\n' >> "$tmp/smb.conf"
 setsid smbd --foreground --no-process-group --configfile="$tmp/smb.conf" > "$tmp/smbd.log" 2>&1 &
 smb_pid=$!
