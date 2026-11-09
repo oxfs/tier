@@ -1,9 +1,8 @@
 use crate::core::Engine;
 use crate::core::schema;
 use anyhow::{Result, ensure};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use rocksdb::IteratorMode;
-use serde::{Deserialize, Serialize};
+use rocksdb::{IteratorMode, ReadOptions};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{fs, io::Write, path::Path};
@@ -22,23 +21,29 @@ pub(crate) struct Image {
     pub format: u32,
     pub seq: u64,
     pub system_id: String,
+    /// Readable view derived from records; recovery verifies both agree.
+    pub paths: Vec<Value>,
     pub records: Vec<Record>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Record {
     pub key: String,
-    pub value: String,
+    pub value: Value,
 }
 
 impl Record {
+    pub(crate) fn decode<T: DeserializeOwned>(&self) -> Result<T> {
+        Ok(T::deserialize(&self.value)?)
+    }
+
     pub(crate) fn bytes(&self) -> Result<Vec<u8>> {
-        Ok(STANDARD.decode(&self.value)?)
+        schema::encode(&self.value)
     }
 }
 
 pub(crate) fn decode(data: &Value) -> Result<Image> {
-    let image: Image = serde_json::from_value(data.clone())?;
+    let image = Image::deserialize(data)?;
     ensure!(image.format == FORMAT, "unsupported snapshot format");
     uuid::Uuid::parse_str(&image.system_id)?;
     Ok(image)
@@ -58,7 +63,9 @@ impl Engine {
             .transpose()?
             .unwrap_or(0);
         let mut records = Vec::new();
-        for item in snapshot.iterator(IteratorMode::Start) {
+        let mut options = ReadOptions::default();
+        options.fill_cache(false);
+        for item in snapshot.iterator_opt(IteratorMode::Start, options) {
             let (key, value) = item?;
             let key = String::from_utf8(key.to_vec())?;
             if schema::ephemeral(&key) {
@@ -66,15 +73,19 @@ impl Engine {
             }
             records.push(Record {
                 key,
-                value: STANDARD.encode(value),
+                value: schema::decode(&value)?,
             });
         }
-        Ok(serde_json::to_value(Image {
+        let image = Image {
             format: FORMAT,
             seq,
             system_id,
+            paths: Vec::new(),
             records,
-        })?)
+        };
+        Ok(serde_json::to_value(crate::recovery::with_snapshot_paths(
+            image,
+        )?)?)
     }
 }
 

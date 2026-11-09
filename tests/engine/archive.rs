@@ -19,18 +19,23 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
     let url = format!("http://{}/dav", http.server_addr());
     let corrupt = Arc::new(AtomicBool::new(true));
     let bad = corrupt.clone();
+    let reject_uploads = Arc::new(AtomicBool::new(false));
+    let reject = reject_uploads.clone();
+    let objects = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let stored = objects.clone();
     let unavailable = Arc::new(std::sync::Mutex::new(String::new()));
     let missing = unavailable.clone();
     let done = Arc::new(AtomicBool::new(false));
     let stop = done.clone();
     let worker = thread::spawn(move || -> Result<()> {
-        let mut objects = HashMap::new();
         while !stop.load(Ordering::Relaxed) {
             let Some(mut req) = http.recv_timeout(Duration::from_millis(50))? else {
                 continue;
             };
             let key = req.url().to_owned();
+            let mut objects = stored.lock().unwrap();
             let (status, body) = match req.method() {
+                Method::Put if reject.load(Ordering::Relaxed) => (503, vec![]),
                 Method::Put => {
                     let mut buf = Vec::new();
                     req.as_reader().read_to_end(&mut buf)?;
@@ -89,6 +94,29 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
     corrupt.store(false, Ordering::Relaxed);
     engine.archive_tick()?;
     assert_eq!(engine.state()?["health"][0]["status"], "remote_only");
+    // Failed background renaming keeps the previous readable remote mapping.
+    let old_objects = objects.lock().unwrap().clone();
+    engine.rename("/photo", "/旅行 #?%.jpg")?;
+    reject_uploads.store(true, Ordering::Relaxed);
+    assert!(engine.archive_tick().is_err());
+    assert_eq!(*objects.lock().unwrap(), old_objects);
+    reject_uploads.store(false, Ordering::Relaxed);
+    engine.archive_tick()?;
+    {
+        let stored = objects.lock().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(
+            stored
+                .keys()
+                .next()
+                .unwrap()
+                .ends_with("%E6%97%85%E8%A1%8C%20%23%3F%25.jpg")
+        );
+        assert!(old_objects.keys().all(|key| !stored.contains_key(key)));
+    }
+    assert_eq!(engine.get("/旅行 #?%.jpg")?, b"photo bytes");
+    engine.rename("/旅行 #?%.jpg", "/photo")?;
+    engine.archive_tick()?;
     // With no local source, corrupt remote content is never accepted on recall.
     corrupt.store(true, Ordering::Relaxed);
     assert!(engine.get("/photo").is_err());

@@ -1520,6 +1520,7 @@ dependencies = [
  "tracing-subscriber",
  "unicase",
  "ureq",
+ "url",
  "uuid",
 ]
 

@@ -13,7 +13,7 @@ use std::{
     io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::fs::PermissionsExt,
+        unix::fs::{MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
 };
@@ -34,6 +34,15 @@ struct Catalog {
 impl Catalog {
     fn parse(value: &Value) -> Result<Self> {
         let image = snapshot::decode(value)?;
+        let result = Self::from_image(image)?;
+        ensure!(
+            result.image.paths == result.paths()?,
+            "snapshot path mapping disagrees with metadata"
+        );
+        Ok(result)
+    }
+
+    fn from_image(image: Image) -> Result<Self> {
         let mut result = Self {
             image,
             nodes: BTreeMap::new(),
@@ -50,10 +59,9 @@ impl Catalog {
         let mut archive_policies = Vec::new();
         for row in &result.image.records {
             ensure!(keys.insert(row.key.clone()), "duplicate snapshot key");
-            let bytes = row.bytes()?;
             let key = row.key.as_str();
             if let Some(id) = key.strip_prefix(schema::NODES) {
-                let node: Record = schema::decode(&bytes)?;
+                let node: Record = row.decode()?;
                 ensure!(
                     node.node.id == id && (id == "root" || Uuid::parse_str(id).is_ok()),
                     "invalid node identity"
@@ -78,9 +86,9 @@ impl Catalog {
                 }
                 result.nodes.insert(id.into(), node);
             } else if key.starts_with(schema::ENTRIES) {
-                entries.insert(key.to_owned(), schema::decode::<String>(&bytes)?);
+                entries.insert(key.to_owned(), row.decode::<String>()?);
             } else if let Some(name) = key.strip_prefix(schema::TARGETS) {
-                let target: Target = schema::decode(&bytes)?;
+                let target: Target = row.decode()?;
                 ensure!(
                     target.name == name && safe_name(name) && target.path.is_absolute(),
                     "invalid target"
@@ -88,7 +96,7 @@ impl Catalog {
                 Uuid::parse_str(&target.identity)?;
                 result.targets.insert(name.into(), target);
             } else if key.starts_with(schema::COPIES) {
-                let copy: Copy = schema::decode(&bytes)?;
+                let copy: Copy = row.decode()?;
                 ensure!(
                     key == schema::copy(&copy.node, &copy.target),
                     "invalid copy key"
@@ -100,11 +108,11 @@ impl Catalog {
                 result.copies.push(copy.clone());
                 result.claimed.push(copy);
             } else if let Some(id) = key.strip_prefix(schema::POLICIES) {
-                policies.push((id.to_owned(), schema::decode::<Policy>(&bytes)?));
+                policies.push((id.to_owned(), row.decode::<Policy>()?));
             } else if let Some(id) = key.strip_prefix(schema::ARCHIVE_POLICIES) {
-                archive_policies.push((id.to_owned(), schema::decode::<ArchivePolicy>(&bytes)?));
+                archive_policies.push((id.to_owned(), row.decode::<ArchivePolicy>()?));
             } else if let Some(name) = key.strip_prefix(schema::ARCHIVE_TARGETS) {
-                let target: ArchiveTarget = schema::decode(&bytes)?;
+                let target: ArchiveTarget = row.decode()?;
                 ensure!(
                     target.name == name && safe_name(name),
                     "invalid archive target"
@@ -121,8 +129,11 @@ impl Catalog {
                 result.archives.insert(name.into(), target);
             } else if key.starts_with(schema::ARCHIVE_COPIES) || key.starts_with(schema::ARCHIVE_GC)
             {
-                let copy: ArchiveCopy = schema::decode(&bytes)?;
-                Uuid::parse_str(&copy.key)?;
+                let copy: ArchiveCopy = row.decode()?;
+                ensure!(
+                    crate::core::objects::valid_name(&copy.key),
+                    "invalid archive object name"
+                );
                 digest(&copy.hash)?;
                 if key.starts_with(schema::ARCHIVE_COPIES) {
                     ensure!(
@@ -132,7 +143,7 @@ impl Catalog {
                     result.archived.push(copy);
                 }
             } else if key.starts_with(schema::TRASH) {
-                let trash: Trash = schema::decode(&bytes)?;
+                let trash: Trash = row.decode()?;
                 ensure!(
                     trash.id > 0 && key == schema::trash(trash.id),
                     "invalid trash key"
@@ -147,31 +158,28 @@ impl Catalog {
                     "duplicate trash node"
                 );
             } else if key.starts_with(schema::GARBAGE) {
-                let copy: Copy = schema::decode(&bytes)?;
+                let copy: Copy = row.decode()?;
                 object_key(&copy)?;
                 result.claimed.push(copy);
             } else {
                 match key {
                     schema::SYSTEM_FORMAT => ensure!(
-                        schema::decode::<String>(&bytes)? == schema::FORMAT,
+                        row.decode::<String>()? == schema::FORMAT,
                         "unsupported metadata format"
                     ),
                     schema::SYSTEM_ID => ensure!(
-                        schema::decode::<String>(&bytes)? == result.image.system_id,
+                        row.decode::<String>()? == result.image.system_id,
                         "system identity mismatch"
                     ),
                     schema::REVISION => ensure!(
-                        schema::decode::<u64>(&bytes)? == result.image.seq,
+                        row.decode::<u64>()? == result.image.seq,
                         "revision mismatch"
                     ),
                     schema::TRASH_SEQ => {
-                        ensure!(
-                            schema::decode::<i64>(&bytes)? >= 0,
-                            "invalid trash sequence"
-                        )
+                        ensure!(row.decode::<i64>()? >= 0, "invalid trash sequence")
                     }
                     schema::BACKUP_SCHEDULE => {
-                        let s: crate::backup::Schedule = schema::decode(&bytes)?;
+                        let s: crate::backup::Schedule = row.decode()?;
                         ensure!(
                             s.seconds > 0
                                 && s.changes > 0
@@ -234,7 +242,7 @@ impl Catalog {
             .records
             .iter()
             .find(|row| row.key == schema::TRASH_SEQ)
-            .map(|row| schema::decode::<i64>(&row.bytes()?))
+            .map(|row| row.decode::<i64>())
             .transpose()?
             .unwrap_or(0);
         ensure!(
@@ -300,6 +308,70 @@ impl Catalog {
         Ok(result)
     }
 
+    fn paths(&self) -> Result<Vec<Value>> {
+        let mut copies: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+        for copy in &self.copies {
+            let node = &self.nodes[&copy.node];
+            let target = &self.targets[&copy.target];
+            copies.entry(&copy.node).or_default().push(json!({
+                "kind": "local",
+                "target": copy.target,
+                "target_id": target.identity,
+                "target_root": target.path,
+                "relative_path": copy.object,
+                "physical_path": target.path.join(&copy.object),
+                "version": copy.version,
+                "hash": copy.hash,
+                "current": copy.version == node.node.version,
+                "primary": node.primary.as_ref() == Some(&copy.target),
+            }));
+        }
+        for copy in &self.archived {
+            let node = &self.nodes[&copy.node];
+            let target = &self.archives[&copy.target];
+            copies.entry(&copy.node).or_default().push(json!({
+                "kind": "archive",
+                "target": copy.target,
+                "relative_path": copy.key,
+                "physical_path": crate::archive::webdav::object_url(&target.url, &copy.key)?,
+                "version": copy.version,
+                "hash": copy.hash,
+                "current": copy.version == node.node.version,
+            }));
+        }
+        for locations in copies.values_mut() {
+            locations.sort_by(|a, b| {
+                a["kind"]
+                    .as_str()
+                    .cmp(&b["kind"].as_str())
+                    .then(a["target"].as_str().cmp(&b["target"].as_str()))
+            });
+        }
+        let mut paths = Vec::with_capacity(self.nodes.len());
+        for (id, node) in &self.nodes {
+            let (path, trash_id) = self.path(id)?;
+            paths.push(json!({
+                "path": Path::new("/").join(path),
+                "node": id,
+                "kind": if node.node.is_dir { "directory" } else { "file" },
+                "namespace": if trash_id.is_some() { "trash" } else { "live" },
+                "trash_id": trash_id,
+                "size": node.node.size,
+                "version": node.node.version,
+                "hash": node.hash,
+                "dirty": node.dirty,
+                "copies": copies.remove(id.as_str()).unwrap_or_default(),
+            }));
+        }
+        paths.sort_by(|a, b| {
+            a["path"]
+                .as_str()
+                .cmp(&b["path"].as_str())
+                .then(a["trash_id"].as_i64().cmp(&b["trash_id"].as_i64()))
+        });
+        Ok(paths)
+    }
+
     fn path(&self, id: &str) -> Result<(PathBuf, Option<i64>)> {
         let mut cursor = id;
         let mut parts = Vec::new();
@@ -326,6 +398,12 @@ impl Catalog {
             }
         }
     }
+}
+
+pub(crate) fn with_snapshot_paths(image: Image) -> Result<Image> {
+    let mut catalog = Catalog::from_image(image)?;
+    catalog.image.paths = catalog.paths()?;
+    Ok(catalog.image)
 }
 
 fn validate_policy(policy: &Policy, targets: &BTreeMap<String, Target>) -> Result<()> {
@@ -389,7 +467,7 @@ fn object_key(copy: &Copy) -> Result<&str> {
             && parts[0] == "objects"
             && parts[1] == copy.node
             && Uuid::parse_str(parts[1]).is_ok()
-            && Uuid::parse_str(parts[2]).is_ok(),
+            && crate::core::objects::valid_name(parts[2]),
         "invalid object path"
     );
     Ok(&copy.object)
@@ -411,7 +489,71 @@ struct Device {
     path: PathBuf,
     handle: fs::File,
 }
+
+struct ResolvedCopy {
+    file: fs::File,
+    object: String,
+    aliases: Vec<String>,
+}
+
 impl Device {
+    fn open_copy(&self, copy: &Copy) -> Result<ResolvedCopy> {
+        let object = object_key(copy)?;
+        match self.open(object) {
+            Ok(file) => {
+                return Ok(ResolvedCopy {
+                    file,
+                    object: object.into(),
+                    aliases: vec![object.into()],
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        // Background renames keep the object UUID. Only search that identity
+        // under this node, never another generation with matching file content.
+        let (parent, name) = object.rsplit_once('/').context("invalid object path")?;
+        let prefix = format!("{}--", &name[..36]);
+        let directory = self.open(parent)?;
+        ensure!(
+            directory.metadata()?.is_dir(),
+            "object node must be a directory"
+        );
+        let mut aliases = Vec::new();
+        for entry in fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if let Some(name) = name.to_str()
+                && name.starts_with(&prefix)
+                && crate::core::objects::valid_name(name)
+            {
+                aliases.push(format!("{parent}/{name}"));
+            }
+        }
+        aliases.sort();
+        let mut selected: Option<fs::File> = None;
+        for alias in &aliases {
+            let file = self.open(alias)?;
+            let metadata = file.metadata()?;
+            ensure!(metadata.is_file(), "object must be a regular file");
+            if let Some(previous) = &selected {
+                let previous = previous.metadata()?;
+                ensure!(
+                    (previous.dev(), previous.ino()) == (metadata.dev(), metadata.ino()),
+                    "ambiguous renamed object: {object}"
+                );
+            } else {
+                selected = Some(file);
+            }
+        }
+        let file = selected.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        Ok(ResolvedCopy {
+            file,
+            object: aliases[0].clone(),
+            aliases,
+        })
+    }
+
     fn open(&self, relative: &str) -> io::Result<fs::File> {
         let mut directory = self.handle.try_clone()?;
         let parts = relative.split('/').collect::<Vec<_>>();
@@ -495,6 +637,8 @@ fn inspect_catalog(
     let mut live = section();
     let mut trash = section();
     let mut good_copies = Vec::new();
+    let mut resolved_copies = Vec::new();
+    let mut resolved_aliases = BTreeSet::new();
     let mut good_archives = Vec::new();
     for (id, node) in &catalog.nodes {
         let (path, trash_id) = catalog.path(id)?;
@@ -523,15 +667,23 @@ fn inspect_catalog(
             let Some(device) = devices.get(&copy.target) else {
                 continue;
             };
-            let display_object = device.path.join(&copy.object);
-            let mut source = match device.open(object_key(copy)?) {
+            let resolved = match device.open_copy(copy) {
                 Ok(source) => source,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    push(report, "missing_copies", json!(display_object));
+                Err(e)
+                    if e.downcast_ref::<io::Error>()
+                        .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+                {
+                    push(
+                        report,
+                        "missing_copies",
+                        json!(device.path.join(&copy.object)),
+                    );
                     continue;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             };
+            let display_object = device.path.join(&resolved.object);
+            let mut source = resolved.file;
             ensure!(
                 source.metadata()?.is_file(),
                 "object must be a regular file"
@@ -568,6 +720,15 @@ fn inspect_catalog(
                 continue;
             }
             good_copies.push(schema::copy(&copy.node, &copy.target));
+            let mut current = copy.clone();
+            current.object = resolved.object;
+            resolved_copies.push(current);
+            resolved_aliases.extend(
+                resolved
+                    .aliases
+                    .into_iter()
+                    .map(|path| (copy.target.clone(), path)),
+            );
             if !found {
                 if let (Some(stage), Some(dest)) = (stage, dest) {
                     stage.as_file().sync_all()?;
@@ -653,7 +814,9 @@ fn inspect_catalog(
                 let relative = PathBuf::from("objects")
                     .join(node.file_name())
                     .join(file.file_name());
-                if !relative.to_str().is_some_and(|p| known.contains(p)) {
+                if !relative.to_str().is_some_and(|p| {
+                    known.contains(p) || resolved_aliases.contains(&(name.clone(), p.to_owned()))
+                }) {
                     unclaimed.push(device.path.join(relative));
                 }
             }
@@ -688,6 +851,7 @@ fn inspect_catalog(
     );
     live["unclaimed"] = json!(unclaimed);
     live["verified_copies"] = json!(good_copies);
+    live["resolved_copies"] = json!(resolved_copies);
     live["verified_archives"] = json!(good_archives);
     Ok(live)
 }
@@ -774,6 +938,7 @@ pub fn import(
     let verified_archives = report["verified_archives"]
         .as_array()
         .context("invalid archive recovery report")?;
+    let resolved: Vec<Copy> = serde_json::from_value(report["resolved_copies"].clone())?;
     for row in &catalog.image.records {
         let mut bytes = row.bytes()?;
         if let Some(name) = row.key.strip_prefix(schema::TARGETS)
@@ -787,6 +952,13 @@ pub fn import(
             && !verified.iter().any(|v| v.as_str() == Some(&row.key))
         {
             continue;
+        }
+        if row.key.starts_with(schema::COPIES) {
+            let copy = resolved
+                .iter()
+                .find(|copy| row.key == schema::copy(&copy.node, &copy.target))
+                .context("verified copy has no physical location")?;
+            bytes = schema::encode(copy)?;
         }
         if row.key.starts_with(schema::ARCHIVE_COPIES)
             && !verified_archives

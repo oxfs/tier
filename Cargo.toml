@@ -21,6 +21,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 tokio = { version = "1", features = ["rt", "net", "signal", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 ureq = "2.12"
+url = "2"
 tempfile = "3"
 unicase = "2"
 tracing = "0.1"

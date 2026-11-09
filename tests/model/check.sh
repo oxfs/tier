@@ -6,27 +6,37 @@ model=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cd "$work"
-cp "$model/Protection.tla" "$model/Protection.cfg" .
+cp "$model/"*.tla "$model/"*.cfg .
 run() {
     java -XX:+UseParallelGC -Xmx1g -cp "$jar" tlc2.TLC -workers 2 \
-        -metadir "$work/states" -config "$1" Protection.tla
+        -metadir "$work/states" -config "$2" "$1.tla"
 }
-run Protection.cfg
-for guard in CheckGeneration CheckVerification CheckRetention CheckRead; do
-    case "$guard" in
-        CheckGeneration) invariant='(PublishesCurrent|DataAvailable)' ;;
-        CheckVerification) invariant='VerifiedCopiesHaveData' ;;
-        CheckRetention) invariant='DataAvailable' ;;
-        CheckRead) invariant='ReadsCurrent' ;;
-    esac
-    sed "s/$guard = TRUE/$guard = FALSE/" "$model/Protection.cfg" >"$work/unsafe.cfg"
-    if run unsafe.cfg >"$work/counterexample.log" 2>&1; then
-        echo "Missing counterexample for $guard" >&2
+counterexample() {
+    local name=$1 guard=$2 invariant=$3
+    sed "s/$guard = TRUE/$guard = FALSE/" "$model/$name.cfg" >"$work/unsafe.cfg"
+    if run "$name" unsafe.cfg >"$work/counterexample.log" 2>&1; then
+        echo "Missing counterexample for $name/$guard" >&2
         exit 1
     fi
     if ! grep -Eq "Invariant $invariant is violated" "$work/counterexample.log"; then
         cat "$work/counterexample.log" >&2
         exit 1
     fi
-    printf 'PASS counterexample: %s\n' "$guard"
+    printf 'PASS counterexample: %s/%s\n' "$name" "$guard"
+}
+for name in Protection Durability PhysicalRename Placement; do
+    run "$name" "$name.cfg"
 done
+counterexample Protection CheckGeneration '(PublishesCurrent|DataAvailable)'
+counterexample Protection CheckVerification VerifiedCopiesHaveData
+counterexample Protection CheckRetention DataAvailable
+counterexample Protection CheckRead ReadsCurrent
+counterexample Durability CheckInvalidation ProtectedContentUnchanged
+counterexample Durability CheckDataSync AcknowledgedDurable
+counterexample Durability CheckMetadataSync AcknowledgedDurable
+counterexample PhysicalRename CheckLinkSync DurableMappingHasBody
+counterexample PhysicalRename CheckMappingSync DurableMappingHasBody
+counterexample PhysicalRename CheckGCCurrent '(DurableMappingHasBody|LiveMappingHasBody)'
+counterexample PhysicalRename CheckIntent NoUntrackedAlias
+counterexample Placement CheckPolicy PublishesCurrentPolicy
+counterexample Placement CheckLive PublishesLiveNode

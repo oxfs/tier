@@ -1,6 +1,6 @@
 //! RocksDB's single-column-family schema. All persisted key layouts live here.
 //!
-//! Values use named-field MessagePack; snapshots share the same codec. Preserve
+//! Values use named-field MessagePack; snapshots render them as JSON. Preserve
 //! storage names with `serde(rename)` when renaming Rust fields. Added fields
 //! need safe defaults. Unknown fields are discarded on read/modify/write, so
 //! incompatible semantics or unsafe downgrades require a new FORMAT gate.

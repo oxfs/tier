@@ -1,6 +1,7 @@
 mod catalog;
 mod file;
 mod model;
+pub(crate) mod objects;
 mod queue;
 mod reconcile;
 mod report;

@@ -22,7 +22,32 @@ impl TargetDirectory {
         fs::File::open(self.root.join(key))
     }
     pub(crate) fn remove_object(&self, key: &str) -> io::Result<()> {
-        fs::remove_file(self.root.join(key))
+        let path = self.root.join(key);
+        match fs::remove_file(&path) {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error),
+        }
+        if let Some(parent) = path.parent() {
+            match fs::File::open(parent) {
+                Ok(directory) => directory.sync_all()?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        // Callers serialize object creation/deletion by node. Never recursively
+        // remove directories: an unpublished candidate may still be copying.
+        if key.starts_with("objects/")
+            && let Some(parent) = path.parent()
+        {
+            match fs::remove_dir(parent) {
+                Ok(()) => fs::File::open(self.root.join("objects"))?.sync_all()?,
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTEMPTY)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
     pub(crate) fn stat(&self) -> Result<libc::statvfs> {
         let mut stat = std::mem::MaybeUninit::uninit();
@@ -182,14 +207,22 @@ impl Engine {
         id: &str,
     ) -> Result<(TargetDirectory, String, fs::File)> {
         let root = self.target(name)?;
+        let label = self.record(id)?.name;
         let dir = root.root.join("objects").join(id);
         fs::create_dir_all(&dir)?;
-        let object = format!("objects/{id}/{}", Uuid::new_v4());
-        let file = fs::OpenOptions::new()
+        let object = format!("objects/{id}/{}", objects::name(&label));
+        let file = match fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
-            .open(root.root.join(&object))?;
+            .open(root.root.join(&object))
+        {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = fs::remove_dir(&dir);
+                return Err(error.into());
+            }
+        };
         Ok((root, object, file))
     }
     pub(crate) fn sync_object(root: &TargetDirectory, object: &str, file: &fs::File) -> Result<()> {
@@ -331,6 +364,17 @@ impl Engine {
     }
     pub(crate) fn collect_garbage(&self) -> Result<()> {
         for (k, c) in self.scan::<Copy>(schema::GARBAGE)? {
+            let lock = self.file_lock(&c.node);
+            let _guard = lock.lock();
+            // A -> B -> A may reuse a still-existing hard-link name. Never
+            // unlink a path now selected by the authoritative copy record.
+            if self
+                .kv_get::<Copy>(&schema::copy(&c.node, &c.target))?
+                .is_some_and(|current| current.object == c.object)
+            {
+                self.delete_record(&k)?;
+                continue;
+            }
             if let Ok(t) = self.target(&c.target) {
                 match t.remove_object(&c.object) {
                     Ok(()) => self.delete_record(&k)?,

@@ -2,6 +2,7 @@
 
 import concurrent.futures
 import errno
+import json
 import os
 import signal
 import subprocess
@@ -22,6 +23,28 @@ class ConnectedTest(unittest.TestCase):
 
 
 class SMBTests(ConnectedTest):
+    def test_physical_names_and_readable_snapshot(self):
+        self.env.write("physical-before.txt", b"portable contents")
+        initial = list((self.env.root / "objects").rglob("*--physical-before.txt"))
+        self.assertEqual(len(initial), 1)
+        latest_name = "离线 名称 #%.txt"
+        smbclient.rename(
+            self.env.path("physical-before.txt"), self.env.path(latest_name), **self.env.config
+        )
+        self.env.action("repair", {})
+        snapshot = self.env.root / "readable-snapshot.json"
+        self.env.action("snapshot", {"path": str(snapshot)})
+        image = json.loads(snapshot.read_text())["metadata"]
+        entry = next(item for item in image["paths"] if item["path"] == "/" + latest_name)
+        current = [copy for copy in entry["copies"] if copy["kind"] == "local" and copy["current"]]
+        self.assertEqual(len(current), 1)
+        physical = self.env.root / "objects" / current[0]["relative_path"]
+        self.assertEqual(str(physical), current[0]["physical_path"])
+        self.assertTrue(physical.name.endswith("--" + latest_name))
+        self.assertEqual(physical.name[:36], initial[0].name[:36])
+        self.assertEqual(physical.read_bytes(), b"portable contents")
+        self.assertFalse(initial[0].exists())
+
     def test_ordinary_user(self):
         # Exercise the production shared-group identity, without forcing an SMB user to root.
         user_options = dict(self.env.config, username="tier-test", connection_cache={})

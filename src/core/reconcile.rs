@@ -84,6 +84,7 @@ impl Engine {
         Ok(Some(latest))
     }
     fn reconcile_one(&self, id: &str, manual: bool) -> Result<()> {
+        self.refresh_object_names(id)?;
         let Some(r) = self.prepare_protected(id)? else {
             return Ok(());
         };
@@ -161,10 +162,30 @@ impl Engine {
             }
             let source = &valid[0];
             let mut input = self.target(&source.target)?.open_object(&source.object)?;
-            let (root, object, mut output) = match self.create_object(&name, id) {
+            let lock = self.file_lock(id);
+            let candidate = {
+                let _guard = lock.lock();
+                self.create_object(&name, id)
+            };
+            let (root, object, mut output) = match candidate {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            // The maintenance gate excludes GC while this candidate is live.
+            // Persist its cleanup job before copying data; publication removes
+            // the job atomically, including when a concurrent purge wins.
+            let candidate_gc = schema::garbage(&name);
+            self.put_record(
+                &candidate_gc,
+                &Copy {
+                    node: id.into(),
+                    target: name.clone(),
+                    object: object.clone(),
+                    version: r.node.version,
+                    hash: None,
+                },
+                true,
+            )?;
             let copied = (|| -> Result<()> {
                 io::copy(&mut input, &mut output)?;
                 ensure!(
@@ -174,21 +195,26 @@ impl Engine {
                 Self::sync_object(&root, &object, &output)
             })();
             if copied.is_err() {
-                let _ = root.remove_object(&object);
+                let _guard = lock.lock();
+                if root.remove_object(&object).is_ok() {
+                    self.delete_record(&candidate_gc)?;
+                }
                 continue;
             }
-            let lock = self.file_lock(id);
             let state = lock.lock();
             let _namespace = self.inner.namespace.read();
-            let latest = self.record(id)?;
-            if state.writer
-                || latest.node.version != r.node.version
-                || self.policy(id)? != p
-                || !self.live(id)?
-            {
-                drop(state);
-                let _ = root.remove_object(&object);
-                return Ok(());
+            let publish = (|| -> Result<bool> {
+                let latest = self.record(id)?;
+                Ok(!state.writer
+                    && latest.node.version == r.node.version
+                    && self.policy(id)? == p
+                    && self.live(id)?)
+            })();
+            if !matches!(publish, Ok(true)) {
+                if root.remove_object(&object).is_ok() {
+                    self.delete_record(&candidate_gc)?;
+                }
+                return publish.map(|_| ());
             }
             let copy = Copy {
                 node: id.into(),
@@ -201,7 +227,7 @@ impl Engine {
             if let Some(old) = self.kv_get::<Copy>(&schema::copy(id, &name))? {
                 puts.push(Self::encoded(schema::garbage(&name), &old)?)
             }
-            self.atomic(puts, vec![], true)?;
+            self.atomic(puts, vec![candidate_gc], true)?;
             domains.insert(self.require::<Target>(&schema::target(&name))?.domain);
             valid.push(copy);
         }

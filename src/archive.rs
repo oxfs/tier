@@ -1,5 +1,5 @@
-use crate::core::schema;
-mod webdav;
+use crate::core::{objects, schema};
+pub(crate) mod webdav;
 use self::webdav::WebDav;
 use crate::core::{Engine, Record, fingerprint, now};
 use anyhow::{Context, Result, bail, ensure};
@@ -279,7 +279,11 @@ impl Engine {
                 Ok(()) => {
                     c.checked = now()?;
                     c.error = None;
-                    verified.push(c)
+                    // A renamed file keeps its old usable copy until the new
+                    // name is uploaded, verified and atomically published.
+                    if objects::matches_name(&c.key, &r.name) {
+                        verified.push(c);
+                    }
                 }
                 Err(e) => {
                     if c.error.is_none() {
@@ -322,12 +326,14 @@ impl Engine {
             );
             source.rewind()?;
             let client = self.archive_client(name)?;
-            let object = client.upload(&mut source, hash)?;
+            let object = client.upload(&mut source, hash, &r.name)?;
             let lock = self.file_lock(id);
             let guard = lock.lock();
             let _namespace = self.inner.namespace.read();
+            let latest = self.record(id)?;
             if guard.writer
-                || self.record(id)?.node.version != r.node.version
+                || latest.node.version != r.node.version
+                || latest.name != r.name
                 || self.archive_policy(id)?.as_ref() != Some(&p)
             {
                 drop(guard);
@@ -370,6 +376,7 @@ impl Engine {
         let mut latest = self.record(id)?;
         if guard.writer
             || latest.node.version != r.node.version
+            || latest.name != r.name
             || self.archive_policy(id)?.as_ref() != Some(&p)
         {
             return Ok(());
