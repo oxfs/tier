@@ -9,7 +9,7 @@ use tier::{
 
 fn policy(write_cache: &str, persistent_storage: &[&str]) -> Result<Policy> {
     Ok(serde_json::from_value(
-        json!({"write_cache":[write_cache],"persistent_storage":persistent_storage,"persistent_copies":persistent_storage.len(),"persist_delay_secs":0}),
+        json!({"write_cache":[write_cache],"persistent_storage":persistent_storage,"persistent_copies":persistent_storage.len(),"persist_delay_secs":0,"low_water":99,"high_water":100}),
     )?)
 }
 

@@ -15,6 +15,8 @@ fn setup(root: &Path) -> Result<(Engine, std::path::PathBuf)> {
         "/",
         &Policy {
             write_cache: vec!["disk".into()],
+            low_water: 99,
+            high_water: 100,
             ..Default::default()
         },
     )?;

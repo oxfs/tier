@@ -13,6 +13,8 @@ fn background_placement_prefers_independent_failure_domains() -> Result<()> {
         "/",
         &Policy {
             write_cache: vec!["cache".into()],
+            low_water: 99,
+            high_water: 100,
             ..Default::default()
         },
     )?;
@@ -31,6 +33,8 @@ fn background_placement_prefers_independent_failure_domains() -> Result<()> {
             write_cache: vec!["cache".into()],
             persistent_storage: names.clone(),
             persistent_copies: 2,
+            low_water: 99,
+            high_water: 100,
             ..Default::default()
         },
     )?;

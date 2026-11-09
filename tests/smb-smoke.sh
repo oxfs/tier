@@ -16,7 +16,7 @@ getent group tier >/dev/null || groupadd --system tier
 getent passwd tier-test >/dev/null || useradd --system --no-create-home --shell /usr/sbin/nologin tier-test
 tier_gid=$(getent group tier | cut -d: -f3)
 "$tier" --db "$tmp/metadata" target main "$tmp/objects"
-"$tier" --db "$tmp/metadata" policy / '{"write_cache":["main"],"persistent_storage":["main"],"persistent_copies":1,"persist_delay_secs":0}'
+"$tier" --db "$tmp/metadata" policy / '{"write_cache":["main"],"persistent_storage":["main"],"persistent_copies":1,"persist_delay_secs":0,"low_water":99,"high_water":100}'
 setpriv --regid "$tier_gid" --clear-groups "$tier" --db "$tmp/metadata" serve --socket "$tmp/tier.sock" --admin 127.0.0.1:0 > "$tmp/tier.log" 2>&1 &
 tier_pid=$!
 for _ in {1..100}; do [[ -S "$tmp/tier.sock" ]] && break; sleep .1; done

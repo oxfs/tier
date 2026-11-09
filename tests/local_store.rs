@@ -35,6 +35,8 @@ fn single_target_writes_then_reconcile_survive_cache_loss() -> anyhow::Result<()
             write_cache: vec!["ssd".into()],
             persistent_storage: vec!["a".into(), "b".into()],
             persistent_copies: 2,
+            low_water: 99,
+            high_water: 100,
             ..Default::default()
         },
     )?;
@@ -62,6 +64,8 @@ fn policy_move_keeps_old_copy_until_replacement_is_verified() -> anyhow::Result<
         "/",
         &Policy {
             write_cache: vec!["old".into()],
+            low_water: 99,
+            high_water: 100,
             ..Default::default()
         },
     )?;
@@ -70,6 +74,8 @@ fn policy_move_keeps_old_copy_until_replacement_is_verified() -> anyhow::Result<
         "/",
         &Policy {
             write_cache: vec!["new".into()],
+            low_water: 99,
+            high_water: 100,
             ..Default::default()
         },
     )?;
@@ -91,6 +97,8 @@ fn write_handles_are_exclusive_and_reconcile_waits_until_close() -> anyhow::Resu
             write_cache: vec!["cache".into()],
             persistent_storage: vec!["disk".into()],
             persistent_copies: 1,
+            low_water: 99,
+            high_water: 100,
             ..Default::default()
         },
     )?;
@@ -120,6 +128,8 @@ fn corruption_is_repaired_from_a_verified_replica_and_manual_policy_is_honored()
             persistent_storage: vec!["disk".into()],
             persistent_copies: 1,
             manual_repair: true,
+            low_water: 99,
+            high_water: 100,
             ..Default::default()
         },
     )?;
@@ -142,6 +152,8 @@ fn fallback_accepts_one_primary_even_when_eventual_replica_is_offline() -> anyho
             persistent_storage: vec!["a".into(), "b".into()],
             persistent_copies: 2,
             direct_fallback: true,
+            low_water: 99,
+            high_water: 100,
             ..Default::default()
         },
     )?;
@@ -159,6 +171,8 @@ fn stable_handle_observes_writes_after_rename_and_truncation() -> anyhow::Result
         "/",
         &Policy {
             write_cache: vec!["disk".into()],
+            low_water: 99,
+            high_water: 100,
             ..Default::default()
         },
     )?;
@@ -182,6 +196,8 @@ fn unrelated_files_write_concurrently_without_losing_namespace_updates() -> anyh
         "/",
         &Policy {
             write_cache: vec!["disk".into()],
+            low_water: 99,
+            high_water: 100,
             ..Default::default()
         },
     )?;
@@ -224,6 +240,8 @@ fn restart_never_promotes_an_old_replica_after_in_place_write() -> anyhow::Resul
             write_cache: vec!["cache".into()],
             persistent_storage: vec!["disk".into()],
             persistent_copies: 1,
+            low_water: 99,
+            high_water: 100,
             ..Default::default()
         },
     )?;
@@ -255,6 +273,8 @@ fn empty_files_read_without_recalling_archive() -> anyhow::Result<()> {
         "/",
         &Policy {
             write_cache: vec!["disk".into()],
+            low_water: 99,
+            high_water: 100,
             ..Default::default()
         },
     )?;

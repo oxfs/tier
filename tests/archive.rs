@@ -67,6 +67,8 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
             write_cache: vec!["disk".into()],
             persistent_storage: vec!["replica".into()],
             persistent_copies: 1,
+            low_water: 99,
+            high_water: 100,
             ..Default::default()
         },
     )?;
@@ -106,6 +108,14 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
     engine.archive_tick()?;
     assert_eq!(engine.state()?["archive_targets"][0]["object_count"], 0);
     assert_eq!(engine.get("/photo")?, b"photo bytes");
+    // This test needs two live copies regardless of the runner's disk usage.
+    assert_eq!(
+        engine.state()?["health"][0]["readable_local"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     // A damaged preferred local target cannot displace a healthy cache copy.
     let id = engine.stat("/photo")?.id;
     let object = fs::read_dir(replica.join("objects").join(id))?
