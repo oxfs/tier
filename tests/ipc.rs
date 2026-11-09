@@ -426,3 +426,48 @@ fn invalid_write_body_and_timestamp_are_rejected_without_modifying_file() -> Res
     assert_eq!(attr.size, 0);
     Ok(())
 }
+
+#[test]
+fn attach_rejects_an_unsupported_subdirectory_instead_of_exporting_root() -> Result<()> {
+    let (temp, engine, _server) = fixture()?;
+    engine.mkdir("/subset")?;
+    let stream = UnixStream::connect(temp.path().join("tier.sock"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut client = Client {
+        stream,
+        next: 1,
+        root: 0,
+    };
+    client.call(
+        Request {
+            method: Method::Hello as i32,
+            protocol_version: VERSION.into(),
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    client.submit(
+        Request {
+            method: Method::Attach as i32,
+            name: "/subset".into(),
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    assert_eq!(client.receive()?.1.error, libc::EINVAL);
+    assert_ne!(
+        client
+            .call(
+                Request {
+                    method: Method::Attach as i32,
+                    name: "/".into(),
+                    ..Default::default()
+                },
+                vec![]
+            )?
+            .0
+            .handle,
+        0
+    );
+    Ok(())
+}

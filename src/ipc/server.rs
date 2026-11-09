@@ -566,6 +566,9 @@ fn execute(session: &mut Session, request: Request, instance: &str) -> Reply {
             if session.attached {
                 return Err(errno(libc::EISCONN));
             }
+            if !request.name.is_empty() && request.name != "/" {
+                return Err(errno(libc::EINVAL));
+            }
             let node = session.engine.stat_id("root")?;
             response.attr = Some(attr(&node));
             response.handle = session.insert(handle(node.id, None, false, false))?;

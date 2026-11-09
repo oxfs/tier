@@ -10,9 +10,9 @@
 struct tier_config {
 	struct tier_client *client;
 	uint64_t root, cwd;
-	int next_fd;
 	char *cwd_name;
 };
+static int next_fd = 1000;
 struct tier_fh {
 	uint64_t handle;
 	int flags;
@@ -120,7 +120,6 @@ static int tier_connect(struct vfs_handle_struct *h, const char *service,
 		return -1;
 	}
 	h->data = c;
-	c->next_fd = 1000;
 	c->cwd_name = talloc_strdup(c, "/");
 	become_root();
 	c->client = tier_client_connect(c, h->conn->sconn->ev_ctx, path);
@@ -201,6 +200,12 @@ static int tier_openat(struct vfs_handle_struct *h, const struct files_struct *d
 	Tier__Ipc__Response *out;
 	struct tier_fh *f;
 	int ret = -1;
+	int descriptor;
+	if (next_fd == INT_MAX) {
+		errno = EMFILE;
+		goto done;
+	}
+	descriptor = next_fd++;
 	if (!no_stream(name))
 		goto done;
 	if (how->resolve &
@@ -254,7 +259,7 @@ static int tier_openat(struct vfs_handle_struct *h, const struct files_struct *d
 	f->handle = out->handle;
 	f->flags = how->flags;
 	fsp->fsp_flags.have_proc_fds = false;
-	ret = ++c->next_fd;
+	ret = descriptor;
 done: {
 	int saved = errno;
 	TALLOC_FREE(tmp);
