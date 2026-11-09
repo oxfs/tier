@@ -155,3 +155,38 @@ fn backup_bookkeeping_does_not_trigger_new_snapshots_and_retention_is_applied() 
     assert_eq!(count()?, 2);
     Ok(())
 }
+
+#[test]
+fn offline_snapshot_destination_backs_off_without_delaying_healthy_targets() -> Result<()> {
+    let root = tempdir()?;
+    let engine = Engine::open(&root.path().join("metadata"))?;
+    let a = root.path().join("a");
+    let b = root.path().join("b");
+    fs::create_dir(&a)?;
+    fs::create_dir(&b)?;
+    engine.schedule(&tier::backup::Schedule {
+        directories: vec![a.clone(), b.clone()],
+        seconds: 60,
+        changes: 1,
+        keep: 2,
+        retain_days: 0,
+        hourly: 0,
+        daily: 0,
+    })?;
+    engine.schedule_backups()?;
+    fs::rename(&a, root.path().join("offline"))?;
+    engine.mkdir("/new")?;
+    assert!(engine.schedule_backups().is_err());
+    // Failed destinations back off; repeating a scheduler tick does not repeat I/O.
+    engine.schedule_backups()?;
+    let status = engine.state()?;
+    assert!(
+        status["backup_status"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["path"] == b.to_str().unwrap() && s["lag"] == 0)
+    );
+    assert!(engine.backup_tick().is_err());
+    Ok(())
+}

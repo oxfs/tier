@@ -1,6 +1,6 @@
 mod webdav;
 use self::webdav::WebDav;
-use crate::core::{Engine, fingerprint, key, now};
+use crate::core::{Engine, Record, fingerprint, key, now};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -57,19 +57,34 @@ impl Engine {
         configured_client(&t.url, t.user_env.as_deref(), t.pass_env.as_deref())
     }
     pub(crate) fn archive_policy(&self, id: &str) -> Result<Option<ArchivePolicy>> {
+        let view = self.inner.db.snapshot();
         let mut id = id.to_owned();
+        let mut seen = HashSet::new();
         loop {
-            if let Some(p) = self.kv_get(&key("archive_policy", &id))? {
-                return Ok(Some(p));
+            ensure!(seen.insert(id.clone()), "namespace cycle");
+            if let Some(policy) = Self::view_get(&view, &key("archive_policy", &id))? {
+                return Ok(Some(policy));
             }
-            let Some(parent) = self.record(&id)?.parent else {
-                return Ok(self
-                    .scan::<crate::core::Trash>("trash/")?
-                    .into_iter()
-                    .find(|(_, t)| t.node == id)
-                    .and_then(|(_, t)| t.archive_policy));
-            };
-            id = parent;
+            let node: Record =
+                Self::view_get(&view, &key("node", &id))?.context("missing policy node")?;
+            if let Some(parent) = node.parent {
+                id = parent;
+            } else {
+                for item in view.iterator(rocksdb::IteratorMode::From(
+                    b"trash/",
+                    rocksdb::Direction::Forward,
+                )) {
+                    let (key, value) = item?;
+                    if !key.starts_with(b"trash/") {
+                        break;
+                    }
+                    let trash: crate::core::Trash = Self::decode(&value)?;
+                    if trash.node == id {
+                        return Ok(trash.archive_policy);
+                    }
+                }
+                return Ok(None);
+            }
         }
     }
     pub fn add_archive(

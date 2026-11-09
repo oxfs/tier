@@ -369,48 +369,58 @@ impl Engine {
             .map(|(_, v)| v)
             .collect())
     }
+    pub(crate) fn view_get<T: DeserializeOwned>(
+        view: &rocksdb::SnapshotWithThreadMode<'_, TransactionDB>,
+        key: &str,
+    ) -> Result<Option<T>> {
+        view.get(key)?.map(|bytes| Self::decode(&bytes)).transpose()
+    }
     pub(crate) fn live(&self, id: &str) -> Result<bool> {
-        let mut n = self.record(id)?;
-        let mut seen = HashSet::new();
-        loop {
-            if n.node.id == "root" {
-                return Ok(true);
-            }
-            if !seen.insert(n.node.id.clone()) {
-                bail!("namespace cycle")
-            }
-            let Some(p) = n.parent else { return Ok(false) };
-            n = self.record(&p)?;
-        }
+        Ok(self.path_for(id)?.is_some())
     }
     pub(crate) fn path_for(&self, id: &str) -> Result<Option<String>> {
-        let mut n = self.record(id)?;
-        let mut parts = vec![];
+        let view = self.inner.db.snapshot();
+        let mut id = id.to_owned();
+        let mut parts = Vec::new();
         let mut seen = HashSet::new();
-        while n.node.id != "root" {
-            ensure!(seen.insert(n.node.id.clone()), "namespace cycle");
-            parts.push(n.name);
-            let Some(p) = n.parent else { return Ok(None) };
-            n = self.record(&p)?;
+        while id != "root" {
+            ensure!(seen.insert(id.clone()), "namespace cycle");
+            let node: Record =
+                Self::view_get(&view, &key("node", &id))?.ok_or_else(|| failure(libc::ENOENT))?;
+            parts.push(node.name);
+            let Some(parent) = node.parent else {
+                return Ok(None);
+            };
+            id = parent;
         }
         parts.reverse();
         Ok(Some(format!("/{}", parts.join("/"))))
     }
     pub(crate) fn policy(&self, id: &str) -> Result<Policy> {
+        let view = self.inner.db.snapshot();
         let mut id = id.to_owned();
+        let mut seen = HashSet::new();
         loop {
-            if let Some(p) = self.kv_get(&key("policy", &id))? {
-                return Ok(p);
+            ensure!(seen.insert(id.clone()), "namespace cycle");
+            if let Some(policy) = Self::view_get(&view, &key("policy", &id))? {
+                return Ok(policy);
             }
-            if let Some(parent) = self.record(&id)?.parent {
+            let node: Record =
+                Self::view_get(&view, &key("node", &id))?.ok_or_else(|| failure(libc::ENOENT))?;
+            if let Some(parent) = node.parent {
                 id = parent;
             } else {
-                return self
-                    .scan::<Trash>("trash/")?
-                    .into_iter()
-                    .find(|(_, t)| t.node == id)
-                    .map(|(_, t)| t.policy)
-                    .context("no applicable storage policy");
+                for item in view.iterator(IteratorMode::From(b"trash/", Direction::Forward)) {
+                    let (key, value) = item?;
+                    if !key.starts_with(b"trash/") {
+                        break;
+                    }
+                    let trash: Trash = Self::decode(&value)?;
+                    if trash.node == id {
+                        return Ok(trash.policy);
+                    }
+                }
+                bail!("no applicable storage policy");
             }
         }
     }

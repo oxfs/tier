@@ -213,7 +213,11 @@ static int tier_openat(struct vfs_handle_struct *h, const struct files_struct *d
 	r.name = discard_const_p(char, name->base_name);
 	if (!r.parent)
 		goto done;
-	if (fsp->fsp_flags.is_pathref || (how->flags & O_PATH))
+	if (fsp->fsp_flags.is_pathref || (how->flags & O_PATH) ||
+	    (fsp->access_mask != 0 &&
+	     !(fsp->access_mask &
+	       (SEC_FILE_READ_DATA | SEC_FILE_WRITE_DATA | SEC_FILE_APPEND_DATA)) &&
+	     !(how->flags & O_TRUNC)))
 		r.access = TIER__IPC__ACCESS__METADATA;
 	else
 		switch (how->flags & O_ACCMODE) {
@@ -830,7 +834,8 @@ static NTSTATUS tier_get_dos(struct vfs_handle_struct *h, struct files_struct *f
 static NTSTATUS tier_set_dos(struct vfs_handle_struct *h, struct files_struct *fsp,
 			     uint32_t mode)
 {
-	return NT_STATUS_NOT_SUPPORTED;
+	/* Use Samba's configured UNIX mappings without storing extended attributes. */
+	return NT_STATUS_NOT_IMPLEMENTED;
 }
 static NTSTATUS tier_get_real_name(struct vfs_handle_struct *h, struct files_struct *dir,
 				   const char *name, TALLOC_CTX *ctx, char **found)

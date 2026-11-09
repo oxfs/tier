@@ -3,7 +3,7 @@
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 work=${TIER_SAMBA_BUILD_DIR:-/tmp/tier-samba-build}
-out=${1:-"$repo/dist/samba"}
+out=${1:-"$work/output"}
 mkdir -p "$work" "$out"
 out=$(cd "$out" && pwd)
 version=$(dpkg-query -W -f='${Version}' samba)

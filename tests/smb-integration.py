@@ -12,6 +12,7 @@ import time
 import urllib.request
 
 import smbclient
+from smbclient._os import _set_basic_information
 from smbprotocol.exceptions import SMBResponseException
 
 PORT = int(os.environ["SMB_TEST_PORT"])
@@ -122,6 +123,10 @@ except OSError:
     pass
 else:
     raise AssertionError("named stream unexpectedly accepted")
+assert read("partial") == b"abXYe"
+# Ordinary Windows copy tools set the archive bit even when DOS storage is disabled.
+_set_basic_information(path("partial"), file_attributes=0x20, **CONFIG)
+_set_basic_information(path("目录"), file_attributes=0x10, **CONFIG)
 assert read("partial") == b"abXYe"
 
 # Samba retains share-mode enforcement even with kernel locking disabled.

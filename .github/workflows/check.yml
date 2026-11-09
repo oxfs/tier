@@ -1,9 +1,12 @@
 name: Checks
 on:
   push:
-    branches: ['**']
+    branches: ['main']
   pull_request:
   workflow_call:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
@@ -44,6 +47,11 @@ jobs:
             -v "$RUNNER_TEMP/tier-debian:/build" \
             -e TIER_BIN=/workspace/target/release/tier \
             -w /workspace debian:13-slim /workspace/tests/debian-ci.sh
+          docker run --rm \
+            -v "$PWD:/workspace:ro" \
+            -v "$RUNNER_TEMP/tier-debian/artifacts:/artifacts" \
+            -e TIER_PACKAGE=/artifacts/tier-debian13-amd64.tar.gz \
+            -w /workspace debian:13-slim /workspace/tests/debian-runtime.sh
       - uses: actions/upload-artifact@v4
         with:
           name: tier-debian13-amd64

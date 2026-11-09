@@ -31,6 +31,7 @@ pub(crate) struct Status {
     pub seq: u64,
     pub time: u64,
     pub error: Option<String>,
+    pub attempted_at: u64,
 }
 
 impl Engine {
@@ -107,6 +108,14 @@ impl Engine {
             let last = self.kv_get::<Status>(&key)?;
             if !force
                 && last.as_ref().is_some_and(|last| {
+                    last.error.is_some()
+                        && time.saturating_sub(last.attempted_at) < settings.seconds.min(60)
+                })
+            {
+                continue;
+            }
+            if !force
+                && last.as_ref().is_some_and(|last| {
                     last.error.is_none()
                         && (revision == last.seq
                             || (revision.saturating_sub(last.seq) < settings.changes
@@ -153,6 +162,7 @@ impl Engine {
                                 previous.as_ref().map_or(0, |s| s.time)
                             },
                             error,
+                            attempted_at: time,
                         },
                         false,
                     )?;

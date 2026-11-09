@@ -32,3 +32,6 @@ tiny_http = "0.12"
 [build-dependencies]
 prost-build = "0.14"
 protoc-bin-vendored = "3"
+
+[profile.dev.package.librocksdb-sys]
+debug = false
