@@ -4,16 +4,29 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 
 #define TIER_HEADER 24
 #define TIER_MESSAGE_MAX (1024 * 1024)
 #define TIER_DATA_MAX (4 * 1024 * 1024)
 #define TIER_INFLIGHT_MAX 32
+#define TIER_TIMEOUT_SECONDS 60
+
+/* Calls live on the connection until their reply is consumed. The caller's
+ * context only owns a link: freeing an async SMB request must not leave a
+ * dangling tevent_req in the dispatcher, or discard a partially sent frame. */
+struct tier_call_owner {
+	struct tier_call *call;
+};
 
 struct tier_call {
 	struct tier_call *prev, *next;
 	struct tier_client *client;
 	struct tevent_req *async;
+	struct tier_call_owner *owner;
+	struct tevent_timer *timer;
+	struct timespec deadline;
+	Tier__Ipc__Method method;
 	uint64_t id;
 	uint8_t *frame;
 	size_t length, sent;
@@ -26,11 +39,14 @@ struct tier_call {
 struct tier_client {
 	int fd;
 	struct tevent_fd *fde;
+	struct tevent_context *ev;
 	struct tier_call *calls;
 	uint64_t next_id;
 	unsigned count;
 	int error;
 	uint32_t max_data;
+	uint32_t max_inflight;
+	bool closing;
 	uint8_t header[TIER_HEADER];
 	size_t header_used, body_used, body_length;
 	uint8_t *body;
@@ -69,11 +85,25 @@ static void finish(struct tier_call *p, int error)
 	p->error = error;
 	p->done = true;
 	TALLOC_FREE(p->frame);
+	TALLOC_FREE(p->timer);
+	if (p->owner)
+		talloc_steal(p->owner, p);
+	if (!p->owner) {
+		TALLOC_FREE(p);
+		return;
+	}
 	if (p->async)
 		tevent_req_done(p->async);
 }
 static void fail(struct tier_client *c, int error)
 {
+	if (!c->error && !c->closing) {
+		DBG_ERR("tier IPC failed: errno=%d (%s), pending=%u, request=%llu, "
+			"method=%d\n",
+			error, strerror(error), c->count,
+			(unsigned long long)(c->calls ? c->calls->id : 0),
+			c->calls ? c->calls->method : 0);
+	}
 	c->error = error ? error : EIO;
 	while (c->calls)
 		finish(c->calls, c->error);
@@ -81,14 +111,34 @@ static void fail(struct tier_client *c, int error)
 }
 static int call_destroy(struct tier_call *p)
 {
-	if (!p->done)
-		return -1;
+	if (p->owner)
+		p->owner->call = NULL;
 	if (p->response)
 		tier__ipc__response__free_unpacked(p->response, NULL);
 	return 0;
 }
+static int owner_destroy(struct tier_call_owner *owner)
+{
+	struct tier_call *p = owner->call;
+	if (p) {
+		p->owner = NULL;
+		p->async = NULL;
+		if (p->done)
+			TALLOC_FREE(p);
+	}
+	return 0;
+}
+static void call_timeout(struct tevent_context *ev, struct tevent_timer *timer,
+			 struct timeval now, void *data)
+{
+	struct tier_call *p = data;
+	DBG_ERR("tier IPC timeout: request=%llu method=%d\n", (unsigned long long)p->id,
+		p->method);
+	fail(p->client, ETIMEDOUT);
+}
 static int client_destroy(struct tier_client *c)
 {
+	c->closing = true;
 	fail(c, ECONNRESET);
 	if (c->fd >= 0)
 		close(c->fd);
@@ -180,6 +230,12 @@ receive:
 			fail(c, EPROTO);
 			return;
 		}
+		if (p->response->error < 0 || p->response->error > 4095 ||
+		    (dlen &&
+		     (p->method != TIER__IPC__METHOD__READ || p->response->error))) {
+			fail(c, EPROTO);
+			return;
+		}
 		if (dlen) {
 			p->data = talloc_steal(p, c->body);
 			memmove(p->data, p->data + mlen, dlen);
@@ -207,15 +263,22 @@ struct tier_call *tier_submit(TALLOC_CTX *ctx, struct tier_client *c,
 		errno = c->error;
 		return NULL;
 	}
-	if (c->count >= TIER_INFLIGHT_MAX) {
+	if (c->count >= c->max_inflight) {
+		DBG_WARNING("tier IPC queue full: pending=%u method=%d\n", c->count,
+			    request->method);
 		errno = EBUSY;
+		return NULL;
+	}
+	if (c->next_id == UINT64_MAX) {
+		fail(c, EOVERFLOW);
+		errno = EOVERFLOW;
 		return NULL;
 	}
 	if (mlen > TIER_MESSAGE_MAX || length > c->max_data) {
 		errno = EMSGSIZE;
 		return NULL;
 	}
-	p = talloc_zero(ctx, struct tier_call);
+	p = talloc_zero(c, struct tier_call);
 	if (!p) {
 		errno = ENOMEM;
 		return NULL;
@@ -223,6 +286,9 @@ struct tier_call *tier_submit(TALLOC_CTX *ctx, struct tier_client *c,
 	p->client = c;
 	p->id = ++c->next_id;
 	p->async = async;
+	if (async)
+		tevent_req_defer_callback(async, c->ev);
+	p->method = request->method;
 	p->length = TIER_HEADER + mlen + length;
 	p->frame = talloc_array(p, uint8_t, p->length);
 	if (!p->frame) {
@@ -239,9 +305,29 @@ struct tier_call *tier_submit(TALLOC_CTX *ctx, struct tier_client *c,
 	tier__ipc__request__pack(request, p->frame + TIER_HEADER);
 	if (length)
 		memcpy(p->frame + TIER_HEADER + mlen, data, length);
+	p->owner = talloc_zero(ctx, struct tier_call_owner);
+	if (!p->owner) {
+		TALLOC_FREE(p);
+		errno = ENOMEM;
+		return NULL;
+	}
+	p->owner->call = p;
+	talloc_set_destructor(p->owner, owner_destroy);
+	talloc_set_destructor(p, call_destroy);
+	if (clock_gettime(CLOCK_MONOTONIC, &p->deadline) != 0) {
+		TALLOC_FREE(p);
+		return NULL;
+	}
+	p->deadline.tv_sec += TIER_TIMEOUT_SECONDS;
+	p->timer = tevent_add_timer(
+	    c->ev, p, timeval_current_ofs(TIER_TIMEOUT_SECONDS, 0), call_timeout, p);
+	if (!p->timer) {
+		TALLOC_FREE(p);
+		errno = ENOMEM;
+		return NULL;
+	}
 	DLIST_ADD_END(c->calls, p);
 	c->count++;
-	talloc_set_destructor(p, call_destroy);
 	interest(c);
 	return p;
 }
@@ -250,6 +336,8 @@ int tier_wait(struct tier_call *p)
 	while (!p->done) {
 		struct pollfd fd = {.fd = p->client->fd, .events = POLLIN};
 		struct tier_call *q;
+		struct timespec now;
+		int64_t remaining;
 		int ret;
 		for (q = p->client->calls; q; q = q->next) {
 			if (q->sent < q->length) {
@@ -257,7 +345,13 @@ int tier_wait(struct tier_call *p)
 				break;
 			}
 		}
-		ret = poll(&fd, 1, 60000);
+		if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+			fail(p->client, errno);
+			break;
+		}
+		remaining = (p->deadline.tv_sec - now.tv_sec) * 1000 +
+			    (p->deadline.tv_nsec - now.tv_nsec) / 1000000;
+		ret = poll(&fd, 1, remaining > 0 ? (int)remaining : 0);
 		if (ret < 0 && errno == EINTR)
 			continue;
 		if (ret <= 0) {
@@ -279,6 +373,15 @@ Tier__Ipc__Response *tier_result(struct tier_call *p, void **data, size_t *lengt
 		return NULL;
 	}
 	if (p->response->error) {
+		/* Ordinary namespace misses are common; keep them at debug level. */
+		if (p->response->error == EIO || p->response->error == ENOSPC ||
+		    p->response->error == EPROTO)
+			DBG_ERR("tier request=%llu method=%d errno=%d\n",
+				(unsigned long long)p->id, p->method, p->response->error);
+		else
+			DBG_DEBUG("tier request=%llu method=%d errno=%d\n",
+				  (unsigned long long)p->id, p->method,
+				  p->response->error);
 		errno = p->response->error;
 		return NULL;
 	}
@@ -314,7 +417,9 @@ struct tier_client *tier_client_connect(TALLOC_CTX *ctx, struct tevent_context *
 		return NULL;
 	}
 	c->fd = -1;
+	c->ev = ev;
 	c->max_data = TIER_DATA_MAX;
+	c->max_inflight = TIER_INFLIGHT_MAX;
 	talloc_set_destructor(c, client_destroy);
 	c->fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (c->fd == -1)
@@ -335,15 +440,19 @@ struct tier_client *tier_client_connect(TALLOC_CTX *ctx, struct tevent_context *
 	response = tier_rpc(tmp, c, &request);
 	if (!response)
 		goto error;
-	if (response->protocol_version != 1 || !response->max_data) {
+	if (response->protocol_version != 1 || !response->max_data ||
+	    !response->max_inflight || !response->max_message) {
 		errno = EPROTO;
 		goto error;
 	}
 	c->max_data = MIN(response->max_data, TIER_DATA_MAX);
+	c->max_inflight = MIN(response->max_inflight, TIER_INFLIGHT_MAX);
 	TALLOC_FREE(tmp);
 	return c;
 error: {
 	int saved = errno;
+	DBG_ERR("tier IPC connect failed: socket=%s errno=%d (%s)\n", path, saved,
+		strerror(saved));
 	TALLOC_FREE(c);
 	errno = saved;
 }

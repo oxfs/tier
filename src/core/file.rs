@@ -13,9 +13,6 @@ pub struct FileHandle {
     closed: bool,
 }
 impl FileHandle {
-    pub fn node_id(&self) -> &str {
-        &self.id
-    }
     pub fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<usize> {
         let mut state = self.state.lock();
         self.engine.ensure_body(&self.id, &mut state)?;
@@ -35,7 +32,7 @@ impl FileHandle {
         r.node.size = body.file.metadata()?.len();
         r.node.mtime = SystemTime::now();
         r.node.ctime = r.node.mtime;
-        self.engine.put_record(&key("node", &self.id), &r, false)?;
+        self.engine.put_record(&schema::node(&self.id), &r, false)?;
         Ok(n)
     }
     pub fn set_len(&self, len: u64) -> Result<()> {
@@ -49,7 +46,7 @@ impl FileHandle {
         r.node.size = len;
         r.node.mtime = SystemTime::now();
         r.node.ctime = r.node.mtime;
-        self.engine.put_record(&key("node", &self.id), &r, false)
+        self.engine.put_record(&schema::node(&self.id), &r, false)
     }
     pub fn sync(&self) -> Result<()> {
         let mut state = self.state.lock();
@@ -75,7 +72,7 @@ impl FileHandle {
                 r.node.size = b.file.metadata()?.len();
             }
             r.closed_at = now()?;
-            self.engine.put_record(&key("node", &self.id), &r, false)?;
+            self.engine.put_record(&schema::node(&self.id), &r, false)?;
             self.engine.schedule_file(&self.id)?;
         }
         Ok(())
@@ -195,25 +192,22 @@ impl Engine {
             r.primary = Some(body.copy.target.clone());
             body.copy.version = r.node.version;
             body.copy.hash = None;
-            let copy_key = format!("copy/{id}/{}", body.copy.target);
+            let copy_key = schema::copy(id, &body.copy.target);
             let mut changes = vec![
-                Self::encoded(key("node", id), &r)?,
+                Self::encoded(schema::node(id), &r)?,
                 Self::encoded(copy_key.clone(), &body.copy)?,
             ];
             if let Some(old) = self.kv_get::<Copy>(&copy_key)?
                 && old.object != body.copy.object
             {
-                changes.push(Self::encoded(
-                    format!("garbage/{}/{}", old.target, Uuid::new_v4()),
-                    &old,
-                )?);
+                changes.push(Self::encoded(schema::garbage(&old.target), &old)?);
             }
             self.atomic(changes, vec![], invalidates_protected)?;
             if truncate {
                 body.file.set_len(0)?;
                 r.node.size = 0;
                 r.node.mtime = SystemTime::now();
-                self.put_record(&key("node", id), &r, false)?;
+                self.put_record(&schema::node(id), &r, false)?;
             }
             self.schedule_file(id)?;
             guard.writer = true;
@@ -275,14 +269,11 @@ impl Engine {
         };
         r.primary = Some(target);
         let mut puts = vec![
-            Self::encoded(key("node", id), &r)?,
-            Self::encoded(format!("copy/{id}/{}", copy.target), &copy)?,
+            Self::encoded(schema::node(id), &r)?,
+            Self::encoded(schema::copy(id, &copy.target), &copy)?,
         ];
-        if let Some(old) = self.kv_get::<Copy>(&format!("copy/{id}/{}", copy.target))? {
-            puts.push(Self::encoded(
-                format!("garbage/{}/{}", old.target, Uuid::new_v4()),
-                &old,
-            )?);
+        if let Some(old) = self.kv_get::<Copy>(&schema::copy(id, &copy.target))? {
+            puts.push(Self::encoded(schema::garbage(&old.target), &old)?);
         }
         self.atomic(puts, vec![], true)?;
         state.body = Some(Body { file, root, copy });
@@ -298,51 +289,8 @@ impl Engine {
         }
         h.close()
     }
-    pub fn put_from(&self, path: &str, input: &mut fs::File) -> Result<()> {
-        input.rewind()?;
-        let h = self.open_file(path, true, true, true)?;
-        let mut buf = vec![0; 1024 * 1024];
-        let mut offset = 0;
-        loop {
-            let n = input.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            let mut done = 0;
-            while done < n {
-                let written = h.write_at(offset + done as u64, &buf[done..n])?;
-                ensure!(written > 0, "short write");
-                done += written;
-            }
-            offset += n as u64;
-        }
-        h.close()
-    }
-    pub fn copy_to(&self, path: &str, out: &mut fs::File) -> Result<()> {
-        self.copy_id(&self.stat(path)?.id, out)
-    }
-    pub(crate) fn copy_id(&self, id: &str, out: &mut fs::File) -> Result<()> {
-        let h = self.open_id(id, false, false)?;
-        let mut offset = 0;
-        let mut buf = vec![0; 1024 * 1024];
-        out.set_len(0)?;
-        out.rewind()?;
-        loop {
-            let n = h.read_at(offset, &mut buf)?;
-            if n == 0 {
-                break;
-            }
-            out.write_all(&buf[..n])?;
-            offset += n as u64;
-        }
-        out.rewind()?;
-        Ok(())
-    }
     pub fn get(&self, path: &str) -> Result<Vec<u8>> {
-        self.read_id(&self.stat(path)?.id)
-    }
-    pub(crate) fn read_id(&self, id: &str) -> Result<Vec<u8>> {
-        let h = self.open_id(id, false, false)?;
+        let h = self.open_file(path, false, false, false)?;
         let mut out = vec![];
         let mut buf = vec![0; 65536];
         loop {
@@ -423,11 +371,11 @@ impl Engine {
             r.primary = Some(name.clone());
             self.atomic(
                 vec![
-                    Self::encoded(key("node", id), &r)?,
-                    Self::encoded(format!("copy/{id}/{name}"), &copy)?,
-                    Self::encoded(format!("garbage/{}/{}", old.target, Uuid::new_v4()), &old)?,
+                    Self::encoded(schema::node(id), &r)?,
+                    Self::encoded(schema::copy(id, &name), &copy)?,
+                    Self::encoded(schema::garbage(&old.target), &old)?,
                 ],
-                vec![format!("copy/{id}/{}", old.target)],
+                vec![schema::copy(id, &old.target)],
                 true,
             )?;
             state.body = Some(Body { file, root, copy });

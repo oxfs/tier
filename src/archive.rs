@@ -1,6 +1,7 @@
+use crate::core::schema;
 mod webdav;
 use self::webdav::WebDav;
-use crate::core::{Engine, Record, fingerprint, key, now};
+use crate::core::{Engine, Record, fingerprint, now};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -53,7 +54,7 @@ pub(crate) fn configured_client(
 }
 impl Engine {
     pub(crate) fn archive_client(&self, target: &str) -> Result<WebDav> {
-        let t: ArchiveTarget = self.require(&key("archive_target", target))?;
+        let t: ArchiveTarget = self.require(&schema::archive_target(target))?;
         configured_client(&t.url, t.user_env.as_deref(), t.pass_env.as_deref())
     }
     pub(crate) fn archive_policy(&self, id: &str) -> Result<Option<ArchivePolicy>> {
@@ -62,20 +63,20 @@ impl Engine {
         let mut seen = HashSet::new();
         loop {
             ensure!(seen.insert(id.clone()), "namespace cycle");
-            if let Some(policy) = Self::view_get(&view, &key("archive_policy", &id))? {
+            if let Some(policy) = Self::view_get(&view, &schema::archive_policy(&id))? {
                 return Ok(Some(policy));
             }
             let node: Record =
-                Self::view_get(&view, &key("node", &id))?.context("missing policy node")?;
+                Self::view_get(&view, &schema::node(&id))?.context("missing policy node")?;
             if let Some(parent) = node.parent {
                 id = parent;
             } else {
                 for item in view.iterator(rocksdb::IteratorMode::From(
-                    b"trash/",
+                    schema::TRASH.as_bytes(),
                     rocksdb::Direction::Forward,
                 )) {
                     let (key, value) = item?;
-                    if !key.starts_with(b"trash/") {
+                    if !key.starts_with(schema::TRASH.as_bytes()) {
                         break;
                     }
                     let trash: crate::core::Trash = Self::decode(&value)?;
@@ -101,12 +102,12 @@ impl Engine {
         );
         WebDav::new(url, None)?;
         ensure!(
-            self.kv_get::<ArchiveTarget>(&key("archive_target", name))?
+            self.kv_get::<ArchiveTarget>(&schema::archive_target(name))?
                 .is_none(),
             "archive already exists"
         );
         self.put_record(
-            &key("archive_target", name),
+            &schema::archive_target(name),
             &ArchiveTarget {
                 name: name.into(),
                 url: url.into(),
@@ -125,10 +126,10 @@ impl Engine {
             "invalid archive policy"
         );
         for t in &p.targets {
-            let _: ArchiveTarget = self.require(&key("archive_target", t))?;
+            let _: ArchiveTarget = self.require(&schema::archive_target(t))?;
         }
         let _guard = self.inner.namespace.write();
-        self.put_record(&key("archive_policy", &node.id), p, true)?;
+        self.put_record(&schema::archive_policy(&node.id), p, true)?;
         for r in self.subtree(&node.id)? {
             if !r.node.is_dir {
                 self.schedule_file(&r.node.id)?;
@@ -139,7 +140,7 @@ impl Engine {
     pub(crate) fn archive_copies(&self, id: &str) -> Result<Vec<ArchiveCopy>> {
         let r = self.record(id)?;
         Ok(self
-            .scan::<ArchiveCopy>(&format!("archive_copy/{id}/"))?
+            .scan::<ArchiveCopy>(&schema::archive_copies(id))?
             .into_iter()
             .map(|(_, v)| v)
             .filter(|v| v.version == r.node.version && r.hash.as_ref() == Some(&v.hash))
@@ -198,14 +199,14 @@ impl Engine {
             let result = self.archive_one(&id, manual);
             let failed = result.is_err();
             if let Err(e) = result {
-                self.put_record(&key("status/archive_error", &id), &format!("{e:#}"), false)?;
+                self.put_record(&schema::archive_error(&id), &format!("{e:#}"), false)?;
                 errors.push(format!("{id}: {e:#}"));
             } else {
-                self.delete_record(&key("status/archive_error", &id))?;
+                self.delete_record(&schema::archive_error(&id))?;
             }
             self.reschedule_work("archive", &id, failed)?;
         }
-        for (k, c) in self.scan::<ArchiveCopy>("archive_gc/")? {
+        for (k, c) in self.scan::<ArchiveCopy>(schema::ARCHIVE_GC)? {
             if let Err(e) = self
                 .archive_client(&c.target)
                 .and_then(|client| client.remove(&c.key))
@@ -227,7 +228,7 @@ impl Engine {
         let current = self.archive_copies(id)?;
         let Some(p) = configured.filter(|p| p.copies > 0) else {
             let current: Vec<_> = self
-                .scan::<ArchiveCopy>(&format!("archive_copy/{id}/"))?
+                .scan::<ArchiveCopy>(&schema::archive_copies(id))?
                 .into_iter()
                 .map(|(_, c)| c)
                 .collect();
@@ -253,11 +254,8 @@ impl Engine {
                         let mut puts = vec![];
                         let mut dels = vec![];
                         for c in current {
-                            puts.push(Self::encoded(
-                                format!("archive_gc/{}", uuid::Uuid::new_v4()),
-                                &c,
-                            )?);
-                            dels.push(format!("archive_copy/{id}/{}", c.target));
+                            puts.push(Self::encoded(schema::archive_gc(), &c)?);
+                            dels.push(schema::archive_copy(id, &c.target));
                         }
                         self.atomic(puts, dels, true)?;
                     }
@@ -288,7 +286,7 @@ impl Engine {
                         c.checked = now()?;
                     }
                     c.error = Some(format!("{e:#}"));
-                    self.put_record(&format!("archive_copy/{id}/{}", c.target), &c, false)?;
+                    self.put_record(&schema::archive_copy(id, &c.target), &c, false)?;
                     let policy = self.policy(id)?;
                     if !manual
                         && (policy.manual_repair
@@ -345,12 +343,9 @@ impl Engine {
                 checked: now()?,
                 error: None,
             };
-            let mut puts = vec![Self::encoded(format!("archive_copy/{id}/{name}"), &c)?];
-            if let Some(old) = self.kv_get::<ArchiveCopy>(&format!("archive_copy/{id}/{name}"))? {
-                puts.push(Self::encoded(
-                    format!("archive_gc/{}", uuid::Uuid::new_v4()),
-                    &old,
-                )?);
+            let mut puts = vec![Self::encoded(schema::archive_copy(id, name), &c)?];
+            if let Some(old) = self.kv_get::<ArchiveCopy>(&schema::archive_copy(id, name))? {
+                puts.push(Self::encoded(schema::archive_gc(), &old)?);
             }
             self.atomic(puts, vec![], true)?;
             verified.push(c);
@@ -393,14 +388,11 @@ impl Engine {
                 keep.push(c);
                 continue;
             }
-            puts.push(Self::encoded(
-                format!("garbage/{}/{}", c.target, uuid::Uuid::new_v4()),
-                &c,
-            )?);
-            deletes.push(format!("copy/{id}/{}", c.target));
+            puts.push(Self::encoded(schema::garbage(&c.target), &c)?);
+            deletes.push(schema::copy(id, &c.target));
         }
         latest.primary = keep.first().map(|c| c.target.clone());
-        puts.push(Self::encoded(key("node", id), &latest)?);
+        puts.push(Self::encoded(schema::node(id), &latest)?);
         self.atomic(puts, deletes, true)?;
         if guard.body.as_ref().is_some_and(|b| {
             !keep

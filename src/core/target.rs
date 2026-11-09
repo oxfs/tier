@@ -1,5 +1,5 @@
 use super::*;
-use std::os::fd::AsRawFd;
+use std::{os::fd::AsRawFd, path::PathBuf};
 
 /// Pins the directory whose identity was verified. All object operations use
 /// this descriptor even if the configured mountpoint changes underneath us.
@@ -69,10 +69,10 @@ impl Engine {
             .to_owned();
         let _guard = self.inner.namespace.write();
         ensure!(
-            self.kv_get::<Target>(&key("target", name))?.is_none(),
+            self.kv_get::<Target>(&schema::target(name))?.is_none(),
             "target already exists"
         );
-        for (_, other) in self.scan::<Target>("target/")? {
+        for (_, other) in self.scan::<Target>(schema::TARGETS)? {
             ensure!(
                 !path.starts_with(&other.path) && !other.path.starts_with(&path),
                 "overlapping targets"
@@ -102,13 +102,13 @@ impl Engine {
         };
         ensure!(
             !self
-                .scan::<Target>("target/")?
+                .scan::<Target>(schema::TARGETS)?
                 .iter()
                 .any(|(_, t)| t.identity == identity),
             "duplicate target identity"
         );
         self.put_record(
-            &key("target", name),
+            &schema::target(name),
             &Target {
                 name: name.into(),
                 path,
@@ -119,7 +119,7 @@ impl Engine {
         )
     }
     pub(crate) fn target(&self, name: &str) -> Result<TargetDirectory> {
-        let t: Target = self.require(&key("target", name))?;
+        let t: Target = self.require(&schema::target(name))?;
         TargetDirectory::open(t.path, &t.identity)
     }
     pub(crate) fn target_stat(&self, name: &str) -> Result<libc::statvfs> {
@@ -129,7 +129,7 @@ impl Engine {
         let mut total = 0;
         let mut free = 0;
         let mut devices = HashSet::new();
-        for (_, t) in self.scan::<Target>("target/")? {
+        for (_, t) in self.scan::<Target>(schema::TARGETS)? {
             if devices.insert(t.domain)
                 && let Ok(s) = self.target_stat(&t.name)
             {
@@ -164,11 +164,11 @@ impl Engine {
                 "duplicate target"
             );
             for name in names {
-                let _: Target = self.require(&key("target", name))?;
+                let _: Target = self.require(&schema::target(name))?;
             }
         }
         let _guard = self.inner.namespace.write();
-        self.put_record(&key("policy", &n.id), p, true)?;
+        self.put_record(&schema::policy(&n.id), p, true)?;
         for r in self.subtree(&n.id)? {
             if !r.node.is_dir {
                 self.schedule_file(&r.node.id)?;
@@ -230,7 +230,7 @@ impl Engine {
         if fits()? {
             return Ok(true);
         }
-        for (_, candidate) in self.scan::<Record>("node/")? {
+        for (_, candidate) in self.scan::<Record>(schema::NODES)? {
             let id = &candidate.node.id;
             if id == exclude || candidate.node.is_dir || candidate.dirty || candidate.hash.is_none()
             {
@@ -278,13 +278,13 @@ impl Engine {
             if record.primary.as_deref() == Some(name) {
                 record.primary = Some(verified[0].target.clone());
             }
-            let garbage = format!("garbage/{name}/{}", Uuid::new_v4());
+            let garbage = schema::garbage(name);
             self.atomic(
                 vec![
-                    Self::encoded(key("node", id), &record)?,
+                    Self::encoded(schema::node(id), &record)?,
                     Self::encoded(garbage.clone(), old)?,
                 ],
-                vec![format!("copy/{id}/{name}")],
+                vec![schema::copy(id, name)],
                 true,
             )?;
             state.body = None;
@@ -330,7 +330,7 @@ impl Engine {
         Err(failure(libc::ENOSPC))
     }
     pub(crate) fn collect_garbage(&self) -> Result<()> {
-        for (k, c) in self.scan::<Copy>("garbage/")? {
+        for (k, c) in self.scan::<Copy>(schema::GARBAGE)? {
             if let Ok(t) = self.target(&c.target) {
                 match t.remove_object(&c.object) {
                     Ok(()) => self.delete_record(&k)?,

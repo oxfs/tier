@@ -1,4 +1,5 @@
 use crate::core::Engine;
+use crate::core::schema;
 use anyhow::{Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rocksdb::IteratorMode;
@@ -7,6 +8,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{fs, io::Write, path::Path};
 use tempfile::NamedTempFile;
+
+const FORMAT: u32 = 1;
 
 #[derive(Serialize, Deserialize)]
 struct Envelope<T> {
@@ -36,7 +39,7 @@ impl Record {
 
 pub(crate) fn decode(data: &Value) -> Result<Image> {
     let image: Image = serde_json::from_value(data.clone())?;
-    ensure!(image.format == 2, "unsupported snapshot format");
+    ensure!(image.format == FORMAT, "unsupported snapshot format");
     uuid::Uuid::parse_str(&image.system_id)?;
     Ok(image)
 }
@@ -46,11 +49,11 @@ impl Engine {
         let snapshot = self.inner.db.snapshot();
         let system_id = Self::decode::<String>(
             &snapshot
-                .get("system/id")?
+                .get(schema::SYSTEM_ID)?
                 .ok_or_else(|| anyhow::anyhow!("missing system identity"))?,
         )?;
         let seq = snapshot
-            .get("system/revision")?
+            .get(schema::REVISION)?
             .map(|bytes| Self::decode::<u64>(&bytes))
             .transpose()?
             .unwrap_or(0);
@@ -58,12 +61,7 @@ impl Engine {
         for item in snapshot.iterator(IteratorMode::Start) {
             let (key, value) = item?;
             let key = String::from_utf8(key.to_vec())?;
-            if key.starts_with("backup/status/")
-                || key.starts_with("status/")
-                || key.starts_with("queue/")
-                || key.starts_with("queue_at/")
-                || key == "backup/lineage"
-            {
+            if schema::ephemeral(&key) {
                 continue;
             }
             records.push(Record {
@@ -72,7 +70,7 @@ impl Engine {
             });
         }
         Ok(serde_json::to_value(Image {
-            format: 2,
+            format: FORMAT,
             seq,
             system_id,
             records,

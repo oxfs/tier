@@ -1,6 +1,16 @@
 syntax = "proto3";
 package tier.ipc;
 
+// Evolution contract: never renumber or reuse a field/enum number. Reserve the
+// number AND name when deleting one. Additions must have safe absent-field
+// behavior; a new mandatory semantic requires a negotiated capability or a new
+// protocol_version, even if the bytes themselves remain decodable.
+// Proto3 scalars below are not required: absent == zero/false/empty. Validate
+// method-dependent requirements at the server boundary. Changes uses has_*
+// flags because setting size/mode to zero must differ from leaving it unchanged.
+// Message fields have presence; repeated entries may be empty. Do not depend on
+// unknown fields surviving a Rust prost decode/re-encode cycle.
+
 // The Unix stream carries a 24-byte big-endian header followed by this message
 // and optional raw file bytes: magic=0x54494552, version:u16=1, flags:u16=0,
 // request_id:u64, message_length:u32, data_length:u32. Responses echo request_id.
@@ -56,6 +66,7 @@ message Changes {
   Timestamp btime = 7;
 }
 message Request {
+  // Only fields used by method are meaningful; this is not a required-field set.
   Method method = 1;
   uint64 handle = 2;
   uint64 parent = 3;

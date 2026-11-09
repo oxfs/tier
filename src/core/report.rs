@@ -6,7 +6,7 @@ impl Engine {
             requested > 0 && (1..=100).contains(&size),
             "invalid trash page"
         );
-        let mut trash = self.scan::<Trash>("trash/")?;
+        let mut trash = self.scan::<Trash>(schema::TRASH)?;
         trash.reverse();
         let total = trash.len() as u64;
         let pages = total.div_ceil(size);
@@ -40,7 +40,7 @@ impl Engine {
     pub fn state(&self) -> Result<Value> {
         use std::os::unix::fs::MetadataExt;
         let mut targets = vec![];
-        for (_, t) in self.scan::<Target>("target/")? {
+        for (_, t) in self.scan::<Target>(schema::TARGETS)? {
             let stat = self.target_stat(&t.name).ok();
             let mut row = serde_json::to_value(&t)?;
             row["online"] = stat.is_some().into();
@@ -57,33 +57,33 @@ impl Engine {
             targets.push(row);
         }
         let mut policies = vec![];
-        for (k, p) in self.scan::<Policy>("policy/")? {
-            let id = k.trim_start_matches("policy/");
+        for (k, p) in self.scan::<Policy>(schema::POLICIES)? {
+            let id = k.trim_start_matches(schema::POLICIES);
             if let Some(path) = self.path_for(id)? {
                 policies.push(json!({"node":id,"path":path,"policy":p}));
             }
         }
         let mut archive_policy = vec![];
-        for (k, p) in self.scan::<crate::archive::ArchivePolicy>("archive_policy/")? {
-            let id = k.trim_start_matches("archive_policy/");
+        for (k, p) in self.scan::<crate::archive::ArchivePolicy>(schema::ARCHIVE_POLICIES)? {
+            let id = k.trim_start_matches(schema::ARCHIVE_POLICIES);
             if let Some(path) = self.path_for(id)? {
                 archive_policy.push(json!({"node":id,"path":path,"settings":p}));
             }
         }
-        let copies = self.scan::<crate::archive::ArchiveCopy>("archive_copy/")?;
+        let copies = self.scan::<crate::archive::ArchiveCopy>(schema::ARCHIVE_COPIES)?;
         let mut archive_targets = vec![];
-        for (_, t) in self.scan::<crate::archive::ArchiveTarget>("archive_target/")? {
+        for (_, t) in self.scan::<crate::archive::ArchiveTarget>(schema::ARCHIVE_TARGETS)? {
             archive_targets.push(json!({"name":t.name,"url":t.url,"object_count":copies.iter().filter(|(_,c)|c.target==t.name).count()}));
         }
         let mut errors = vec![];
-        for (k, error) in self.scan::<String>("status/archive_error/")? {
-            let id = k.trim_start_matches("status/archive_error/");
+        for (k, error) in self.scan::<String>(schema::ARCHIVE_ERRORS)? {
+            let id = k.trim_start_matches(schema::ARCHIVE_ERRORS);
             if let Some(path) = self.path_for(id)? {
                 errors.push(json!({"node":id,"path":path,"error":error}));
             }
         }
         let mut health = vec![];
-        for (_, r) in self.scan::<Record>("node/")? {
+        for (_, r) in self.scan::<Record>(schema::NODES)? {
             if r.node.is_dir {
                 continue;
             }
@@ -108,7 +108,7 @@ impl Engine {
                     if targets.contains(&c.target) {
                         current += 1
                     }
-                    if let Some(t) = self.kv_get::<Target>(&key("target", &c.target))? {
+                    if let Some(t) = self.kv_get::<Target>(&schema::target(&c.target))? {
                         domains.insert(t.domain);
                     }
                     locations.push(c.target);
@@ -136,11 +136,11 @@ impl Engine {
             health.push(json!({"path":path,"status":status,"current":current,"required":required,"readable_local":locations,"readable_domains":domains.len(),"repair":if p.manual_repair{"manual"}else{"auto"},"error":r.error}));
         }
         let schedule = self
-            .kv_get::<crate::backup::Schedule>("backup/schedule")?
+            .kv_get::<crate::backup::Schedule>(schema::BACKUP_SCHEDULE)?
             .map(|s| vec![json!({"config":s})])
             .unwrap_or_default();
         Ok(
-            json!({"seq":self.business_revision()?,"targets":targets,"trash_count":self.scan::<Trash>("trash/")?.len(),"archive_targets":archive_targets,"policies":policies,"archive_policy":archive_policy,"archive_errors":errors,"health":health,"backup_schedule":schedule,"backup_status":self.backup_status()?}),
+            json!({"seq":self.business_revision()?,"targets":targets,"trash_count":self.scan::<Trash>(schema::TRASH)?.len(),"archive_targets":archive_targets,"policies":policies,"archive_policy":archive_policy,"archive_errors":errors,"health":health,"backup_schedule":schedule,"backup_status":self.backup_status()?}),
         )
     }
 }

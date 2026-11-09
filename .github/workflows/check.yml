@@ -22,7 +22,11 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - run: sudo apt-get update -qq && sudo apt-get install -y clang clang-format libclang-dev cmake pkg-config
+      - run: sudo apt-get update -qq && sudo apt-get install -y clang clang-format libclang-dev cmake pkg-config shellcheck shfmt
+      - run: |
+          python3 -m venv "$RUNNER_TEMP/lint"
+          "$RUNNER_TEMP/lint/bin/pip" install -r tests/requirements-dev.txt
+          echo "$RUNNER_TEMP/lint/bin" >> "$GITHUB_PATH"
       - run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy --component rust-analyzer
       - run: rustup default stable
       - id: rust-version
@@ -35,7 +39,9 @@ jobs:
             ~/.cargo/git
             target
           key: ubuntu-amd64-rust-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}-${{ github.sha }}
-          restore-keys: ubuntu-amd64-rust-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}-
+          restore-keys: |
+            ubuntu-amd64-rust-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}-
+            ubuntu-amd64-rust-${{ steps.rust-version.outputs.version }}-
       - run: make check
       - run: rust-analyzer diagnostics . --severity error
       - run: tests/capacity-smoke.sh
@@ -50,17 +56,18 @@ jobs:
             -v "$PWD:/workspace" \
             -v "$RUNNER_TEMP/tier-debian:/build" \
             -e TIER_BIN=/workspace/target/release/tier \
-            -w /workspace debian:13-slim /workspace/tests/debian-ci.sh
+            -w /workspace debian:13-slim /workspace/ci/build-debian.sh
           docker run --rm \
             -v "$PWD:/workspace:ro" \
             -v "$RUNNER_TEMP/tier-debian/artifacts:/artifacts" \
             -e TIER_PACKAGE=/artifacts/tier-debian13-amd64.tar.gz \
-            -w /workspace debian:13-slim /workspace/tests/debian-runtime.sh
+            -w /workspace debian:13-slim /workspace/ci/test-debian.sh
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: tier-debian13-amd64
           path: ${{ runner.temp }}/tier-debian/artifacts/*
-          if-no-files-found: error
+          if-no-files-found: warn
       - uses: actions/cache/save@v4
         if: always() && steps.rust-cache.outputs.cache-primary-key != '' && steps.rust-cache.outputs.cache-hit != 'true'
         with:

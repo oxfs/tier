@@ -436,13 +436,21 @@ fn serve(
         let local = pending.acquire(MAX_INFLIGHT);
         let frame = match Frame::read(&mut stream) {
             Ok(Some(frame)) => frame,
-            _ => break,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(%error, "invalid or interrupted IPC frame");
+                break;
+            }
         };
         let request = match Request::decode(frame.message.as_slice()) {
             Ok(request) => request,
-            Err(_) => break,
+            Err(error) => {
+                tracing::warn!(request_id = frame.id, %error, "invalid IPC protobuf");
+                break;
+            }
         };
         if !ids.lock().unwrap().insert(frame.id) {
+            tracing::warn!(request_id = frame.id, "duplicate in-flight IPC request");
             break;
         }
         let method = Method::try_from(request.method).unwrap_or(Method::Invalid);
@@ -452,7 +460,7 @@ fn serve(
             frame.data.is_empty()
         };
         if !data_valid || request.length as usize > MAX_DATA {
-            let _ = send(&writer, frame.id, Err(errno(libc::EINVAL)));
+            let _ = send(&writer, frame.id, method, Err(errno(libc::EINVAL)));
             ids.lock().unwrap().remove(&frame.id);
             continue;
         }
@@ -465,7 +473,7 @@ fn serve(
             let handle = match handle {
                 Ok(handle) => handle,
                 Err(error) => {
-                    let _ = send(&writer, frame.id, Err(error));
+                    let _ = send(&writer, frame.id, method, Err(error));
                     ids.lock().unwrap().remove(&frame.id);
                     continue;
                 }
@@ -478,14 +486,14 @@ fn serve(
                 let _local = local;
                 let _global = global;
                 let result = execute_file(&engine, &handle, request, frame.data);
-                let _ = send(&writer, frame.id, result);
+                let _ = send(&writer, frame.id, method, result);
                 ids.lock().unwrap().remove(&frame.id);
             });
         } else {
             drop(local);
             pending.wait_empty();
             let result = execute(&mut session.lock().unwrap(), request, instance);
-            if send(&writer, frame.id, result).is_err() {
+            if send(&writer, frame.id, method, result).is_err() {
                 break;
             }
             ids.lock().unwrap().remove(&frame.id);
@@ -496,7 +504,7 @@ fn serve(
 }
 
 type Reply = Result<(Response, Vec<u8>)>;
-fn send(writer: &Mutex<UnixStream>, id: u64, result: Reply) -> io::Result<()> {
+fn send(writer: &Mutex<UnixStream>, id: u64, method: Method, result: Reply) -> io::Result<()> {
     let (response, data) = match result {
         Ok(result) => result,
         Err(error) => {
@@ -508,6 +516,11 @@ fn send(writer: &Mutex<UnixStream>, id: u64, result: Reply) -> io::Result<()> {
                         .and_then(io::Error::raw_os_error)
                 })
                 .unwrap_or(libc::EIO);
+            if matches!(code, libc::EIO | libc::ENOSPC | libc::EPROTO) {
+                tracing::error!(request_id = id, ?method, errno = code, error = %format!("{error:#}"), "IPC operation failed");
+            } else {
+                tracing::debug!(request_id = id, ?method, errno = code, %error, "IPC operation rejected");
+            }
             (
                 Response {
                     error: code,

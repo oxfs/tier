@@ -1,14 +1,27 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")"
+# shellcheck source=/dev/null
 . /etc/os-release
-[ "$ID" = debian ] && [ "$VERSION_ID" = 13 ] || { echo 'This package requires Debian 13.' >&2; exit 1; }
-[ "$(dpkg --print-architecture)" = "$(cat architecture)" ] || { echo 'Package architecture does not match this host.' >&2; exit 1; }
-[ "$(dpkg-query -W -f='${Version}' samba)" = "$(cat samba-version)" ] || { echo 'Samba package version does not match tier.so; install a matching Tier package.' >&2; exit 1; }
+if [ "$ID" != debian ] || [ "$VERSION_ID" != 13 ]; then
+    echo 'This package requires Debian 13.' >&2
+    exit 1
+fi
+[ "$(dpkg --print-architecture)" = "$(cat architecture)" ] || {
+    echo 'Package architecture does not match this host.' >&2
+    exit 1
+}
+[ "$(dpkg-query -W -f='${Version}' samba)" = "$(cat samba-version)" ] || {
+    echo 'Samba package version does not match tier.so; install a matching Tier package.' >&2
+    exit 1
+}
 dpkg-query -W libprotobuf-c1 >/dev/null
 getent group tier >/dev/null || groupadd --system tier
 module_dir=$(smbd -b | awk '$1 == "MODULESDIR:" {print $2}')
-[ -n "$module_dir" ] || { echo 'Cannot locate Samba modules.' >&2; exit 1; }
+[ -n "$module_dir" ] || {
+    echo 'Cannot locate Samba modules.' >&2
+    exit 1
+}
 install -d /usr/local/bin "$module_dir/vfs"
 staged=$(mktemp /usr/local/bin/.tier.XXXXXX)
 module=$(mktemp "$module_dir/vfs/.tier.XXXXXX")

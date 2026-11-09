@@ -2,7 +2,7 @@
 set -euo pipefail
 cache=$(mktemp -d)
 privilege=()
-if (( EUID != 0 )); then privilege=(sudo); fi
+if ((EUID != 0)); then privilege=(sudo); fi
 cleanup() {
     if mountpoint -q "$cache"; then "${privilege[@]}" umount "$cache"; fi
     rmdir "$cache"

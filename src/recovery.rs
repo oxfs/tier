@@ -1,3 +1,4 @@
+use crate::core::schema;
 use crate::{
     archive::{ArchiveCopy, ArchivePolicy, ArchiveTarget, configured_client},
     core::{Copy, Engine, Policy, Record, Target, Trash, safe_name},
@@ -51,8 +52,8 @@ impl Catalog {
             ensure!(keys.insert(row.key.clone()), "duplicate snapshot key");
             let bytes = row.bytes()?;
             let key = row.key.as_str();
-            if let Some(id) = key.strip_prefix("node/") {
-                let node: Record = decode_record(&bytes)?;
+            if let Some(id) = key.strip_prefix(schema::NODES) {
+                let node: Record = schema::decode(&bytes)?;
                 ensure!(
                     node.node.id == id && (id == "root" || Uuid::parse_str(id).is_ok()),
                     "invalid node identity"
@@ -76,20 +77,20 @@ impl Catalog {
                     digest(hash)?;
                 }
                 result.nodes.insert(id.into(), node);
-            } else if key.starts_with("entry/") {
-                entries.insert(key.to_owned(), decode_record::<String>(&bytes)?);
-            } else if let Some(name) = key.strip_prefix("target/") {
-                let target: Target = decode_record(&bytes)?;
+            } else if key.starts_with(schema::ENTRIES) {
+                entries.insert(key.to_owned(), schema::decode::<String>(&bytes)?);
+            } else if let Some(name) = key.strip_prefix(schema::TARGETS) {
+                let target: Target = schema::decode(&bytes)?;
                 ensure!(
                     target.name == name && safe_name(name) && target.path.is_absolute(),
                     "invalid target"
                 );
                 Uuid::parse_str(&target.identity)?;
                 result.targets.insert(name.into(), target);
-            } else if key.starts_with("copy/") {
-                let copy: Copy = decode_record(&bytes)?;
+            } else if key.starts_with(schema::COPIES) {
+                let copy: Copy = schema::decode(&bytes)?;
                 ensure!(
-                    key == format!("copy/{}/{}", copy.node, copy.target),
+                    key == schema::copy(&copy.node, &copy.target),
                     "invalid copy key"
                 );
                 object_key(&copy)?;
@@ -98,12 +99,12 @@ impl Catalog {
                 }
                 result.copies.push(copy.clone());
                 result.claimed.push(copy);
-            } else if let Some(id) = key.strip_prefix("policy/") {
-                policies.push((id.to_owned(), decode_record::<Policy>(&bytes)?));
-            } else if let Some(id) = key.strip_prefix("archive_policy/") {
-                archive_policies.push((id.to_owned(), decode_record::<ArchivePolicy>(&bytes)?));
-            } else if let Some(name) = key.strip_prefix("archive_target/") {
-                let target: ArchiveTarget = decode_record(&bytes)?;
+            } else if let Some(id) = key.strip_prefix(schema::POLICIES) {
+                policies.push((id.to_owned(), schema::decode::<Policy>(&bytes)?));
+            } else if let Some(id) = key.strip_prefix(schema::ARCHIVE_POLICIES) {
+                archive_policies.push((id.to_owned(), schema::decode::<ArchivePolicy>(&bytes)?));
+            } else if let Some(name) = key.strip_prefix(schema::ARCHIVE_TARGETS) {
+                let target: ArchiveTarget = schema::decode(&bytes)?;
                 ensure!(
                     target.name == name && safe_name(name),
                     "invalid archive target"
@@ -118,21 +119,22 @@ impl Catalog {
                     "incomplete archive credentials"
                 );
                 result.archives.insert(name.into(), target);
-            } else if key.starts_with("archive_copy/") || key.starts_with("archive_gc/") {
-                let copy: ArchiveCopy = decode_record(&bytes)?;
+            } else if key.starts_with(schema::ARCHIVE_COPIES) || key.starts_with(schema::ARCHIVE_GC)
+            {
+                let copy: ArchiveCopy = schema::decode(&bytes)?;
                 Uuid::parse_str(&copy.key)?;
                 digest(&copy.hash)?;
-                if key.starts_with("archive_copy/") {
+                if key.starts_with(schema::ARCHIVE_COPIES) {
                     ensure!(
-                        key == format!("archive_copy/{}/{}", copy.node, copy.target),
+                        key == schema::archive_copy(&copy.node, &copy.target),
                         "invalid archive copy key"
                     );
                     result.archived.push(copy);
                 }
-            } else if key.starts_with("trash/") {
-                let trash: Trash = decode_record(&bytes)?;
+            } else if key.starts_with(schema::TRASH) {
+                let trash: Trash = schema::decode(&bytes)?;
                 ensure!(
-                    trash.id > 0 && key == format!("trash/{:020}", trash.id),
+                    trash.id > 0 && key == schema::trash(trash.id),
                     "invalid trash key"
                 );
                 let original = trash
@@ -144,29 +146,32 @@ impl Catalog {
                     result.trash.insert(trash.node.clone(), trash).is_none(),
                     "duplicate trash node"
                 );
-            } else if key.starts_with("garbage/") {
-                let copy: Copy = decode_record(&bytes)?;
+            } else if key.starts_with(schema::GARBAGE) {
+                let copy: Copy = schema::decode(&bytes)?;
                 object_key(&copy)?;
                 result.claimed.push(copy);
             } else {
                 match key {
-                    "system/format" => ensure!(
-                        decode_record::<String>(&bytes)? == "tier-rocksdb-v1",
+                    schema::SYSTEM_FORMAT => ensure!(
+                        schema::decode::<String>(&bytes)? == schema::FORMAT,
                         "unsupported metadata format"
                     ),
-                    "system/id" => ensure!(
-                        decode_record::<String>(&bytes)? == result.image.system_id,
+                    schema::SYSTEM_ID => ensure!(
+                        schema::decode::<String>(&bytes)? == result.image.system_id,
                         "system identity mismatch"
                     ),
-                    "system/revision" => ensure!(
-                        decode_record::<u64>(&bytes)? == result.image.seq,
+                    schema::REVISION => ensure!(
+                        schema::decode::<u64>(&bytes)? == result.image.seq,
                         "revision mismatch"
                     ),
-                    "system/trash_seq" => {
-                        ensure!(decode_record::<i64>(&bytes)? >= 0, "invalid trash sequence")
+                    schema::TRASH_SEQ => {
+                        ensure!(
+                            schema::decode::<i64>(&bytes)? >= 0,
+                            "invalid trash sequence"
+                        )
                     }
-                    "backup/schedule" => {
-                        let s: crate::backup::Schedule = decode_record(&bytes)?;
+                    schema::BACKUP_SCHEDULE => {
+                        let s: crate::backup::Schedule = schema::decode(&bytes)?;
                         ensure!(
                             s.seconds > 0
                                 && s.changes > 0
@@ -179,7 +184,12 @@ impl Catalog {
                 }
             }
         }
-        for required in ["system/format", "system/id", "system/revision", "node/root"] {
+        for required in [
+            schema::SYSTEM_FORMAT,
+            schema::SYSTEM_ID,
+            schema::REVISION,
+            schema::ROOT,
+        ] {
             ensure!(
                 keys.contains(required),
                 "missing snapshot record {required}"
@@ -197,10 +207,7 @@ impl Catalog {
                     result.nodes.get(parent).is_some_and(|p| p.node.is_dir),
                     "invalid parent"
                 );
-                let key = format!(
-                    "entry/{parent}/{}",
-                    unicase::UniCase::new(&node.name).to_folded_case()
-                );
+                let key = schema::entry(parent, &node.name);
                 ensure!(
                     expected.insert(key, id.clone()).is_none(),
                     "duplicate sibling name"
@@ -226,8 +233,8 @@ impl Catalog {
             .image
             .records
             .iter()
-            .find(|row| row.key == "system/trash_seq")
-            .map(|row| decode_record::<i64>(&row.bytes()?))
+            .find(|row| row.key == schema::TRASH_SEQ)
+            .map(|row| schema::decode::<i64>(&row.bytes()?))
             .transpose()?
             .unwrap_or(0);
         ensure!(
@@ -366,12 +373,6 @@ fn validate_archive_policy(
         ensure!(targets.contains_key(name), "archive target missing");
     }
     Ok(())
-}
-
-fn decode_record<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    let (value, trailing) = postcard::take_from_bytes(bytes)?;
-    ensure!(trailing.is_empty(), "trailing bytes in snapshot record");
-    Ok(value)
 }
 
 fn digest(hash: &str) -> Result<()> {
@@ -566,7 +567,7 @@ fn inspect_catalog(
                 push(report, "damaged", json!(display_object));
                 continue;
             }
-            good_copies.push(format!("copy/{}/{}", copy.node, copy.target));
+            good_copies.push(schema::copy(&copy.node, &copy.target));
             if !found {
                 if let (Some(stage), Some(dest)) = (stage, dest) {
                     stage.as_file().sync_all()?;
@@ -593,7 +594,7 @@ fn inspect_catalog(
                 });
                 match result {
                     Ok(()) => {
-                        good_archives.push(format!("archive_copy/{}/{}", copy.node, copy.target));
+                        good_archives.push(schema::archive_copy(&copy.node, &copy.target));
                         push(
                             report,
                             "verified_remote",
@@ -773,51 +774,53 @@ pub fn import(
         .context("invalid archive recovery report")?;
     for row in &catalog.image.records {
         let mut bytes = row.bytes()?;
-        if let Some(name) = row.key.strip_prefix("target/")
+        if let Some(name) = row.key.strip_prefix(schema::TARGETS)
             && let Some(path) = targets.get(name)
         {
             let mut target = catalog.targets[name].clone();
             target.path = fs::canonicalize(path)?;
-            bytes = postcard::to_allocvec(&target)?;
+            bytes = schema::encode(&target)?;
         }
-        if row.key.starts_with("copy/") && !verified.iter().any(|v| v.as_str() == Some(&row.key)) {
+        if row.key.starts_with(schema::COPIES)
+            && !verified.iter().any(|v| v.as_str() == Some(&row.key))
+        {
             continue;
         }
-        if row.key.starts_with("archive_copy/")
+        if row.key.starts_with(schema::ARCHIVE_COPIES)
             && !verified_archives
                 .iter()
                 .any(|value| value.as_str() == Some(&row.key))
         {
             continue;
         }
-        if row.key.starts_with("archive_copy/") {
-            let mut copy: ArchiveCopy = decode_record(&bytes)?;
+        if row.key.starts_with(schema::ARCHIVE_COPIES) {
+            let mut copy: ArchiveCopy = schema::decode(&bytes)?;
             copy.checked = crate::core::now()?;
             copy.error = None;
-            bytes = postcard::to_allocvec(&copy)?;
+            bytes = schema::encode(&copy)?;
         }
-        if row.key.starts_with("garbage/") || row.key.starts_with("archive_gc/") {
+        if row.key.starts_with(schema::GARBAGE) || row.key.starts_with(schema::ARCHIVE_GC) {
             continue;
         }
-        if let Some(id) = row.key.strip_prefix("node/") {
+        if let Some(id) = row.key.strip_prefix(schema::NODES) {
             let mut node = catalog.nodes[id].clone();
             node.primary = catalog
                 .copies
                 .iter()
                 .find(|copy| {
                     copy.node == id
-                        && verified.iter().any(|v| {
-                            v.as_str() == Some(&format!("copy/{}/{}", copy.node, copy.target))
-                        })
+                        && verified
+                            .iter()
+                            .any(|v| v.as_str() == Some(&schema::copy(&copy.node, &copy.target)))
                 })
                 .map(|c| c.target.clone());
-            bytes = postcard::to_allocvec(&node)?;
+            bytes = schema::encode(&node)?;
         }
         transaction.put(&row.key, bytes)?;
     }
     transaction.put(
-        "backup/lineage",
-        postcard::to_allocvec(&Uuid::new_v4().to_string())?,
+        schema::BACKUP_LINEAGE,
+        schema::encode(&Uuid::new_v4().to_string())?,
     )?;
     transaction.commit()?;
     engine.rebuild_work_queue()?;

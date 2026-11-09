@@ -70,7 +70,7 @@ impl Engine {
             }
             self.inner.db.snapshot()
         };
-        let prefix = format!("entry/{parent}/");
+        let prefix = schema::entries(parent);
         for item in snapshot.iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward)) {
             let (k, v) = item?;
             if !k.starts_with(prefix.as_bytes()) {
@@ -78,7 +78,7 @@ impl Engine {
             }
             let id: String = Self::decode(&v)?;
             let bytes = snapshot
-                .get(key("node", &id))?
+                .get(schema::node(&id))?
                 .ok_or_else(|| failure(libc::ENOENT))?;
             let r: Record = Self::decode(&bytes)?;
             visitor(r.name, r.node)?;
@@ -124,24 +124,25 @@ impl Engine {
             r.node.mtime = t;
         }
         r.node.ctime = SystemTime::now();
-        self.put_record(&key("node", id), &r, false)
+        self.put_record(&schema::node(id), &r, false)
     }
     pub(crate) fn set_birth_time(&self, id: &str, time: SystemTime) -> Result<()> {
         let lock = self.file_lock(id);
         let _guard = lock.lock();
         let mut r = self.record(id)?;
         r.node.btime = time;
-        self.put_record(&key("node", id), &r, false)
+        self.put_record(&schema::node(id), &r, false)
     }
     pub fn inherit_policy(&self, path: &str, archive: bool) -> Result<()> {
         let n = self.stat(path)?;
         ensure!(n.is_dir, "policy requires directory");
         ensure!(archive || n.id != "root", "root requires storage policy");
         let _guard = self.inner.namespace.write();
-        self.delete_record(&key(
-            if archive { "archive_policy" } else { "policy" },
-            &n.id,
-        ))?;
+        self.delete_record(&if archive {
+            schema::archive_policy(&n.id)
+        } else {
+            schema::policy(&n.id)
+        })?;
         for r in self.subtree(&n.id)? {
             if !r.node.is_dir {
                 self.schedule_file(&r.node.id)?;
@@ -199,7 +200,7 @@ impl Engine {
         );
         self.atomic(
             vec![
-                Self::encoded(key("node", &r.node.id), &r)?,
+                Self::encoded(schema::node(&r.node.id), &r)?,
                 Self::encoded(k, &r.node.id)?,
             ],
             vec![],
@@ -258,7 +259,7 @@ impl Engine {
                             libc::ENOTDIR
                         }));
                     }
-                    if n.node.is_dir && !self.scan::<String>(&format!("entry/{dst}/"))?.is_empty() {
+                    if n.node.is_dir && !self.scan::<String>(&schema::entries(&dst))?.is_empty() {
                         return Err(failure(libc::ENOTEMPTY));
                     }
                     let original = self.path_for(&dst)?.unwrap_or_default();
@@ -268,7 +269,7 @@ impl Engine {
                 record.parent = Some(tp.into());
                 record.name = to.into();
                 record.node.ctime = SystemTime::now();
-                puts.push(Self::encoded(key("node", &src.id), &record)?);
+                puts.push(Self::encoded(schema::node(&src.id), &record)?);
                 puts.push(Self::encoded(entry(tp, to), &src.id)?);
                 // Deletions precede inserts when case-only renames share the same key.
                 deletes.retain(|k| !puts.iter().any(|(p, _)| p == k));
@@ -297,7 +298,7 @@ impl Engine {
         if let Some(parent) = &r.parent {
             deletes.push(entry(parent, &r.name));
         }
-        let next = self.kv_get::<i64>("system/trash_seq")?.unwrap_or(0) + 1;
+        let next = self.kv_get::<i64>(schema::TRASH_SEQ)?.unwrap_or(0) + 1;
         let trash = Trash {
             id: next,
             node: r.node.id.clone(),
@@ -309,9 +310,9 @@ impl Engine {
         };
         r.parent = None;
         puts.extend([
-            Self::encoded(key("node", &r.node.id), &r)?,
-            Self::encoded(format!("trash/{next:020}"), &trash)?,
-            Self::encoded("system/trash_seq".into(), &next)?,
+            Self::encoded(schema::node(&r.node.id), &r)?,
+            Self::encoded(schema::trash(next), &trash)?,
+            Self::encoded(schema::TRASH_SEQ.into(), &next)?,
         ]);
         Ok(())
     }
@@ -340,7 +341,7 @@ impl Engine {
                         libc::ENOTDIR
                     }));
                 }
-                if is_dir && !self.scan::<String>(&format!("entry/{}/", n.id))?.is_empty() {
+                if is_dir && !self.scan::<String>(&schema::entries(&n.id))?.is_empty() {
                     return Err(failure(libc::ENOTEMPTY));
                 }
                 let path = self.path_for(&n.id)?.unwrap_or_default();
@@ -354,11 +355,7 @@ impl Engine {
     pub fn restore(&self, id: i64, path: &str) -> Result<()> {
         let (p, name) = split(path)?;
         self.namespace_files(
-            || {
-                Ok(vec![
-                    self.require::<Trash>(&format!("trash/{id:020}"))?.node,
-                ])
-            },
+            || Ok(vec![self.require::<Trash>(&schema::trash(id))?.node]),
             |_| {
                 let parent = self.lookup_unlocked(p)?;
                 if !parent.is_dir {
@@ -367,16 +364,16 @@ impl Engine {
                 if self.kv_get::<String>(&entry(&parent.id, name))?.is_some() {
                     return Err(failure(libc::EEXIST));
                 }
-                let t: Trash = self.require(&format!("trash/{id:020}"))?;
+                let t: Trash = self.require(&schema::trash(id))?;
                 let mut r = self.record(&t.node)?;
                 r.parent = Some(parent.id.clone());
                 r.name = name.into();
                 self.atomic(
                     vec![
-                        Self::encoded(key("node", &t.node), &r)?,
+                        Self::encoded(schema::node(&t.node), &r)?,
                         Self::encoded(entry(&parent.id, name), &t.node)?,
                     ],
-                    vec![format!("trash/{id:020}")],
+                    vec![schema::trash(id)],
                     false,
                 )?;
                 for r in self.subtree(&t.node)? {
@@ -395,7 +392,7 @@ impl Engine {
             let r = self.record(&id)?;
             if r.node.is_dir {
                 todo.extend(
-                    self.scan::<String>(&format!("entry/{id}/"))?
+                    self.scan::<String>(&schema::entries(&id))?
                         .into_iter()
                         .map(|(_, id)| id),
                 );
@@ -407,7 +404,7 @@ impl Engine {
     pub fn purge(&self, id: i64) -> Result<()> {
         self.namespace_files(
             || {
-                let t: Trash = self.require(&format!("trash/{id:020}"))?;
+                let t: Trash = self.require(&schema::trash(id))?;
                 Ok(self
                     .subtree(&t.node)?
                     .into_iter()
@@ -415,30 +412,29 @@ impl Engine {
                     .collect())
             },
             |guards| {
-                let t: Trash = self.require(&format!("trash/{id:020}"))?;
+                let t: Trash = self.require(&schema::trash(id))?;
                 let records = self.subtree(&t.node)?;
                 ensure!(guards.iter().all(|g| g.handles == 0), "file is open");
                 let mut puts = vec![];
-                let mut deletes = vec![format!("trash/{id:020}")];
+                let mut deletes = vec![schema::trash(id)];
                 for r in records {
                     let nid = &r.node.id;
                     for c in self.copies(nid)? {
-                        puts.push(Self::encoded(
-                            format!("garbage/{}/{}", c.target, Uuid::new_v4()),
-                            &c,
-                        )?);
-                        deletes.push(format!("copy/{nid}/{}", c.target));
+                        puts.push(Self::encoded(schema::garbage(&c.target), &c)?);
+                        deletes.push(schema::copy(nid, &c.target));
                     }
                     for (k, c) in
-                        self.scan::<crate::archive::ArchiveCopy>(&format!("archive_copy/{nid}/"))?
+                        self.scan::<crate::archive::ArchiveCopy>(&schema::archive_copies(nid))?
                     {
-                        puts.push(Self::encoded(format!("archive_gc/{}", Uuid::new_v4()), &c)?);
+                        puts.push(Self::encoded(schema::archive_gc(), &c)?);
                         deletes.push(k);
                     }
-                    for prefix in ["node", "policy", "archive_policy"] {
-                        deletes.push(key(prefix, nid));
-                    }
-                    for (k, _) in self.scan::<String>(&format!("entry/{nid}/"))? {
+                    deletes.extend([
+                        schema::node(nid),
+                        schema::policy(nid),
+                        schema::archive_policy(nid),
+                    ]);
+                    for (k, _) in self.scan::<String>(&schema::entries(nid))? {
                         deletes.push(k);
                     }
                 }

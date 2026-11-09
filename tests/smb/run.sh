@@ -5,9 +5,24 @@ tier=$(command -v "${TIER_BIN:-tier}")
 port=${SMB_PORT:-14445}
 tmp=$(mktemp -d)
 cleanup() {
+    status=$?
     [[ -z ${smb_pid:-} ]] || kill -- -"$smb_pid" 2>/dev/null || true
     [[ -z ${tier_pid:-} ]] || kill "$tier_pid" 2>/dev/null || true
+    [[ -z ${smb_pid:-} ]] || wait "$smb_pid" 2>/dev/null || true
+    [[ -z ${tier_pid:-} ]] || wait "$tier_pid" 2>/dev/null || true
+    if ((status != 0)); then
+        for log in "$tmp"/*.log; do
+            [[ -f "$log" ]] || continue
+            printf '\n--- %s ---\n' "$log" >&2
+            tail -100 "$log" >&2
+        done
+    fi
+    if [[ -n ${TIER_TEST_LOG_DIR:-} ]]; then
+        mkdir -p "$TIER_TEST_LOG_DIR"
+        cp "$tmp"/*.log "$TIER_TEST_LOG_DIR/"
+    fi
     if [[ ${KEEP_TEST_DATA:-0} == 1 ]]; then printf 'SMB test data: %s\n' "$tmp"; else rm -rf -- "$tmp"; fi
+    return "$status"
 }
 trap cleanup EXIT
 mkdir -p "$tmp"/{objects,native,private,lock,state,cache,run}
@@ -17,11 +32,17 @@ getent passwd tier-test >/dev/null || useradd --system --no-create-home --shell 
 tier_gid=$(getent group tier | cut -d: -f3)
 "$tier" --db "$tmp/metadata" target main "$tmp/objects"
 "$tier" --db "$tmp/metadata" policy / '{"write_cache":["main"],"persistent_storage":["main"],"persistent_copies":1,"persist_delay_secs":0,"low_water":99,"high_water":100}'
-setpriv --regid "$tier_gid" --clear-groups "$tier" --db "$tmp/metadata" serve --socket "$tmp/tier.sock" --admin 127.0.0.1:0 > "$tmp/tier.log" 2>&1 &
+setpriv --regid "$tier_gid" --clear-groups "$tier" --db "$tmp/metadata" serve --socket "$tmp/tier.sock" --admin 127.0.0.1:0 >"$tmp/tier.log" 2>&1 &
 tier_pid=$!
-for _ in {1..100}; do [[ -S "$tmp/tier.sock" ]] && break; sleep .1; done
-[[ -S "$tmp/tier.sock" ]] || { cat "$tmp/tier.log" >&2; exit 1; }
-cat > "$tmp/smb.conf" <<CONF
+for _ in {1..100}; do
+    [[ -S "$tmp/tier.sock" ]] && break
+    sleep .1
+done
+[[ -S "$tmp/tier.sock" ]] || {
+    cat "$tmp/tier.log" >&2
+    exit 1
+}
+cat >"$tmp/smb.conf" <<CONF
 [global]
 server role = standalone server
 security = user
@@ -57,6 +78,9 @@ map archive = no
 map hidden = no
 map system = no
 map readonly = no
+[fault]
+copy = tier
+tier:socket = $tmp/fault.sock
 [native]
 path = $tmp/native
 read only = no
@@ -70,22 +94,33 @@ map hidden = no
 map system = no
 map readonly = no
 CONF
-password=tier-integration-test
+password="tier-integration-test"
 printf '%s\n%s\n' "$password" "$password" | smbpasswd -s -c "$tmp/smb.conf" -a root
 printf '%s\n%s\n' "$password" "$password" | smbpasswd -s -c "$tmp/smb.conf" -a tier-test
-setsid smbd --foreground --no-process-group --configfile="$tmp/smb.conf" > "$tmp/smbd.log" 2>&1 &
+setsid smbd --foreground --no-process-group --configfile="$tmp/smb.conf" >"$tmp/smbd.log" 2>&1 &
 smb_pid=$!
 client=(smbclient //127.0.0.1/tier -p "$port" -U "root%$password" -s "$tmp/smb.conf")
 ready=0
-for _ in {1..100}; do if "${client[@]}" -c ls > "$tmp/list.log" 2>&1; then ready=1; break; fi; sleep .1; done
-if [[ $ready != 1 ]]; then cat "$tmp/"{list,smb,smbd,tier}.log >&2; exit 1; fi
-printf 'tier smb round trip\n' > "$tmp/input"
+for _ in {1..100}; do
+    if "${client[@]}" -c ls >"$tmp/list.log" 2>&1; then
+        ready=1
+        break
+    fi
+    sleep .1
+done
+if [[ $ready != 1 ]]; then
+    cat "$tmp/"{list,smb,smbd,tier}.log >&2
+    exit 1
+fi
+printf 'tier smb round trip\n' >"$tmp/input"
 "${client[@]}" -c "mkdir photos; put $tmp/input photos/draft; rename photos/draft photos/final; get photos/final $tmp/output"
 cmp "$tmp/input" "$tmp/output"
 "${client[@]}" -c "del photos/final; rmdir photos"
+"${client[@]}" -c "put $tmp/input timeout-probe"
+SMB_TEST_ROOT="$tmp" SMB_TEST_PORT="$port" python3 "$(dirname "$0")/protocol.py"
 if [[ ${TIER_BENCHMARK:-0} == 1 ]]; then
-    SMB_TEST_PORT="$port" python3 "$(dirname "$0")/smb-benchmark.py"
+    SMB_TEST_PORT="$port" python3 "$(dirname "$0")/benchmark.py"
 fi
 SMB_TEST_ROOT="$tmp" SMB_TEST_PORT="$port" TIER_TEST_PID="$tier_pid" TIER_TEST_GID="$tier_gid" TIER_BIN="$tier" \
-    python3 "$(dirname "$0")/smb-integration.py"
+    python3 "$(dirname "$0")/integration.py"
 printf 'PASS Samba VFS integration\n'

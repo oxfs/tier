@@ -1,3 +1,4 @@
+use crate::core::schema;
 use crate::core::{Engine, now};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -58,19 +59,19 @@ impl Engine {
                 .sync_all()?;
             fs::File::open(path)?.sync_all()?;
         }
-        self.put_record("backup/schedule", schedule, true)
+        self.put_record(schema::BACKUP_SCHEDULE, schedule, true)
     }
 
     fn backup_marker(&self) -> Result<String> {
         Ok(format!(
             ".tier-backup-{}",
-            self.require::<String>("system/id")?
+            self.require::<String>(schema::SYSTEM_ID)?
         ))
     }
 
     pub(crate) fn backup_status(&self) -> Result<Vec<serde_json::Value>> {
         let revision = self.business_revision()?;
-        self.scan::<Status>("backup/status/")?
+        self.scan::<Status>(schema::BACKUP_STATUS)?
             .into_iter()
             .map(|(_, status)| {
                 let mut value = serde_json::to_value(&status)?;
@@ -88,23 +89,23 @@ impl Engine {
     }
 
     fn dispatch_backups(&self, force: bool) -> Result<()> {
-        let Some(settings) = self.kv_get::<Schedule>("backup/schedule")? else {
+        let Some(settings) = self.kv_get::<Schedule>(schema::BACKUP_SCHEDULE)? else {
             return Ok(());
         };
-        let system = self.require::<String>("system/id")?;
+        let system = self.require::<String>(schema::SYSTEM_ID)?;
         let marker = self.backup_marker()?;
-        let lineage = if let Some(id) = self.kv_get::<String>("backup/lineage")? {
+        let lineage = if let Some(id) = self.kv_get::<String>(schema::BACKUP_LINEAGE)? {
             id
         } else {
             let id = uuid::Uuid::new_v4().to_string();
-            self.put_record("backup/lineage", &id, true)?;
+            self.put_record(schema::BACKUP_LINEAGE, &id, true)?;
             id
         };
         let time = now()?;
-        let revision = self.kv_get::<u64>("system/revision")?.unwrap_or(0);
+        let revision = self.kv_get::<u64>(schema::REVISION)?.unwrap_or(0);
         let mut jobs = Vec::new();
         for path in &settings.directories {
-            let key = status_key(path);
+            let key = schema::backup_status(path);
             let last = self.kv_get::<Status>(&key)?;
             if !force
                 && last.as_ref().is_some_and(|last| {
@@ -181,15 +182,6 @@ impl Engine {
             Ok(())
         })
     }
-}
-
-fn status_key(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    use std::os::unix::ffi::OsStrExt;
-    format!(
-        "backup/status/{:x}",
-        Sha256::digest(path.as_os_str().as_bytes())
-    )
 }
 
 fn publish_to(

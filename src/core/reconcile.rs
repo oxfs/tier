@@ -24,13 +24,13 @@ impl Engine {
                 if let Ok(mut n) = self.record(&id) {
                     n.error = Some(format!("{e:#}"));
                     n.incident = Some(n.incident.unwrap_or(now()?));
-                    self.put_record(&key("node", &id), &n, false)?;
+                    self.put_record(&schema::node(&id), &n, false)?;
                 }
                 errors.push(format!("{id}: {e:#}"));
             }
             self.reschedule_work("local", &id, failed)?;
         }
-        for (_, t) in self.scan::<Trash>("trash/")? {
+        for (_, t) in self.scan::<Trash>(schema::TRASH)? {
             if t.expires <= now()?
                 && let Err(e) = self.purge(t.id)
             {
@@ -75,8 +75,8 @@ impl Engine {
         copy.hash = Some(hash);
         self.atomic(
             vec![
-                Self::encoded(key("node", id), &latest)?,
-                Self::encoded(format!("copy/{id}/{}", copy.target), &copy)?,
+                Self::encoded(schema::node(id), &latest)?,
+                Self::encoded(schema::copy(id, &copy.target), &copy)?,
             ],
             vec![],
             true,
@@ -97,7 +97,11 @@ impl Engine {
         }
         let (targets, count) = p.desired();
         let required = self.archive_retained(id, count)?;
-        let placement = (r.node.version, targets.to_vec(), count);
+        let placement = model::Placement {
+            version: r.node.version,
+            targets: targets.to_vec(),
+            copies: count,
+        };
         let have = valid.iter().filter(|c| targets.contains(&c.target)).count();
         if have < required && r.placement.as_ref() == Some(&placement) && !manual {
             let incident = r.incident.unwrap_or(now()?);
@@ -132,7 +136,7 @@ impl Engine {
             .iter()
             .filter(|c| targets.contains(&c.target))
             .filter_map(|c| {
-                self.kv_get::<Target>(&key("target", &c.target))
+                self.kv_get::<Target>(&schema::target(&c.target))
                     .ok()
                     .flatten()
                     .map(|t| t.domain)
@@ -142,7 +146,7 @@ impl Engine {
             let index = desired
                 .iter()
                 .position(|name| {
-                    self.kv_get::<Target>(&key("target", name))
+                    self.kv_get::<Target>(&schema::target(name))
                         .ok()
                         .flatten()
                         .is_some_and(|t| !domains.contains(&t.domain))
@@ -193,15 +197,12 @@ impl Engine {
                 version: r.node.version,
                 hash: Some(hash.into()),
             };
-            let mut puts = vec![Self::encoded(format!("copy/{id}/{name}"), &copy)?];
-            if let Some(old) = self.kv_get::<Copy>(&format!("copy/{id}/{name}"))? {
-                puts.push(Self::encoded(
-                    format!("garbage/{name}/{}", Uuid::new_v4()),
-                    &old,
-                )?)
+            let mut puts = vec![Self::encoded(schema::copy(id, &name), &copy)?];
+            if let Some(old) = self.kv_get::<Copy>(&schema::copy(id, &name))? {
+                puts.push(Self::encoded(schema::garbage(&name), &old)?)
             }
             self.atomic(puts, vec![], true)?;
-            domains.insert(self.require::<Target>(&key("target", &name))?.domain);
+            domains.insert(self.require::<Target>(&schema::target(&name))?.domain);
             valid.push(copy);
         }
         ensure!(
@@ -244,11 +245,8 @@ impl Engine {
         let mut deletes = vec![];
         for c in self.copies(id)? {
             if !keep.contains(&c.target) {
-                puts.push(Self::encoded(
-                    format!("garbage/{}/{}", c.target, Uuid::new_v4()),
-                    &c,
-                )?);
-                deletes.push(format!("copy/{id}/{}", c.target));
+                puts.push(Self::encoded(schema::garbage(&c.target), &c)?);
+                deletes.push(schema::copy(id, &c.target));
             }
         }
         latest.primary = valid
@@ -259,7 +257,7 @@ impl Engine {
         latest.error = None;
         latest.incident = None;
         latest.placement = Some(placement);
-        puts.push(Self::encoded(key("node", id), &latest)?);
+        puts.push(Self::encoded(schema::node(id), &latest)?);
         self.atomic(puts, deletes, true)?;
         if state.body.as_ref().is_some_and(|b| {
             !valid.iter().any(|c| {

@@ -104,6 +104,33 @@ fn fixture() -> Result<(tempfile::TempDir, Engine, IpcServer)> {
 }
 
 #[test]
+fn additive_protobuf_fields_do_not_change_existing_request_semantics() -> Result<()> {
+    let (temp, _engine, _server) = fixture()?;
+    let mut stream = UnixStream::connect(temp.path().join("tier.sock"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    // Stable HELLO wire vector plus an unknown varint field 100. This exercises
+    // the actual server parser rather than assuming every protobuf runtime
+    // preserves unknown fields when re-encoding.
+    Frame {
+        id: 1,
+        message: vec![0x08, 0x01, 0x90, 0x01, 0x01, 0xa0, 0x06, 0x07],
+        data: vec![],
+    }
+    .write(&mut stream)?;
+    let frame = Frame::read(&mut stream)?.unwrap();
+    let response = Response::decode(frame.message.as_slice())?;
+    assert_eq!(response.error, 0);
+    assert_eq!(response.protocol_version, VERSION as u32);
+
+    let omitted = Changes::decode([].as_slice())?;
+    let zero_size = Changes::decode([0x28, 0x01].as_slice())?;
+    assert!(!omitted.has_size);
+    assert!(zero_size.has_size);
+    assert_eq!(zero_size.size, 0);
+    Ok(())
+}
+
+#[test]
 fn framing_rejects_bad_headers_and_truncated_payloads() -> Result<()> {
     let frame = Frame::request(
         42,

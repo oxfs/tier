@@ -249,7 +249,7 @@ fn restart_never_promotes_an_old_replica_after_in_place_write() -> anyhow::Resul
     e.reconcile()?;
     drop(e);
     let status = std::process::Command::new(std::env::current_exe()?)
-        .args(["--exact", "crash_writer_child", "--nocapture"])
+        .args(["--exact", "files::crash_writer_child", "--nocapture"])
         .env("TIER_CRASH_TEST_DB", tmp.path().join("db"))
         .status()?;
     assert!(status.success());
