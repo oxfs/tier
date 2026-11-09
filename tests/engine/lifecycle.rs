@@ -47,9 +47,19 @@ fn restore_namespace_from_snapshot_with_a_single_surviving_disk() -> Result<()> 
         &recovered,
         &BTreeMap::from([("disk-a".into(), moved)]),
         true,
+        &Default::default(),
     )?;
     assert_eq!(Engine::open(&recovered)?.get("/albums/image")?, b"new");
-    assert!(recovery::import(&data, &recovered, &BTreeMap::new(), false).is_err());
+    assert!(
+        recovery::import(
+            &data,
+            &recovered,
+            &BTreeMap::new(),
+            false,
+            &Default::default()
+        )
+        .is_err()
+    );
     Ok(())
 }
 

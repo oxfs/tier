@@ -39,9 +39,24 @@ fn damaged_media_requires_explicit_degraded_restore() -> Result<()> {
     let file = object(&disk, &engine.stat("/photo")?.id)?;
     fs::write(&file, b"corrupt")?;
     let destination = tmp.path().join("recovered");
-    assert!(recovery::import(&snapshot, &destination, &BTreeMap::new(), false).is_err());
+    assert!(
+        recovery::import(
+            &snapshot,
+            &destination,
+            &BTreeMap::new(),
+            false,
+            &Default::default()
+        )
+        .is_err()
+    );
     assert!(!destination.exists());
-    let report = recovery::import(&snapshot, &destination, &BTreeMap::new(), true)?;
+    let report = recovery::import(
+        &snapshot,
+        &destination,
+        &BTreeMap::new(),
+        true,
+        &Default::default(),
+    )?;
     assert_eq!(report["missing"], serde_json::json!(["photo"]));
     assert_eq!(report["damaged"], serde_json::json!([file]));
     assert!(Engine::open(&destination)?.get("/photo").is_err());
@@ -67,7 +82,13 @@ fn trash_is_verified_but_not_extracted_into_live_namespace() -> Result<()> {
     assert!(!out.join("old").exists());
     assert_eq!(fs::read(out.join("live"))?, b"live");
     let restored = tmp.path().join("restored");
-    recovery::import(&snapshot, &restored, &BTreeMap::new(), false)?;
+    recovery::import(
+        &snapshot,
+        &restored,
+        &BTreeMap::new(),
+        false,
+        &Default::default(),
+    )?;
     let engine = Engine::open(&restored)?;
     engine.restore(1, "/restored")?;
     assert_eq!(engine.get("/restored/photo")?, b"photo");

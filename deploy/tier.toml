@@ -1,3 +1,12 @@
 db = "/var/lib/tier/metadata"
 socket = "/run/tier/tier.sock"
 admin = "127.0.0.1:9480"
+
+# Restart Tier after changing these settings. Cache + write buffers are not a
+# total process-memory limit; leave room for indexes, compaction and file cache.
+[rocksdb]
+block_cache_mib = 128
+write_buffer_mib = 32
+max_write_buffers = 3
+max_background_jobs = 2
+compression = "lz4" # "lz4" or "none"

@@ -23,7 +23,13 @@ fn restored_catalog_uses_a_distinct_backup_lineage() -> Result<()> {
     let original = source.stat("/original")?.id;
     source.backup_tick()?;
     let restored = temp.path().join("restored");
-    recovery::import(&baseline, &restored, &BTreeMap::new(), false)?;
+    recovery::import(
+        &baseline,
+        &restored,
+        &BTreeMap::new(),
+        false,
+        &Default::default(),
+    )?;
     let engine = Engine::open(&restored)?;
     engine.mkdir("/replacement")?;
     let replacement = engine.stat("/replacement")?.id;

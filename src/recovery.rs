@@ -705,7 +705,9 @@ pub fn import(
     dest: &Path,
     targets: &BTreeMap<String, PathBuf>,
     allow_degraded: bool,
+    options: &crate::core::RocksDbOptions,
 ) -> Result<Value> {
+    options.validate()?;
     let catalog = Catalog::parse(snapshot)?;
     ensure!(!dest.exists(), "destination metadata already exists");
     for (name, path) in targets {
@@ -756,7 +758,7 @@ pub fn import(
         .unwrap_or(Path::new("."));
     let temp = tempfile::tempdir_in(parent)?;
     let staging = temp.path().join("metadata");
-    let engine = Engine::open(&staging)?;
+    let engine = Engine::open_with_options(&staging, options)?;
     let mut options = rocksdb::WriteOptions::default();
     options.set_sync(true);
     let transaction = engine

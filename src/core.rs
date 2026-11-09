@@ -11,6 +11,7 @@ mod target;
 pub use file::FileHandle;
 pub(crate) use model::{Copy, Record, Target, Trash};
 pub use model::{Node, Policy};
+pub use store::{RocksDbCompression, RocksDbOptions};
 
 use anyhow::{Context, Result, bail, ensure};
 use parking_lot::{Mutex, RwLock};

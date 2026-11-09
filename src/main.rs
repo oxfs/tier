@@ -133,8 +133,13 @@ fn main() -> Result<()> {
             let (name, path) = mapping.split_once('=').context("use NAME=PATH")?;
             map.insert(name.to_owned(), path.into());
         }
-        let report =
-            recovery::import(&tier::snapshot::load(snapshot)?, &db, &map, *allow_degraded)?;
+        let report = recovery::import(
+            &tier::snapshot::load(snapshot)?,
+            &db,
+            &map,
+            *allow_degraded,
+            &settings.rocksdb,
+        )?;
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
@@ -148,7 +153,7 @@ fn main() -> Result<()> {
     guard.try_lock().context(
         "database is in use; manage a running Tier instance through its local web interface",
     )?;
-    let engine = Engine::open(&db)?;
+    let engine = Engine::open_with_options(&db, &settings.rocksdb)?;
     match cli.action {
         Action::Target {
             name,

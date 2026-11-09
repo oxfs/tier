@@ -39,6 +39,8 @@ Windows 通过 `\\NAS地址\tier` 访问。升级 Samba 后，安装匹配的 Ti
 
 启动配置为 `/etc/tier/tier.toml`，元数据默认存放在 `/var/lib/tier/metadata`。设备、策略和快照计划通过控制台管理。后端日志用 `journalctl -u tier -f` 查看，插件日志位于 Samba 配置的日志目录。
 
+TOML 的 `[rocksdb]` 可调整元数据缓存、写缓冲、后台任务数和压缩方式，默认值见包内 `tier.toml`，修改后重启 Tier 生效。
+
 误删文件可从回收站恢复。元数据快照不包含正文；元数据丢失时，使用快照和存活设备检查、恢复到新的目录：
 
 ```sh

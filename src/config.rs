@@ -6,6 +6,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
 };
+use tier::core::RocksDbOptions;
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -13,6 +14,8 @@ pub struct Settings {
     db: Option<PathBuf>,
     pub socket: Option<PathBuf>,
     pub admin: Option<SocketAddr>,
+    #[serde(default)]
+    pub rocksdb: RocksDbOptions,
 }
 
 fn user_dir(variable: &str, fallback: &str) -> Result<PathBuf> {
@@ -42,6 +45,7 @@ impl Settings {
         };
         let settings: Self =
             toml::from_str(&contents).with_context(|| format!("parse {}", path.display()))?;
+        settings.rocksdb.validate()?;
         for path in settings.db.iter().chain(&settings.socket) {
             ensure!(
                 path.is_absolute(),
@@ -85,5 +89,39 @@ mod tests {
             fs::write(&path, invalid).unwrap();
             assert!(Settings::load(Some(&path)).is_err());
         }
+    }
+
+    #[test]
+    fn rocksdb_defaults_overrides_and_invalid_limits() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("tier.toml");
+        fs::write(&path, "[rocksdb]\nblock_cache_mib=64\ncompression='none'")?;
+        let settings = Settings::load(Some(&path))?;
+        assert_eq!(settings.rocksdb.block_cache_mib, 64);
+        assert_eq!(settings.rocksdb.write_buffer_mib, 32);
+        assert!(matches!(
+            settings.rocksdb.compression,
+            tier::core::RocksDbCompression::None
+        ));
+        for invalid in [
+            "block_cache_mib=0",
+            "write_buffer_mib=-1",
+            "write_buffer_mib=9223372036854775807",
+            "max_write_buffers=1",
+            "max_background_jobs=0",
+            "compression='unknown'",
+            "disable_wal=true",
+            "block_cahce_mib=64",
+        ] {
+            fs::write(&path, format!("[rocksdb]\n{invalid}"))?;
+            assert!(Settings::load(Some(&path)).is_err(), "accepted {invalid}");
+        }
+        let defaults: Settings = toml::from_str(include_str!("../deploy/tier.toml"))?;
+        defaults.rocksdb.validate()?;
+        assert_eq!(
+            defaults.rocksdb.block_cache_mib,
+            RocksDbOptions::default().block_cache_mib
+        );
+        Ok(())
     }
 }
