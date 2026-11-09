@@ -1,3 +1,3 @@
-db = "/var/lib/tier/tier.sqlite"
-mountpoint = "/srv/tier/share"
+db = "/var/lib/tier/metadata"
+socket = "/run/tier/tier.sock"
 admin = "127.0.0.1:9480"

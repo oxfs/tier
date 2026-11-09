@@ -1,89 +1,35 @@
 #!/usr/bin/env bash
-# Run as root on Linux with tier, smbd, smbclient and FUSE installed.
+# Run as root on Debian 13 with the matching tier.so installed.
 set -euo pipefail
-tier=${TIER_BIN:-tier}
+tier=$(command -v "${TIER_BIN:-tier}")
 port=${SMB_PORT:-14445}
 tmp=$(mktemp -d)
-mkdir -p "$tmp"/{mnt,objects,private,lock,state,cache,run}
 cleanup() {
-    [[ -z ${smb_pid:-} ]] || kill "$smb_pid" 2>/dev/null || true
-    mountpoint -q "$tmp/mnt" && umount "$tmp/mnt" || true
+    [[ -z ${smb_pid:-} ]] || kill -- -"$smb_pid" 2>/dev/null || true
     [[ -z ${tier_pid:-} ]] || kill "$tier_pid" 2>/dev/null || true
-    [[ -d "$tmp" && "$tmp" == /tmp/tmp.* ]] && rm -rf -- "$tmp"
+    if [[ ${KEEP_TEST_DATA:-0} == 1 ]]; then printf 'SMB test data: %s\n' "$tmp"; else rm -rf -- "$tmp"; fi
 }
 trap cleanup EXIT
-"$tier" --db "$tmp/tier.db" target main "$tmp/objects"
-"$tier" --db "$tmp/tier.db" policy / '{"write_cache":["main"],"cache_copies":1,"persistent_storage":["main"],"persistent_copies":1,"persist_delay_secs":0}'
-"$tier" --db "$tmp/tier.db" serve "$tmp/mnt" --admin 127.0.0.1:0 > "$tmp/tier.log" 2>&1 &
-tier_pid=$!
-for _ in {1..100}; do mountpoint -q "$tmp/mnt" && break; sleep .1; done
-mountpoint -q "$tmp/mnt" || { cat "$tmp/tier.log" >&2; exit 1; }
-python3 - "$tmp/mnt" <<'PY'
-import errno
-import os
-import sqlite3
-import sys
-from pathlib import Path
-root = Path(sys.argv[1])
-path = root / "lock-test"
-path.write_bytes(b"previous content")
-path.write_bytes(b"new")
-assert path.read_bytes() == b"new"
-with path.open("wb") as writer:
-    writer.write(b"first")
-    writer.flush()
-    os.fsync(writer.fileno())
-    try:
-        os.open(path, os.O_RDWR)
-    except OSError as exc:
-        assert exc.errno == errno.EBUSY, exc
-    else:
-        raise AssertionError("second writer unexpectedly opened")
-with path.open("rb") as reader:
-    replacement = root / "replacement"
-    replacement.write_bytes(b"second")
-    replacement.replace(path)
-    assert reader.read() == b"first"
-assert path.read_bytes() == b"second"
-path.unlink()
-for replace in (False, True):
-    path = root / "detach-test"
-    path.write_bytes(b"original")
-    with path.open("r+b", buffering=0) as writer:
-        writer.write(b"modified")
-        try:
-            os.truncate(path, 2)
-        except OSError as error:
-            assert error.errno == errno.EBUSY, error
-        else:
-            raise AssertionError("path truncation bypassed the writer")
-        if replace:
-            other = root / "replacement"
-            other.write_bytes(b"new")
-            other.replace(path)
-        else:
-            path.unlink()
-        try:
-            writer.write(b"lost")
-        except OSError as error:
-            assert error.errno == errno.ESTALE, error
-        else:
-            raise AssertionError("detached handle acknowledged a write")
-    with sqlite3.connect(root.parent / "tier.db") as db:
-        key, = db.execute("SELECT c.object FROM trash t JOIN copies c ON c.node=t.node WHERE original='/detach-test' ORDER BY t.id DESC LIMIT 1").fetchone()
-    assert (root.parent / "objects" / key).read_bytes() == b"modified"
-    if replace:
-        assert path.read_bytes() == b"new"
-PY
+mkdir -p "$tmp"/{objects,native,private,lock,state,cache,run}
 chmod 755 "$tmp"
-cat > "$tmp/smb.conf" <<EOF
+getent group tier >/dev/null || groupadd --system tier
+getent passwd tier-test >/dev/null || useradd --system --no-create-home --shell /usr/sbin/nologin tier-test
+tier_gid=$(getent group tier | cut -d: -f3)
+"$tier" --db "$tmp/metadata" target main "$tmp/objects"
+"$tier" --db "$tmp/metadata" policy / '{"write_cache":["main"],"persistent_storage":["main"],"persistent_copies":1,"persist_delay_secs":0}'
+setpriv --regid "$tier_gid" --clear-groups "$tier" --db "$tmp/metadata" serve --socket "$tmp/tier.sock" --admin 127.0.0.1:0 > "$tmp/tier.log" 2>&1 &
+tier_pid=$!
+for _ in {1..100}; do [[ -S "$tmp/tier.sock" ]] && break; sleep .1; done
+[[ -S "$tmp/tier.sock" ]] || { cat "$tmp/tier.log" >&2; exit 1; }
+cat > "$tmp/smb.conf" <<CONF
 [global]
 server role = standalone server
 security = user
-map to guest = bad user
 interfaces = 127.0.0.1
 bind interfaces only = yes
 smb ports = $port
+smb2 max read = 1048576
+smb2 max write = 1048576
 private dir = $tmp/private
 lock directory = $tmp/lock
 state directory = $tmp/state
@@ -91,30 +37,51 @@ cache directory = $tmp/cache
 pid directory = $tmp/run
 ncalrpc dir = $tmp/run/ncalrpc
 log file = $tmp/smb.log
-EOF
-sed -e "s|/srv/tier/share|$tmp/mnt|" -e "s/force group = tier/force group = root/" -e "s/guest ok = no/guest ok = yes/" deploy/samba-share.conf >> "$tmp/smb.conf"
-printf '    force user = root\n' >> "$tmp/smb.conf"
+[tier]
+path = /
+vfs objects = tier
+tier:socket = $tmp/tier.sock
+read only = no
+force group = tier
+kernel share modes = no
+posix locking = no
+oplocks = no
+level2 oplocks = no
+ea support = no
+store dos attributes = no
+map archive = no
+map hidden = no
+map system = no
+map readonly = no
+[native]
+path = $tmp/native
+read only = no
+force user = root
+oplocks = no
+level2 oplocks = no
+ea support = no
+store dos attributes = no
+map archive = no
+map hidden = no
+map system = no
+map readonly = no
+CONF
+password=tier-integration-test
+printf '%s\n%s\n' "$password" "$password" | smbpasswd -s -c "$tmp/smb.conf" -a root
+printf '%s\n%s\n' "$password" "$password" | smbpasswd -s -c "$tmp/smb.conf" -a tier-test
 setsid smbd --foreground --no-process-group --configfile="$tmp/smb.conf" > "$tmp/smbd.log" 2>&1 &
 smb_pid=$!
-client=(smbclient //127.0.0.1/tier -p "$port" -U 'tierguest%' -s "$tmp/smb.conf")
-for _ in {1..100}; do "${client[@]}" -c ls >/dev/null 2>&1 && break; sleep .1; done
+client=(smbclient //127.0.0.1/tier -p "$port" -U "root%$password" -s "$tmp/smb.conf")
+ready=0
+for _ in {1..100}; do if "${client[@]}" -c ls > "$tmp/list.log" 2>&1; then ready=1; break; fi; sleep .1; done
+if [[ $ready != 1 ]]; then cat "$tmp/"{list,smb,smbd,tier}.log >&2; exit 1; fi
 printf 'tier smb round trip\n' > "$tmp/input"
 "${client[@]}" -c "mkdir photos; put $tmp/input photos/draft; rename photos/draft photos/final; get photos/final $tmp/output"
 cmp "$tmp/input" "$tmp/output"
-printf '\0\377Apple metadata\0' > "$tmp/stream"
-"${client[@]}" -c "put $tmp/stream photos/final:AFP_AfpInfo; get photos/final:AFP_AfpInfo $tmp/returned-stream"
-cmp "$tmp/stream" "$tmp/returned-stream"
-"${client[@]}" -c "setmode photos +h; allinfo photos" > "$tmp/dir-info"
-grep -Ei 'attributes:.*H' "$tmp/dir-info"
-"${client[@]}" -c "setmode photos/final +rha; allinfo photos/final" > "$tmp/file-info"
-grep -Ei 'attributes:.*R' "$tmp/file-info"
-"${client[@]}" -c "setmode photos/final -rha; setmode photos -h"
-python3 - "$tmp/mnt/photos" <<'PY'
-import os,sys
-times=(1_689_123_456_123_456_700,1_689_123_456_765_432_100)
-os.utime(sys.argv[1],ns=times)
-info=os.stat(sys.argv[1])
-assert (info.st_atime_ns,info.st_mtime_ns)==times
-PY
 "${client[@]}" -c "del photos/final; rmdir photos"
-[[ ! -e "$tmp/mnt/photos" ]]
+if [[ ${TIER_BENCHMARK:-0} == 1 ]]; then
+    SMB_TEST_PORT="$port" python3 "$(dirname "$0")/smb-benchmark.py"
+fi
+SMB_TEST_ROOT="$tmp" SMB_TEST_PORT="$port" TIER_TEST_PID="$tier_pid" TIER_TEST_GID="$tier_gid" TIER_BIN="$tier" \
+    python3 "$(dirname "$0")/smb-integration.py"
+printf 'PASS Samba VFS integration\n'

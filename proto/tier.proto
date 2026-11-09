@@ -1,0 +1,96 @@
+syntax = "proto3";
+package tier.ipc;
+
+// The Unix stream carries a 24-byte big-endian header followed by this message
+// and optional raw file bytes: magic=0x54494552, version:u16=1, flags:u16=0,
+// request_id:u64, message_length:u32, data_length:u32. Responses echo request_id.
+// Both lengths are bounded by HELLO's limits. Only WRITE requests and READ
+// responses carry raw bytes. No request is automatically replayed on reconnect.
+enum Method {
+  INVALID = 0;
+  HELLO = 1;
+  ATTACH = 2;
+  STAT_AT = 3;
+  GETATTR = 4;
+  OPEN = 5;
+  SETATTR = 6;
+  MKDIR = 7;
+  RENAME = 8;
+  UNLINK = 9;
+  FSINFO = 10;
+  READ = 11;
+  WRITE = 12;
+  SYNC = 13;
+  CLOSE = 14;
+  OPENDIR = 15;
+  READDIR = 16;
+  CLOSEDIR = 17;
+  DETACH = 18;
+}
+enum Access { METADATA = 0; READ_ONLY = 1; WRITE_ONLY = 2; READ_WRITE = 3; }
+enum Disposition { EXISTING = 0; CREATE_NEW = 1; OPEN_OR_CREATE = 2; }
+message Timestamp { sint64 seconds = 1; uint32 nanos = 2; }
+message Attr {
+  string node_id = 1;
+  uint64 inode = 2;
+  bool directory = 3;
+  uint64 size = 4;
+  uint64 allocated = 5;
+  uint32 mode = 6;
+  uint32 uid = 7;
+  uint32 gid = 8;
+  uint32 nlink = 9;
+  Timestamp atime = 10;
+  Timestamp mtime = 11;
+  Timestamp ctime = 12;
+  Timestamp btime = 13;
+  uint64 version = 14;
+}
+message Changes {
+  uint64 size = 1;
+  Timestamp atime = 2;
+  Timestamp mtime = 3;
+  uint32 mode = 4;
+  bool has_size = 5;
+  bool has_mode = 6;
+  Timestamp btime = 7;
+}
+message Request {
+  Method method = 1;
+  uint64 handle = 2;
+  uint64 parent = 3;
+  string name = 4;
+  uint64 target_parent = 5;
+  string target_name = 6;
+  Access access = 7;
+  Disposition disposition = 8;
+  bool truncate = 9;
+  bool directory = 10;
+  bool replace = 11;
+  uint64 offset = 12;
+  uint32 length = 13;
+  bool stable = 14;
+  Changes changes = 15;
+  uint32 max_entries = 16;
+  uint32 max_bytes = 17;
+  uint32 protocol_version = 18;
+}
+message Entry { string name = 1; Attr attr = 2; }
+message Response {
+  // Linux errno, zero on success. Text is diagnostic only.
+  int32 error = 1;
+  string message = 2;
+  uint64 handle = 3;
+  Attr attr = 4;
+  repeated Entry entries = 5;
+  uint32 count = 6;
+  bool eof = 7;
+  bool created = 8;
+  uint64 total_bytes = 9;
+  uint64 free_bytes = 10;
+  string instance = 11;
+  uint32 protocol_version = 12;
+  uint32 max_message = 13;
+  uint32 max_data = 14;
+  uint32 max_inflight = 15;
+}

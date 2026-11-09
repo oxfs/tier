@@ -11,7 +11,7 @@ use std::{
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     db: Option<PathBuf>,
-    pub mountpoint: Option<PathBuf>,
+    pub socket: Option<PathBuf>,
     pub admin: Option<SocketAddr>,
 }
 
@@ -42,7 +42,7 @@ impl Settings {
         };
         let settings: Self =
             toml::from_str(&contents).with_context(|| format!("parse {}", path.display()))?;
-        for path in settings.db.iter().chain(&settings.mountpoint) {
+        for path in settings.db.iter().chain(&settings.socket) {
             ensure!(
                 path.is_absolute(),
                 "configured path must be absolute: {}",
@@ -58,7 +58,7 @@ impl Settings {
         }
         let dir = user_dir("XDG_STATE_HOME", ".local/state")?;
         fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        Ok(dir.join("tier.sqlite"))
+        Ok(dir.join("metadata"))
     }
 }
 
@@ -72,7 +72,7 @@ mod tests {
         assert!(Settings::load(Some(&path)).is_err());
         fs::write(
             &path,
-            "db='/srv/catalog'\nmountpoint='/srv/share'\nadmin='127.0.0.1:9840'",
+            "db='/srv/catalog'\nsocket='/run/tier/tier.sock'\nadmin='127.0.0.1:9840'",
         )
         .unwrap();
         let config = Settings::load(Some(&path)).unwrap();

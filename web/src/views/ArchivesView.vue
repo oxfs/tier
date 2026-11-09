@@ -12,7 +12,7 @@ function open(key: string, data: Record<string, unknown>) {
   <section class="panel">
     <h2>WebDAV 目标</h2>
     <div class="grid">
-      <article class="entity" v-for="a in state.cloud_targets" :key="a.name">
+      <article class="entity" v-for="a in state.archive_targets" :key="a.name">
         <h3>{{ a.name }}</h3>
         <p>{{ a.url }}</p>
         <small>
@@ -22,11 +22,11 @@ function open(key: string, data: Record<string, unknown>) {
         </small>
       </article>
     </div>
-    <p v-if="!state.cloud_targets.length" class="empty">尚未配置归档目标。</p>
+    <p v-if="!state.archive_targets.length" class="empty">尚未配置归档目标。</p>
   </section>
   <section class="panel">
     <h2>归档策略</h2>
-    <div v-for="p in state.cloud_policy" :key="p.node" class="entity">
+    <div v-for="p in state.archive_policy" :key="p.node" class="entity">
       <h3>{{ p.path }}</h3>
       <p>
         归档 {{ p.settings.copies }} 份，保留本地
@@ -38,7 +38,7 @@ function open(key: string, data: Record<string, unknown>) {
       </p>
       <button
         @click="
-          open('cloud_policy', {
+          open('archive_policy', {
             ...p.settings,
             path: p.path,
           })
@@ -47,7 +47,7 @@ function open(key: string, data: Record<string, unknown>) {
         编辑归档策略
       </button>
     </div>
-    <p v-if="!state.cloud_policy.length" class="empty">暂无归档策略。</p>
+    <p v-if="!state.archive_policy.length" class="empty">暂无归档策略。</p>
   </section>
 
   <section class="panel">

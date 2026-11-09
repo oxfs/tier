@@ -14,12 +14,12 @@ use command::Command;
 use serde_json::{Value, json};
 use std::{
     net::{SocketAddr, TcpListener},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 #[derive(Clone)]
 struct Backend {
-    engine: Arc<Mutex<Engine>>,
+    engine: Engine,
     maintenance: Arc<Maintenance>,
 }
 
@@ -57,7 +57,7 @@ pub(crate) fn start(
     let app = router(
         addr,
         Backend {
-            engine: Arc::new(Mutex::new(engine)),
+            engine,
             maintenance,
         },
     );
@@ -166,22 +166,13 @@ async fn read_trash(State(backend): State<Backend>, Query(query): Query<TrashQue
     blocking(move || {
         backend
             .engine
-            .lock()
-            .map_err(|_| anyhow::anyhow!("engine unavailable"))?
             .trash_page(query.page.unwrap_or(1), query.page_size.unwrap_or(25))
     })
     .await
 }
 
 async fn read_state(State(backend): State<Backend>) -> Response {
-    blocking(move || {
-        backend
-            .engine
-            .lock()
-            .map_err(|_| anyhow::anyhow!("engine unavailable"))?
-            .state()
-    })
-    .await
+    blocking(move || backend.engine.state()).await
 }
 async fn execute(
     State(backend): State<Backend>,
@@ -201,10 +192,11 @@ mod tests {
     fn admin_routes_enforce_origin_host_and_typed_commands() -> Result<()> {
         let root = tempfile::tempdir()?;
         let db = root.path().join("metadata.db");
+        let engine = Engine::open(&db)?;
         let server = start(
             "127.0.0.1:0".parse()?,
-            Engine::open(&db)?,
-            Arc::new(Maintenance::new(&db)),
+            engine.clone(),
+            Arc::new(Maintenance::new(engine)),
         )?;
         let origin = format!("http://{}", server.addr);
         let api = format!("{origin}/api/action");
@@ -273,12 +265,18 @@ mod tests {
         post("target", json!({"name":"disk","path":target}), 200)?;
         post(
             "policy",
-            json!({"path":"/","write_cache":["disk"],"cache_copies":1,"persistent_storage":["disk"],"persistent_copies":1,"persist_delay_secs":0}),
+            json!({"path":"/","write_cache":["disk"],"persistent_storage":["disk"],"persistent_copies":1,"persist_delay_secs":0}),
             200,
         )?;
         let path = root.path().join("snapshot.json");
         post("snapshot", json!({"path":path}), 200)?;
-        assert_eq!(crate::snapshot::load(&path)?["targets"][0]["name"], "disk");
+        assert!(
+            crate::snapshot::load(&path)?["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["key"] == "target/disk")
+        );
         let report = post("inspect", json!({"path":path,"roots":[target]}), 200)?.into_string()?;
         assert_eq!(
             serde_json::from_str::<Value>(&report)?["verified"],

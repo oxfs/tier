@@ -1,158 +1,702 @@
-use crate::core::{Engine, safe_name};
+use crate::{
+    archive::{ArchiveCopy, ArchivePolicy, ArchiveTarget, configured_client},
+    core::{Copy, Engine, Policy, Record, Target, Trash, safe_name},
+    snapshot::{self, Image},
+};
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::{params_from_iter, types::Value as Sql};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Read, Write},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::PermissionsExt,
+    },
     path::{Path, PathBuf},
 };
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
-fn rows<'a>(snapshot: &'a Value, table: &str) -> Result<&'a Vec<Value>> {
-    snapshot[table]
-        .as_array()
-        .with_context(|| format!("missing table {table}"))
+struct Catalog {
+    image: Image,
+    nodes: BTreeMap<String, Record>,
+    targets: BTreeMap<String, Target>,
+    copies: Vec<Copy>,
+    archives: BTreeMap<String, ArchiveTarget>,
+    archived: Vec<ArchiveCopy>,
+    trash: BTreeMap<String, Trash>,
+    claimed: Vec<Copy>,
 }
-fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
-    v[key].as_str().with_context(|| format!("missing {key}"))
+
+impl Catalog {
+    fn parse(value: &Value) -> Result<Self> {
+        let image = snapshot::decode(value)?;
+        let mut result = Self {
+            image,
+            nodes: BTreeMap::new(),
+            targets: BTreeMap::new(),
+            copies: Vec::new(),
+            archives: BTreeMap::new(),
+            archived: Vec::new(),
+            trash: BTreeMap::new(),
+            claimed: Vec::new(),
+        };
+        let mut keys = BTreeSet::new();
+        let mut entries = BTreeMap::new();
+        let mut policies = Vec::new();
+        let mut archive_policies = Vec::new();
+        for row in &result.image.records {
+            ensure!(keys.insert(row.key.clone()), "duplicate snapshot key");
+            let bytes = row.bytes()?;
+            let key = row.key.as_str();
+            if let Some(id) = key.strip_prefix("node/") {
+                let node: Record = decode_record(&bytes)?;
+                ensure!(
+                    node.node.id == id && (id == "root" || Uuid::parse_str(id).is_ok()),
+                    "invalid node identity"
+                );
+                if id != "root" {
+                    ensure!(
+                        safe_name(&node.name) && node.name.len() <= 255,
+                        "invalid node name"
+                    );
+                }
+                if node.node.is_dir {
+                    ensure!(
+                        node.node.size == 0
+                            && node.primary.is_none()
+                            && node.hash.is_none()
+                            && !node.dirty,
+                        "invalid directory state"
+                    );
+                }
+                if let Some(hash) = &node.hash {
+                    digest(hash)?;
+                }
+                result.nodes.insert(id.into(), node);
+            } else if key.starts_with("entry/") {
+                entries.insert(key.to_owned(), decode_record::<String>(&bytes)?);
+            } else if let Some(name) = key.strip_prefix("target/") {
+                let target: Target = decode_record(&bytes)?;
+                ensure!(
+                    target.name == name && safe_name(name) && target.path.is_absolute(),
+                    "invalid target"
+                );
+                Uuid::parse_str(&target.identity)?;
+                result.targets.insert(name.into(), target);
+            } else if key.starts_with("copy/") {
+                let copy: Copy = decode_record(&bytes)?;
+                ensure!(
+                    key == format!("copy/{}/{}", copy.node, copy.target),
+                    "invalid copy key"
+                );
+                object_key(&copy)?;
+                if let Some(hash) = &copy.hash {
+                    digest(hash)?;
+                }
+                result.copies.push(copy.clone());
+                result.claimed.push(copy);
+            } else if let Some(id) = key.strip_prefix("policy/") {
+                policies.push((id.to_owned(), decode_record::<Policy>(&bytes)?));
+            } else if let Some(id) = key.strip_prefix("archive_policy/") {
+                archive_policies.push((id.to_owned(), decode_record::<ArchivePolicy>(&bytes)?));
+            } else if let Some(name) = key.strip_prefix("archive_target/") {
+                let target: ArchiveTarget = decode_record(&bytes)?;
+                ensure!(
+                    target.name == name && safe_name(name),
+                    "invalid archive target"
+                );
+                ensure!(
+                    (target.url.starts_with("http://") || target.url.starts_with("https://"))
+                        && !target.url.contains(['?', '#', '@']),
+                    "invalid archive URL"
+                );
+                ensure!(
+                    target.user_env.is_some() == target.pass_env.is_some(),
+                    "incomplete archive credentials"
+                );
+                result.archives.insert(name.into(), target);
+            } else if key.starts_with("archive_copy/") || key.starts_with("archive_gc/") {
+                let copy: ArchiveCopy = decode_record(&bytes)?;
+                Uuid::parse_str(&copy.key)?;
+                digest(&copy.hash)?;
+                if key.starts_with("archive_copy/") {
+                    ensure!(
+                        key == format!("archive_copy/{}/{}", copy.node, copy.target),
+                        "invalid archive copy key"
+                    );
+                    result.archived.push(copy);
+                }
+            } else if key.starts_with("trash/") {
+                let trash: Trash = decode_record(&bytes)?;
+                ensure!(
+                    trash.id > 0 && key == format!("trash/{:020}", trash.id),
+                    "invalid trash key"
+                );
+                let original = trash
+                    .original
+                    .strip_prefix('/')
+                    .context("invalid trash path")?;
+                ensure!(original.split('/').all(safe_name), "invalid trash path");
+                ensure!(
+                    result.trash.insert(trash.node.clone(), trash).is_none(),
+                    "duplicate trash node"
+                );
+            } else if key.starts_with("garbage/") {
+                let copy: Copy = decode_record(&bytes)?;
+                object_key(&copy)?;
+                result.claimed.push(copy);
+            } else {
+                match key {
+                    "system/format" => ensure!(
+                        decode_record::<String>(&bytes)? == "tier-rocksdb-v1",
+                        "unsupported metadata format"
+                    ),
+                    "system/id" => ensure!(
+                        decode_record::<String>(&bytes)? == result.image.system_id,
+                        "system identity mismatch"
+                    ),
+                    "system/revision" => ensure!(
+                        decode_record::<u64>(&bytes)? == result.image.seq,
+                        "revision mismatch"
+                    ),
+                    "system/trash_seq" => {
+                        ensure!(decode_record::<i64>(&bytes)? >= 0, "invalid trash sequence")
+                    }
+                    "backup/schedule" => {
+                        let s: crate::backup::Schedule = decode_record(&bytes)?;
+                        ensure!(
+                            s.seconds > 0
+                                && s.changes > 0
+                                && s.keep > 0
+                                && s.directories.iter().all(|p| p.is_absolute()),
+                            "invalid snapshot schedule"
+                        );
+                    }
+                    _ => bail!("unknown snapshot record: {key}"),
+                }
+            }
+        }
+        for required in ["system/format", "system/id", "system/revision", "node/root"] {
+            ensure!(
+                keys.contains(required),
+                "missing snapshot record {required}"
+            );
+        }
+        let root = result.nodes.get("root").context("missing root")?;
+        ensure!(
+            root.node.is_dir && root.parent.is_none() && root.name.is_empty(),
+            "invalid root"
+        );
+        let mut expected = BTreeMap::new();
+        for (id, node) in &result.nodes {
+            if let Some(parent) = &node.parent {
+                ensure!(
+                    result.nodes.get(parent).is_some_and(|p| p.node.is_dir),
+                    "invalid parent"
+                );
+                let key = format!(
+                    "entry/{parent}/{}",
+                    unicase::UniCase::new(&node.name).to_folded_case()
+                );
+                ensure!(
+                    expected.insert(key, id.clone()).is_none(),
+                    "duplicate sibling name"
+                );
+            }
+            result.path(id)?;
+        }
+        ensure!(entries == expected, "directory index disagrees with nodes");
+        for (id, trash) in &result.trash {
+            ensure!(trash.expires >= trash.deleted, "invalid trash expiry");
+            validate_policy(&trash.policy, &result.targets)?;
+            if let Some(policy) = &trash.archive_policy {
+                validate_archive_policy(policy, &result.archives)?;
+            }
+            ensure!(
+                id != "root"
+                    && result.nodes.get(id).is_some_and(|n| n.parent.is_none())
+                    && trash.node == *id,
+                "invalid trash root"
+            );
+        }
+        let trash_seq = result
+            .image
+            .records
+            .iter()
+            .find(|row| row.key == "system/trash_seq")
+            .map(|row| decode_record::<i64>(&row.bytes()?))
+            .transpose()?
+            .unwrap_or(0);
+        ensure!(
+            result.trash.values().all(|trash| trash.id <= trash_seq),
+            "trash sequence precedes records"
+        );
+        let mut identities = BTreeSet::new();
+        for target in result.targets.values() {
+            ensure!(
+                identities.insert(&target.identity),
+                "duplicate target identity"
+            );
+        }
+        for copy in &result.claimed {
+            ensure!(
+                result.targets.contains_key(&copy.target),
+                "object target missing"
+            );
+        }
+        for node in result.nodes.values() {
+            if let Some(primary) = &node.primary {
+                ensure!(
+                    result.targets.contains_key(primary),
+                    "primary target missing"
+                );
+            }
+        }
+        for copy in &result.copies {
+            let node = result.nodes.get(&copy.node).context("copy without node")?;
+            ensure!(
+                !node.node.is_dir
+                    && copy.version <= node.node.version
+                    && result.targets.contains_key(&copy.target),
+                "invalid copy reference"
+            );
+        }
+        for copy in &result.archived {
+            let node = result
+                .nodes
+                .get(&copy.node)
+                .context("archive without node")?;
+            ensure!(
+                !node.node.is_dir
+                    && copy.version <= node.node.version
+                    && result.archives.contains_key(&copy.target),
+                "invalid archive reference"
+            );
+        }
+        for (id, policy) in policies {
+            ensure!(
+                result.nodes.get(&id).is_some_and(|n| n.node.is_dir),
+                "policy without directory"
+            );
+            validate_policy(&policy, &result.targets)?;
+        }
+        for (id, policy) in archive_policies {
+            ensure!(
+                result.nodes.get(&id).is_some_and(|n| n.node.is_dir),
+                "archive policy without directory"
+            );
+            validate_archive_policy(&policy, &result.archives)?;
+        }
+        Ok(result)
+    }
+
+    fn path(&self, id: &str) -> Result<(PathBuf, Option<i64>)> {
+        let mut cursor = id;
+        let mut parts = Vec::new();
+        let mut visited = BTreeSet::new();
+        loop {
+            ensure!(visited.insert(cursor), "directory cycle");
+            let node = self.nodes.get(cursor).context("missing parent")?;
+            if cursor == "root" {
+                return Ok((parts.iter().rev().collect(), None));
+            }
+            if let Some(parent) = node.parent.as_deref() {
+                parts.push(node.name.as_str());
+                cursor = parent;
+            } else {
+                let trash = self
+                    .trash
+                    .get(cursor)
+                    .context("detached node has no trash entry")?;
+                let mut path = PathBuf::from(trash.original.trim_start_matches('/'));
+                for part in parts.iter().rev() {
+                    path.push(part);
+                }
+                return Ok((path, Some(trash.id)));
+            }
+        }
+    }
 }
-fn object_key(v: &Value) -> Result<&str> {
-    let key = field(v, "object")?;
-    let parts: Vec<_> = key.split('/').collect();
+
+fn validate_policy(policy: &Policy, targets: &BTreeMap<String, Target>) -> Result<()> {
+    ensure!(
+        policy.write_cache.is_empty()
+            || policy.low_water < policy.high_water && policy.high_water <= 100,
+        "invalid cache watermarks"
+    );
+    ensure!(
+        !policy.write_cache.is_empty() || policy.persistent_copies > 0,
+        "empty storage policy"
+    );
+    ensure!(
+        policy.persistent_copies <= policy.persistent_storage.len(),
+        "invalid replica count"
+    );
+    ensure!(
+        !policy.direct_fallback || !policy.persistent_storage.is_empty(),
+        "fallback needs persistent storage"
+    );
+    for names in [&policy.write_cache, &policy.persistent_storage] {
+        ensure!(
+            names.iter().collect::<BTreeSet<_>>().len() == names.len(),
+            "duplicate policy target"
+        );
+        for name in names {
+            ensure!(targets.contains_key(name), "policy target missing");
+        }
+    }
+    Ok(())
+}
+fn validate_archive_policy(
+    policy: &ArchivePolicy,
+    targets: &BTreeMap<String, ArchiveTarget>,
+) -> Result<()> {
+    ensure!(
+        policy.copies <= policy.targets.len(),
+        "invalid archive replica count"
+    );
+    ensure!(
+        policy.targets.iter().collect::<BTreeSet<_>>().len() == policy.targets.len(),
+        "duplicate archive policy target"
+    );
+    for name in &policy.targets {
+        ensure!(targets.contains_key(name), "archive target missing");
+    }
+    Ok(())
+}
+
+fn decode_record<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    let (value, trailing) = postcard::take_from_bytes(bytes)?;
+    ensure!(trailing.is_empty(), "trailing bytes in snapshot record");
+    Ok(value)
+}
+
+fn digest(hash: &str) -> Result<()> {
+    ensure!(
+        hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid digest"
+    );
+    Ok(())
+}
+fn object_key(copy: &Copy) -> Result<&str> {
+    let parts = copy.object.split('/').collect::<Vec<_>>();
     ensure!(
         parts.len() == 3
             && parts[0] == "objects"
-            && parts[1] == field(v, "node")?
+            && parts[1] == copy.node
             && Uuid::parse_str(parts[1]).is_ok()
             && Uuid::parse_str(parts[2]).is_ok(),
         "invalid object path"
     );
-    Ok(key)
+    Ok(&copy.object)
+}
+fn section() -> Value {
+    json!({"verified":[],"verified_remote":[],"missing":[],"damaged":[],"missing_copies":[],"unconfirmed":[],"remote_errors":[]})
+}
+fn label(path: &Path, trash: Option<i64>) -> Value {
+    match trash {
+        Some(id) => json!({"entry":id,"path":path}),
+        None => json!(path),
+    }
+}
+fn push(report: &mut Value, key: &str, value: Value) {
+    report[key].as_array_mut().unwrap().push(value);
 }
 
-struct Entry {
+struct Device {
     path: PathBuf,
-    trash: Option<i64>,
+    handle: fs::File,
 }
-impl Entry {
-    fn label(&self) -> Value {
-        match self.trash {
-            Some(id) => json!({"entry":id,"path":self.path}),
-            None => json!(self.path),
+impl Device {
+    fn open(&self, relative: &str) -> io::Result<fs::File> {
+        let mut directory = self.handle.try_clone()?;
+        let parts = relative.split('/').collect::<Vec<_>>();
+        for (index, part) in parts.iter().enumerate() {
+            if !safe_name(part) {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            let name = std::ffi::CString::new(*part)
+                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+            let is_directory = index + 1 < parts.len();
+            let flags = libc::O_RDONLY
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | if is_directory {
+                    libc::O_DIRECTORY
+                } else {
+                    libc::O_NONBLOCK
+                };
+            // Each directory is pinned before the next component is resolved.
+            let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            directory = unsafe { fs::File::from_raw_fd(fd) };
         }
+        Ok(directory)
+    }
+    fn identity(&self) -> Result<String> {
+        let mut identity = String::new();
+        let file = self.open(".tier-id")?;
+        ensure!(
+            file.metadata()?.is_file(),
+            "target identity must be a regular file"
+        );
+        file.take(128).read_to_string(&mut identity)?;
+        Ok(Uuid::parse_str(identity.trim())?.to_string())
     }
 }
 
-fn tree(snapshot: &Value) -> Result<BTreeMap<String, Entry>> {
-    let mut links = BTreeMap::new();
-    let mut directories = HashSet::new();
-    let mut siblings = HashSet::new();
-    for row in rows(snapshot, "nodes")? {
-        let id = field(row, "id")?;
-        match row["dir"].as_i64() {
-            Some(1) => {
-                directories.insert(id);
-            }
-            Some(0) => {
-                ensure!(row["size"].as_u64().is_some(), "invalid file size");
-                let hash = field(row, "hash")?;
-                ensure!(
-                    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
-                    "invalid file digest"
-                );
-            }
-            _ => bail!("invalid node type"),
-        }
-        ensure!(
-            row["parent"].is_null() || row["parent"].is_string(),
-            "invalid parent ID"
-        );
-        if id != "root" {
-            ensure!(
-                Uuid::parse_str(id).is_ok() && safe_name(field(row, "name")?),
-                "invalid namespace entry"
-            )
-        }
-        if let Some(parent) = row["parent"].as_str() {
-            ensure!(
-                siblings.insert((parent, unicase::UniCase::new(field(row, "name")?))),
-                "duplicate sibling name"
-            );
-        }
-        ensure!(
-            links
-                .insert(id, (row["parent"].as_str(), field(row, "name")?))
-                .is_none(),
-            "duplicate node"
-        );
-    }
-    ensure!(
-        links.get("root") == Some(&(None, "")) && directories.contains("root"),
-        "invalid root"
-    );
-    let mut trash = BTreeMap::new();
-    for item in rows(snapshot, "trash")? {
-        let id = field(item, "node")?;
-        ensure!(
-            id != "root" && links.get(id).is_some_and(|(p, _)| p.is_none()),
-            "invalid trash root"
-        );
-        let original = field(item, "original")?
-            .strip_prefix('/')
-            .context("invalid trash path")?;
-        ensure!(original.split('/').all(safe_name), "invalid trash path");
-        ensure!(
-            trash
-                .insert(
-                    id,
-                    (
-                        item["id"].as_i64().context("invalid trash entry ID")?,
-                        original
-                    )
-                )
-                .is_none(),
-            "duplicate trash root"
-        );
-    }
-    let mut paths = BTreeMap::new();
-    for id in links.keys() {
-        let mut parts = Vec::new();
-        let mut cursor = *id;
-        let mut seen = HashSet::new();
-        let path = loop {
-            if cursor == "root" {
-                let mut path = PathBuf::new();
-                for name in parts.iter().rev() {
-                    path.push(name)
-                }
-                break Entry { path, trash: None };
-            }
-            ensure!(seen.insert(cursor), "directory cycle");
-            let &(parent, name) = links.get(cursor).context("missing parent")?;
-            let Some(parent) = parent else {
-                let &(entry, original) = trash
-                    .get(cursor)
-                    .context("detached node has no trash entry")?;
-                let mut path = PathBuf::from(original);
-                for name in parts.iter().rev() {
-                    path.push(name)
-                }
-                break Entry {
-                    path,
-                    trash: Some(entry),
-                };
-            };
-            ensure!(directories.contains(parent), "parent must be a directory");
-            parts.push(name);
-            cursor = parent;
+fn inspect_catalog(
+    catalog: &Catalog,
+    roots: &[PathBuf],
+    destination: Option<&Path>,
+    remote: bool,
+) -> Result<Value> {
+    let mut devices = BTreeMap::new();
+    for path in roots {
+        let handle = fs::File::open(path)?;
+        let device = Device {
+            path: fs::canonicalize(path)?,
+            handle,
         };
-        paths.insert((*id).into(), path);
+        ensure!(
+            device.handle.metadata()?.is_dir(),
+            "recovery target must be a directory"
+        );
+        let identity = device.identity()?;
+        let target = catalog
+            .targets
+            .values()
+            .find(|t| t.identity == identity.trim())
+            .context("unknown target identity")?;
+        ensure!(
+            devices.insert(target.name.clone(), device).is_none(),
+            "duplicate recovery target"
+        );
     }
-    Ok(paths)
+    if let Some(dest) = destination {
+        let parent = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let parent = fs::canonicalize(parent)?;
+        ensure!(
+            devices.values().all(|d| !parent.starts_with(&d.path)),
+            "extract outside the source devices"
+        );
+        fs::create_dir(dest).context("extraction requires a new output directory")?;
+        fs::set_permissions(dest, fs::Permissions::from_mode(0o700))?;
+    }
+    let mut live = section();
+    let mut trash = section();
+    let mut good_copies = Vec::new();
+    let mut good_archives = Vec::new();
+    for (id, node) in &catalog.nodes {
+        let (path, trash_id) = catalog.path(id)?;
+        let output = destination.filter(|_| trash_id.is_none());
+        if node.node.is_dir {
+            if let Some(out) = output {
+                fs::create_dir_all(out.join(&path))?;
+            }
+            continue;
+        }
+        let report = if trash_id.is_some() {
+            &mut trash
+        } else {
+            &mut live
+        };
+        let display = label(&path, trash_id);
+        let mut found = false;
+        if node.dirty || node.hash.is_none() {
+            push(report, "unconfirmed", display.clone());
+        }
+        for copy in catalog
+            .copies
+            .iter()
+            .filter(|c| c.node == *id && c.version == node.node.version)
+        {
+            let Some(device) = devices.get(&copy.target) else {
+                continue;
+            };
+            let display_object = device.path.join(&copy.object);
+            let mut source = match device.open(object_key(copy)?) {
+                Ok(source) => source,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    push(report, "missing_copies", json!(display_object));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            ensure!(
+                source.metadata()?.is_file(),
+                "object must be a regular file"
+            );
+            let dest = output.filter(|_| !found).map(|root| root.join(&path));
+            let mut stage = if let Some(dest) = &dest {
+                let parent = dest.parent().context("invalid extract path")?;
+                fs::create_dir_all(parent)?;
+                Some(NamedTempFile::new_in(parent)?)
+            } else {
+                None
+            };
+            let mut hash = Sha256::new();
+            let mut bytes = [0u8; 128 * 1024];
+            let mut size = 0u64;
+            loop {
+                let n = source.read(&mut bytes)?;
+                if n == 0 {
+                    break;
+                }
+                size += n as u64;
+                hash.update(&bytes[..n]);
+                if let Some(out) = &mut stage {
+                    out.write_all(&bytes[..n])?;
+                }
+            }
+            let hash = format!("{:x}", hash.finalize());
+            let valid = !node.dirty
+                && node.hash.as_ref() == Some(&hash)
+                && size == node.node.size
+                && copy.hash.as_ref() == Some(&hash);
+            if !valid {
+                push(report, "damaged", json!(display_object));
+                continue;
+            }
+            good_copies.push(format!("copy/{}/{}", copy.node, copy.target));
+            if !found {
+                if let (Some(stage), Some(dest)) = (stage, dest) {
+                    stage.as_file().sync_all()?;
+                    stage.persist_noclobber(dest)?;
+                }
+                push(report, "verified", display.clone());
+                found = true;
+            }
+        }
+        if remote && !node.dirty {
+            for copy in catalog.archived.iter().filter(|c| {
+                c.node == *id
+                    && c.version == node.node.version
+                    && Some(&c.hash) == node.hash.as_ref()
+            }) {
+                let target = &catalog.archives[&copy.target];
+                let result = configured_client(
+                    &target.url,
+                    target.user_env.as_deref(),
+                    target.pass_env.as_deref(),
+                )
+                .and_then(|client| {
+                    client.read_to(&copy.key, &copy.hash, node.node.size, &mut io::sink())
+                });
+                match result {
+                    Ok(()) => {
+                        good_archives.push(format!("archive_copy/{}/{}", copy.node, copy.target));
+                        push(
+                            report,
+                            "verified_remote",
+                            json!({"path":display,"target":copy.target}),
+                        );
+                        found = true;
+                    }
+                    Err(error) => push(
+                        report,
+                        "remote_errors",
+                        json!({"path":display,"target":copy.target,"error":format!("{error:#}")}),
+                    ),
+                }
+            }
+        }
+        if !found {
+            push(report, "missing", display);
+        }
+    }
+    let mut unclaimed = Vec::new();
+    for (name, device) in &devices {
+        let known = catalog
+            .claimed
+            .iter()
+            .filter(|c| c.target == *name)
+            .map(|c| c.object.as_str())
+            .collect::<BTreeSet<_>>();
+        let objects = match device.open("objects") {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(
+            objects.metadata()?.is_dir(),
+            "object root must be a directory"
+        );
+        for node in fs::read_dir(format!("/proc/self/fd/{}", objects.as_raw_fd()))? {
+            let node = node?;
+            if !node.file_type()?.is_dir() {
+                unclaimed.push(device.path.join("objects").join(node.file_name()));
+                continue;
+            }
+            let relative = format!(
+                "objects/{}",
+                node.file_name()
+                    .to_str()
+                    .context("invalid object directory name")?
+            );
+            let directory = device.open(&relative)?;
+            ensure!(
+                directory.metadata()?.is_dir(),
+                "object node must be a directory"
+            );
+            for file in fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
+                let file = file?;
+                let relative = PathBuf::from("objects")
+                    .join(node.file_name())
+                    .join(file.file_name());
+                if !relative.to_str().is_some_and(|p| known.contains(p)) {
+                    unclaimed.push(device.path.join(relative));
+                }
+            }
+        }
+        ensure!(
+            device.identity()? == catalog.targets[name].identity,
+            "target changed during verification"
+        );
+    }
+    if let Some(destination) = destination {
+        for (id, node) in &catalog.nodes {
+            let (path, trash) = catalog.path(id)?;
+            if node.node.is_dir && trash.is_none() {
+                fs::File::open(destination.join(path))?.sync_all()?;
+            }
+        }
+        fs::File::open(
+            destination
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )?
+        .sync_all()?;
+    }
+    live["trash"] = trash;
+    live["offline"] = json!(
+        catalog
+            .targets
+            .keys()
+            .filter(|name| !devices.contains_key(*name))
+            .collect::<Vec<_>>()
+    );
+    live["unclaimed"] = json!(unclaimed);
+    live["verified_copies"] = json!(good_copies);
+    live["verified_archives"] = json!(good_archives);
+    Ok(live)
+}
+
+pub fn inspect(snapshot: &Value, roots: &[PathBuf], destination: Option<&Path>) -> Result<Value> {
+    inspect_catalog(&Catalog::parse(snapshot)?, roots, destination, false)
+}
+
+pub fn preflight(snapshot: &Value, roots: &[PathBuf]) -> Result<Value> {
+    inspect_catalog(&Catalog::parse(snapshot)?, roots, None, true)
 }
 
 pub fn import(
@@ -161,390 +705,140 @@ pub fn import(
     targets: &BTreeMap<String, PathBuf>,
     allow_degraded: bool,
 ) -> Result<Value> {
-    tree(snapshot)?;
-    for copy in rows(snapshot, "copies")? {
-        object_key(copy)?;
-    }
-    ensure!(!dest.exists(), "destination database already exists");
-    let mut roots = Vec::new();
-    let configured = rows(snapshot, "targets")?;
-    for name in targets.keys() {
+    let catalog = Catalog::parse(snapshot)?;
+    ensure!(!dest.exists(), "destination metadata already exists");
+    for (name, path) in targets {
+        let target = catalog
+            .targets
+            .get(name)
+            .context("unknown target mapping")?;
         ensure!(
-            configured.iter().any(|t| t["name"] == *name),
-            "unknown target mapping: {name}"
+            path.is_absolute()
+                && fs::read_to_string(path.join(".tier-id"))?.trim() == target.identity,
+            "mapped target identity mismatch"
         );
     }
-    for target in configured {
-        let name = field(target, "name")?;
-        let mapped = targets.get(name);
-        let root = mapped
-            .map(PathBuf::as_path)
-            .unwrap_or(Path::new(field(target, "path")?));
-        match fs::read_to_string(root.join(".tier-id")) {
-            Ok(id) if id.trim() == field(target, "identity")? => roots.push(root.to_owned()),
-            _ if mapped.is_none() => continue,
-            _ => bail!("mapped target identity mismatch: {name}"),
-        }
-    }
-    let report = preflight(snapshot, &roots)?;
+    let roots = catalog
+        .targets
+        .iter()
+        .filter_map(|(name, target)| {
+            let path = targets.get(name).unwrap_or(&target.path);
+            fs::read_to_string(path.join(".tier-id"))
+                .ok()
+                .filter(|id| id.trim() == target.identity)
+                .map(|_| path.clone())
+        })
+        .collect::<Vec<_>>();
+    let report = inspect_catalog(&catalog, &roots, None, true)?;
     let clean = [
         "missing",
-        "missing_copies",
-        "offline",
-        "unconfirmed",
-        "remote_errors",
         "damaged",
+        "missing_copies",
+        "unconfirmed",
+        "offline",
         "unclaimed",
+        "remote_errors",
     ]
     .iter()
     .all(|key| {
-        report[key].as_array().is_some_and(Vec::is_empty)
-            && report["trash"][key].as_array().is_none_or(Vec::is_empty)
+        report[*key].as_array().is_none_or(Vec::is_empty)
+            && report["trash"][*key].as_array().is_none_or(Vec::is_empty)
     });
     ensure!(
         clean || allow_degraded,
-        "recovery requires explicit --allow-degraded after review:\n{}",
+        "recovery requires --allow-degraded after reviewing:\n{}",
         serde_json::to_string_pretty(&report)?
     );
-    // Build and validate privately; publication cannot replace an existing database.
-    let temp = NamedTempFile::new_in(
-        dest.parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new(".")),
-    )?;
-    let engine = Engine::open(temp.path())?;
-    let tx = engine.db.unchecked_transaction()?;
-    tx.execute_batch("PRAGMA defer_foreign_keys=ON; DELETE FROM nodes;")?;
-    let system_id = Uuid::parse_str(field(snapshot, "system_id")?)?;
-    tx.execute(
-        "UPDATE system_identity SET uuid=? WHERE id=1",
-        [system_id.to_string()],
-    )?;
-    for table in [
-        "nodes",
-        "xattrs",
-        "targets",
-        "copies",
-        "policies",
-        "trash",
-        "protection",
-        "pending_writes",
-        "backup_schedule",
-        "cloud_targets",
-        "cloud_policy",
-        "cloud_copies",
-    ] {
-        if table == "xattrs" && snapshot.get(table).is_none() {
-            continue;
-        }
-        let st = tx.prepare(&format!("SELECT * FROM {table} LIMIT 0"))?;
-        let columns = st
-            .column_names()
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect::<Vec<_>>();
-        drop(st);
-        let query = format!(
-            "INSERT INTO {table} ({}) VALUES ({})",
-            columns.join(","),
-            vec!["?"; columns.len()].join(",")
-        );
-        let mut insert = tx.prepare(&query)?;
-        for row in rows(snapshot, table)? {
-            let values = columns
-                .iter()
-                .map(|key| {
-                    if table == "targets"
-                        && key == "path"
-                        && let Some(path) = targets.get(field(row, "name")?)
-                    {
-                        ensure!(
-                            fs::read_to_string(path.join(".tier-id"))?.trim()
-                                == field(row, "identity")?,
-                            "target identity mismatch"
-                        );
-                        return Ok(Sql::Text(
-                            path.to_str().context("invalid target path")?.into(),
-                        ));
-                    }
-                    if table == "xattrs" && key == "value" {
-                        let encoded = field(row, key)?;
-                        ensure!(encoded.len() <= 87384, "oversized extended attribute");
-                        return Ok(Sql::Blob(base64::Engine::decode(
-                            &base64::engine::general_purpose::STANDARD,
-                            encoded,
-                        )?));
-                    }
-                    Ok(match &row[key] {
-                        Value::Null => Sql::Null,
-                        Value::String(v) => Sql::Text(v.clone()),
-                        Value::Number(v) => Sql::Integer(v.as_i64().context("invalid integer")?),
-                        _ => bail!("invalid database value"),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            insert.execute(params_from_iter(values))?;
-        }
-    }
-    tx.execute(
-        "UPDATE revision SET seq=? WHERE id=1",
-        [snapshot["seq"]
-            .as_i64()
-            .context("invalid snapshot sequence")?],
-    )?;
-    tx.commit()?;
-    engine
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let temp = tempfile::tempdir_in(parent)?;
+    let staging = temp.path().join("metadata");
+    let engine = Engine::open(&staging)?;
+    let mut options = rocksdb::WriteOptions::default();
+    options.set_sync(true);
+    let transaction = engine
+        .inner
         .db
-        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
-    drop(engine);
-    temp.as_file().sync_all()?;
-    temp.persist_noclobber(dest)?;
-    fs::File::open(
-        dest.parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new(".")),
-    )?
-    .sync_all()?;
-    Ok(report)
-}
-
-pub fn inspect(snapshot: &Value, roots: &[PathBuf], destination: Option<&Path>) -> Result<Value> {
-    let paths = tree(snapshot)?;
-    let mut devices = BTreeMap::new();
-    for path in roots {
-        let id = fs::read_to_string(path.join(".tier-id"))?;
-        let target = rows(snapshot, "targets")?
-            .iter()
-            .find(|v| v["identity"] == id.trim())
-            .context("unknown target ID")?;
-        let previous = devices.insert(field(target, "name")?.to_owned(), fs::canonicalize(path)?);
-        ensure!(
-            previous.is_none(),
-            "duplicate target identity in recovery devices"
-        );
+        .transaction_opt(&options, &rocksdb::TransactionOptions::default());
+    for entry in engine.inner.db.iterator(rocksdb::IteratorMode::Start) {
+        transaction.delete(entry?.0)?;
     }
-    if let Some(dest) = destination {
-        let parent = dest
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let resolved = fs::canonicalize(parent)?;
-        ensure!(
-            devices.values().all(|root| !resolved.starts_with(root)),
-            "extract outside the source devices"
-        );
-        fs::create_dir(dest).context("extraction requires a new output directory")?;
-    }
-    let section = || json!({"verified":[],"missing":[],"damaged":[],"missing_copies":[]});
-    let mut live = section();
-    let mut trash = section();
-    let offline = rows(snapshot, "targets")?
-        .iter()
-        .filter_map(|t| t["name"].as_str())
-        .filter(|name| !devices.contains_key(*name))
-        .collect::<Vec<_>>();
-    let mut known = HashSet::new();
-    let mut by_node = BTreeMap::<&str, Vec<&Value>>::new();
-    for copy in rows(snapshot, "copies")? {
-        if let Some(root) = devices.get(field(copy, "target")?) {
-            known.insert(root.join(object_key(copy)?));
-            by_node.entry(field(copy, "node")?).or_default().push(copy);
-        }
-    }
-    for node in rows(snapshot, "nodes")? {
-        let id = field(node, "id")?;
-        let entry = &paths[id];
-        let path = &entry.path;
-        let output = destination.filter(|_| entry.trash.is_none());
-        let report = if entry.trash.is_some() {
-            &mut trash
-        } else {
-            &mut live
-        };
-        if node["dir"] == 1 {
-            if let Some(dest) = output {
-                fs::create_dir_all(dest.join(path))?;
-            }
-            continue;
-        }
-        let mut found = false;
-        for c in by_node
-            .get(id)
-            .into_iter()
-            .flatten()
-            .filter(|c| c["hash"] == node["hash"])
+    let verified = report["verified_copies"]
+        .as_array()
+        .context("invalid recovery report")?;
+    let verified_archives = report["verified_archives"]
+        .as_array()
+        .context("invalid archive recovery report")?;
+    for row in &catalog.image.records {
+        let mut bytes = row.bytes()?;
+        if let Some(name) = row.key.strip_prefix("target/")
+            && let Some(path) = targets.get(name)
         {
-            let Some(root) = devices.get(field(c, "target")?) else {
-                continue;
-            };
-            let obj = root.join(object_key(c)?);
-            let actual = match fs::canonicalize(&obj) {
-                Ok(path) => path,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    report["missing_copies"]
-                        .as_array_mut()
-                        .unwrap()
-                        .push(json!(obj));
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            };
-            ensure!(actual.starts_with(root), "object outside device");
-            let mut source = fs::File::open(actual)?;
-            let out = output.filter(|_| !found).map(|dest| dest.join(path));
-            let mut stage = if let Some(file) = &out {
-                let parent = file.parent().context("invalid output path")?;
-                fs::create_dir_all(parent)?;
-                Some(NamedTempFile::new_in(parent)?)
-            } else {
-                None
-            };
-            let mut checksum = Sha256::new();
-            let mut length = 0u64;
-            let mut buffer = vec![0; 128 * 1024];
-            loop {
-                let n = source.read(&mut buffer)?;
-                if n == 0 {
-                    break;
-                }
-                checksum.update(&buffer[..n]);
-                if let Some(stage) = &mut stage {
-                    stage.write_all(&buffer[..n])?;
-                }
-                length += n as u64;
-            }
-            if Some(length) != node["size"].as_u64()
-                || format!("{:x}", checksum.finalize()) != field(node, "hash")?
-            {
-                report["damaged"].as_array_mut().unwrap().push(json!(obj));
-                continue;
-            }
-            if !found {
-                if let (Some(stage), Some(out)) = (stage, out) {
-                    stage.persist_noclobber(out)?;
-                }
-                report["verified"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(entry.label());
-                found = true;
-            }
+            let mut target = catalog.targets[name].clone();
+            target.path = fs::canonicalize(path)?;
+            bytes = postcard::to_allocvec(&target)?;
         }
-        if !found {
-            report["missing"]
-                .as_array_mut()
-                .unwrap()
-                .push(entry.label());
-        }
-    }
-    let mut unknown = Vec::new();
-    for root in devices.values() {
-        let objects = root.join("objects");
-        if !objects.is_dir() {
+        if row.key.starts_with("copy/") && !verified.iter().any(|v| v.as_str() == Some(&row.key)) {
             continue;
         }
-        for dir in fs::read_dir(objects)? {
-            let dir = dir?;
-            if !dir.file_type()?.is_dir() {
-                unknown.push(dir.path());
-                continue;
-            }
-            for entry in fs::read_dir(dir.path())? {
-                let p = entry?.path();
-                if !known.contains(&p) {
-                    unknown.push(p);
-                }
-            }
-        }
-    }
-    for t in rows(snapshot, "targets")? {
-        if let Some(root) = devices.get(field(t, "name")?) {
-            ensure!(
-                fs::read_to_string(root.join(".tier-id"))?.trim() == field(t, "identity")?,
-                "target changed during verification"
-            );
-        }
-    }
-    live["trash"] = trash;
-    live["offline"] = json!(offline);
-    live["unclaimed"] = json!(unknown);
-    Ok(live)
-}
-
-/// Check registered WebDAV objects as well as the supplied physical devices.
-pub fn preflight(snapshot: &Value, roots: &[PathBuf]) -> Result<Value> {
-    let mut report = inspect(snapshot, roots, None)?;
-    let paths = tree(snapshot)?;
-    for key in ["unconfirmed", "verified_remote", "remote_errors"] {
-        report[key] = json!([]);
-        report["trash"][key] = json!([]);
-    }
-    for w in rows(snapshot, "pending_writes")? {
-        let entry = paths
-            .get(field(w, "node")?)
-            .context("unknown pending write")?;
-        let section = if entry.trash.is_some() {
-            &mut report["trash"]
-        } else {
-            &mut report
-        };
-        section["unconfirmed"]
-            .as_array_mut()
-            .unwrap()
-            .push(entry.label());
-    }
-    let nodes: BTreeMap<_, _> = rows(snapshot, "nodes")?
-        .iter()
-        .map(|n| Ok((field(n, "id")?, n)))
-        .collect::<Result<_>>()?;
-    let targets: BTreeMap<_, _> = rows(snapshot, "cloud_targets")?
-        .iter()
-        .map(|t| Ok((field(t, "name")?, t)))
-        .collect::<Result<_>>()?;
-    for c in rows(snapshot, "cloud_copies")? {
-        let id = field(c, "node")?;
-        let target = field(c, "target")?;
-        let hash = field(c, "hash")?;
-        let node = nodes.get(id).context("unknown archived node")?;
-        if node["hash"] != hash {
+        if row.key.starts_with("archive_copy/")
+            && !verified_archives
+                .iter()
+                .any(|value| value.as_str() == Some(&row.key))
+        {
             continue;
         }
-        let entry = paths.get(id).context("unknown archived path")?;
-        let section = if entry.trash.is_some() {
-            &mut report["trash"]
-        } else {
-            &mut report
-        };
-        let t = targets.get(target).context("unknown archived target")?;
-        let checked = crate::archive::configured_client(
-            field(t, "url")?,
-            t["user_env"].as_str(),
-            t["pass_env"].as_str(),
+        if row.key.starts_with("archive_copy/") {
+            let mut copy: ArchiveCopy = decode_record(&bytes)?;
+            copy.checked = crate::core::now()?;
+            copy.error = None;
+            bytes = postcard::to_allocvec(&copy)?;
+        }
+        if row.key.starts_with("garbage/") || row.key.starts_with("archive_gc/") {
+            continue;
+        }
+        if let Some(id) = row.key.strip_prefix("node/") {
+            let mut node = catalog.nodes[id].clone();
+            node.primary = catalog
+                .copies
+                .iter()
+                .find(|copy| {
+                    copy.node == id
+                        && verified.iter().any(|v| {
+                            v.as_str() == Some(&format!("copy/{}/{}", copy.node, copy.target))
+                        })
+                })
+                .map(|c| c.target.clone());
+            bytes = postcard::to_allocvec(&node)?;
+        }
+        transaction.put(&row.key, bytes)?;
+    }
+    transaction.put(
+        "backup/lineage",
+        postcard::to_allocvec(&Uuid::new_v4().to_string())?,
+    )?;
+    transaction.commit()?;
+    engine.rebuild_work_queue()?;
+    engine.sync_metadata()?;
+    drop(engine);
+    // RENAME_NOREPLACE makes publishing the new database safe against a concurrent import.
+    use std::os::unix::ffi::OsStrExt;
+    let from = std::ffi::CString::new(staging.as_os_str().as_bytes())?;
+    let to = std::ffi::CString::new(dest.as_os_str().as_bytes())?;
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
         )
-        .and_then(|client| {
-            client.read_to(
-                field(c, "key")?,
-                hash,
-                node["size"].as_u64().context("invalid file size")?,
-                &mut io::sink(),
-            )
-        });
-        match checked {
-            Ok(()) => {
-                section["verified_remote"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(json!({"path":entry.label(),"target":target}));
-                section["missing"]
-                    .as_array_mut()
-                    .unwrap()
-                    .retain(|label| label != &entry.label());
-            }
-            Err(err) => section["remote_errors"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!({"path":entry.label(),"target":target,"error":err.to_string()})),
-        }
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error().into());
     }
+    fs::File::open(parent)?.sync_all()?;
     Ok(report)
 }

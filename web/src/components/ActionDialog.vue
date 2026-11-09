@@ -31,10 +31,7 @@ watch(
     report.value = undefined;
     for (const field of forms[action]) {
       const previous = props.initial[field.key];
-      values.value[field.key] = initialValue(
-        field,
-        field.key === "cache_copies" && previous === 0 ? undefined : previous,
-      );
+      values.value[field.key] = initialValue(field, previous);
     }
     await nextTick();
     if (!modal.value?.open) modal.value?.showModal();
@@ -42,7 +39,7 @@ watch(
   { immediate: true },
 );
 function options(key: string) {
-  if (key === "targets") return props.state?.cloud_targets ?? [];
+  if (key === "targets") return props.state?.archive_targets ?? [];
   if (key === "write_cache" || key === "persistent_storage")
     return props.state?.targets ?? [];
 }
@@ -115,10 +112,7 @@ async function submit() {
             {{ field.section }}
           </h3>
           <div
-            v-if="
-              (!field.cacheOnly || hasCache(values)) &&
-              (field.key !== 'fallback_count' || values.direct_fallback)
-            "
+            v-if="!field.cacheOnly || hasCache(values)"
             :class="{
               field: true,
               wide: field.kind !== 'number',

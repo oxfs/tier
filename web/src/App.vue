@@ -115,7 +115,7 @@ const shortcuts: Record<Page, string[]> = {
   overview: [],
   devices: ["target"],
   policies: ["policy", "inherit"],
-  archives: ["archive", "cloud_policy", "inherit"],
+  archives: ["archive", "archive_policy", "inherit"],
   backups: ["snapshot", "backup_schedule", "inspect"],
   trash: [],
 };
@@ -233,15 +233,11 @@ const icons = {
             </p>
             <p v-else>尚未配置持久化存储</p>
             <p v-if="p.policy.write_cache.length">
-              写入缓存 {{ p.policy.cache_copies }} 份 ·
+              缓存 ·
               {{ p.policy.write_cache.join("、") }}
             </p>
             <p v-if="p.policy.persistent_storage.length" class="muted">
-              {{
-                p.policy.write_cache.length
-                  ? `持久化延迟 ${p.policy.persist_delay_secs} 秒`
-                  : "直接写入持久化存储"
-              }}
+              关闭后 {{ p.policy.persist_delay_secs }} 秒补齐持久化副本
             </p>
             <button @click="open('policy', { ...p.policy, path: p.path })">
               编辑策略

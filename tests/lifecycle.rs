@@ -9,7 +9,7 @@ use tier::{
 
 fn policy(write_cache: &str, persistent_storage: &[&str]) -> Result<Policy> {
     Ok(serde_json::from_value(
-        json!({"write_cache":[write_cache],"cache_copies":1,"persistent_storage":persistent_storage,"persistent_copies":persistent_storage.len(),"persist_delay_secs":0}),
+        json!({"write_cache":[write_cache],"persistent_storage":persistent_storage,"persistent_copies":persistent_storage.len(),"persist_delay_secs":0}),
     )?)
 }
 
@@ -55,10 +55,9 @@ fn restore_namespace_from_snapshot_with_a_single_surviving_disk() -> Result<()> 
 
 #[test]
 fn snapshots_continue_when_one_destination_is_offline() -> Result<()> {
-    use tier::backup::{self, Schedule};
+    use tier::backup::Schedule;
     let work = tempdir()?;
     let engine = Engine::open(&work.path().join("tier.db"))?;
-    backup::init(&engine)?;
     let a = work.path().join("a");
     let b = work.path().join("b");
     fs::create_dir(&a)?;
@@ -84,39 +83,75 @@ fn snapshots_continue_when_one_destination_is_offline() -> Result<()> {
     fs::rename(&a, work.path().join("offline"))?;
     fs::create_dir(&a)?;
     engine.mkdir("/documents")?;
-    engine.backup_tick()?;
+    assert!(engine.backup_tick().is_err());
     assert!(latest(&a)?.is_empty());
     let files = latest(&b)?;
     assert_eq!(files.len(), 1);
+    let id = engine.stat("/documents")?.id;
     assert!(
-        tier::snapshot::load(&files[0].path())?["nodes"]
+        tier::snapshot::load(&files[0].path())?["records"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|n| n["name"] == "documents")
+            .any(|r| r["key"] == format!("node/{id}"))
     );
     Ok(())
 }
 
 #[test]
-fn foreground_publish_waits_for_another_catalog_writer() -> Result<()> {
+fn cloned_engine_exposes_concurrent_namespace_mutations() -> Result<()> {
     let work = tempdir()?;
-    let db = work.path().join("tier.db");
-    let engine = Engine::open(&db)?;
-    let disk = work.path().join("disk");
-    fs::create_dir(&disk)?;
-    engine.register_target("disk", &disk, None, false)?;
-    engine.set_policy("/", &policy("disk", &[])?)?;
-
-    let other = rusqlite::Connection::open(&db)?;
-    other.execute_batch("BEGIN IMMEDIATE")?;
+    let engine = Engine::open(&work.path().join("metadata"))?;
     std::thread::scope(|scope| -> Result<()> {
-        scope.spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            other.execute_batch("COMMIT").unwrap();
-        });
-        engine.put("/photo.jpg", b"latest contents")
+        let handles = (0..8)
+            .map(|i| {
+                let engine = engine.clone();
+                scope.spawn(move || engine.mkdir(&format!("/directory-{i}")))
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap()?;
+        }
+        Ok(())
     })?;
-    assert_eq!(engine.get("/photo.jpg")?, b"latest contents");
+    assert_eq!(engine.list("/")?.len(), 8);
+    assert!(Engine::open(&work.path().join("metadata")).is_err());
+    Ok(())
+}
+
+#[test]
+fn backup_bookkeeping_does_not_trigger_new_snapshots_and_retention_is_applied() -> Result<()> {
+    let work = tempdir()?;
+    let engine = Engine::open(&work.path().join("metadata"))?;
+    let destination = work.path().join("snapshots");
+    fs::create_dir(&destination)?;
+    engine.schedule(&tier::backup::Schedule {
+        directories: vec![destination.clone()],
+        seconds: 3600,
+        changes: 1,
+        keep: 2,
+        retain_days: 0,
+        hourly: 0,
+        daily: 0,
+    })?;
+    engine.schedule_backups()?;
+    let first = engine.snapshot()?["seq"].clone();
+    for _ in 0..5 {
+        engine.schedule_backups()?;
+    }
+    assert_eq!(engine.snapshot()?["seq"], first);
+    let count = || -> Result<usize> {
+        Ok(fs::read_dir(&destination)?
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|file| file.path().extension().is_some_and(|e| e == "json"))
+            .count())
+    };
+    assert_eq!(count()?, 1);
+    for i in 0..8 {
+        engine.mkdir(&format!("/directory-{i}"))?;
+        engine.schedule_backups()?;
+    }
+    assert_eq!(count()?, 2);
     Ok(())
 }

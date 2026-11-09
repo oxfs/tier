@@ -1,5 +1,4 @@
 use anyhow::Result;
-use serde_json::json;
 use std::{
     collections::HashMap,
     fs,
@@ -56,18 +55,23 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
     });
     let work = tempdir()?;
     let disk = work.path().join("disk");
+    let replica = work.path().join("replica");
     fs::create_dir(&disk)?;
-    let db = work.path().join("tier.db");
-    let engine = Engine::open(&db)?;
+    fs::create_dir(&replica)?;
+    let engine = Engine::open(&work.path().join("db"))?;
     engine.add_target("disk", &disk)?;
+    engine.register_target("replica", &replica, None, true)?;
     engine.set_policy(
         "/",
-        &serde_json::from_value(
-            json!({"write_cache":["disk"],"cache_copies":1,"persistent_storage":["disk"],"persistent_copies":1,"persist_delay_secs":0}),
-        )?,
+        &tier::core::Policy {
+            write_cache: vec!["disk".into()],
+            persistent_storage: vec!["replica".into()],
+            persistent_copies: 1,
+            ..Default::default()
+        },
     )?;
     engine.add_archive("remote", &url, None, None)?;
-    engine.set_cloud_policy(
+    engine.set_archive_policy(
         "/",
         &ArchivePolicy {
             targets: vec!["remote".into()],
@@ -79,24 +83,17 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
     engine.put("/photo", b"photo bytes")?;
     engine.reconcile()?;
     assert!(engine.archive_tick().is_err());
-    assert_eq!(engine.snapshot()?["copies"].as_array().unwrap().len(), 1);
     assert_eq!(engine.get("/photo")?, b"photo bytes");
     corrupt.store(false, Ordering::Relaxed);
     engine.archive_tick()?;
-    assert!(engine.snapshot()?["copies"].as_array().unwrap().is_empty());
-    let archived = engine.snapshot()?;
-    let report = tier::recovery::preflight(&archived, std::slice::from_ref(&disk))?;
-    assert_eq!(report["verified_remote"].as_array().unwrap().len(), 1);
-    assert_eq!(report["missing"], json!([]));
-    drop(engine);
-    let reopened = Engine::open(&db)?;
-    assert_eq!(reopened.get("/photo")?, b"photo bytes");
+    assert_eq!(engine.state()?["health"][0]["status"], "remote_only");
+    // With no local source, corrupt remote content is never accepted on recall.
     corrupt.store(true, Ordering::Relaxed);
-    assert!(reopened.get("/photo").is_err());
-    let report = tier::recovery::preflight(&archived, std::slice::from_ref(&disk))?;
-    assert_eq!(report["missing"], json!(["photo"]));
-    assert_eq!(report["remote_errors"].as_array().unwrap().len(), 1);
-    reopened.set_cloud_policy(
+    assert!(engine.get("/photo").is_err());
+    corrupt.store(false, Ordering::Relaxed);
+    assert_eq!(engine.get("/photo")?, b"photo bytes");
+    // Disabling archive retains it until persistent placement is repaired.
+    engine.set_archive_policy(
         "/",
         &ArchivePolicy {
             targets: vec![],
@@ -105,46 +102,18 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
             retain_local: 1,
         },
     )?;
-    reopened.archive_tick()?;
-    assert_eq!(
-        reopened.snapshot()?["cloud_copies"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    corrupt.store(false, Ordering::Relaxed);
-    reopened.reconcile()?;
-    reopened.archive_tick()?;
-    assert!(
-        reopened.snapshot()?["cloud_copies"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(reopened.get("/photo")?, b"photo bytes");
-    let long = work.path().join("long");
-    fs::create_dir(&long)?;
-    reopened.register_target("long", &long, None, true)?;
-    reopened.set_policy(
-        "/",
-        &serde_json::from_value(
-            json!({"write_cache":["disk"],"cache_copies":1,"persistent_storage":["long"],"persistent_copies":1,"persist_delay_secs":0}),
-        )?,
-    )?;
-    reopened.reconcile()?;
-    let snapshot = reopened.snapshot()?;
-    let replica = snapshot["copies"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["target"] == "long")
-        .unwrap();
-    fs::write(
-        long.join(replica["object"].as_str().unwrap()),
-        b"wrong bytes",
-    )?;
-    reopened.set_cloud_policy(
+    engine.reconcile()?;
+    engine.archive_tick()?;
+    assert_eq!(engine.state()?["archive_targets"][0]["object_count"], 0);
+    assert_eq!(engine.get("/photo")?, b"photo bytes");
+    // A damaged preferred local target cannot displace a healthy cache copy.
+    let id = engine.stat("/photo")?.id;
+    let object = fs::read_dir(replica.join("objects").join(id))?
+        .next()
+        .unwrap()?
+        .path();
+    fs::write(object, b"wrong bytes")?;
+    engine.set_archive_policy(
         "/",
         &ArchivePolicy {
             targets: vec!["remote".into()],
@@ -153,47 +122,11 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
             retain_local: 1,
         },
     )?;
-    reopened.archive_tick()?;
-    assert!(
-        reopened.snapshot()?["copies"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|c| c["target"] == "disk"),
-        "a corrupt preferred target cannot displace the last healthy local copy"
-    );
-    let state = reopened.snapshot()?;
-    let old = state["cloud_copies"][0]["key"].as_str().unwrap();
-    *unavailable.lock().unwrap() = format!("/dav/{old}");
-    reopened.archive_tick()?;
-    assert_ne!(reopened.snapshot()?["cloud_copies"][0]["key"], old);
-    let state = reopened.snapshot()?;
-    let repaired = state["cloud_copies"][0]["key"].as_str().unwrap();
-    let settings = |manual| {
-        serde_json::from_value(
-            json!({"write_cache":["disk"],"cache_copies":1,"persistent_storage":["long"],"persistent_copies":1,"persist_delay_secs":0,"manual_repair":manual,"repair_grace_secs":300}),
-        )
-    };
-    reopened.set_policy("/", &settings(true)?)?;
-    *unavailable.lock().unwrap() = format!("/dav/{repaired}");
-    let clock = rusqlite::Connection::open(&db)?;
-    // Advance the cached probe deadline without making the test wait an hour.
-    clock.execute(
-        "UPDATE archive_checks SET checked=0 WHERE key=?",
-        [repaired],
-    )?;
-    assert!(reopened.automatic_archive().is_err());
-    drop(reopened);
-    let restarted = Engine::open(&db)?;
-    assert!(restarted.automatic_archive().is_err());
-    assert_eq!(restarted.snapshot()?["cloud_copies"][0]["key"], repaired);
-    restarted.set_policy("/", &settings(false)?)?;
-    clock.execute(
-        "UPDATE archive_checks SET checked=0,failed_since=1 WHERE key=?",
-        [repaired],
-    )?;
-    restarted.automatic_archive()?;
-    assert_ne!(restarted.snapshot()?["cloud_copies"][0]["key"], repaired);
+    engine.archive_tick()?;
+    assert_eq!(engine.get("/photo")?, b"photo bytes");
+    corrupt.store(true, Ordering::Relaxed);
+    assert!(engine.archive_tick().is_err());
+    assert_eq!(engine.get("/photo")?, b"photo bytes");
     done.store(true, Ordering::Relaxed);
     worker.join().unwrap()?;
     Ok(())

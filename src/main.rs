@@ -10,7 +10,7 @@ struct Cli {
     /// Startup TOML (default: $XDG_CONFIG_HOME/tier/tier.toml).
     #[arg(long, global = true)]
     config: Option<PathBuf>,
-    /// Override the metadata database (default: $XDG_STATE_HOME/tier/tier.sqlite).
+    /// Override the metadata directory (default: $XDG_STATE_HOME/tier/metadata).
     #[arg(long, global = true)]
     db: Option<PathBuf>,
     #[command(subcommand)]
@@ -56,9 +56,10 @@ enum Action {
     Schedule {
         json: String,
     },
-    /// Run the filesystem, background worker and local administration UI.
+    /// Run the Samba IPC service, background workers and administration UI.
     Serve {
-        mountpoint: Option<PathBuf>,
+        #[arg(long)]
+        socket: Option<PathBuf>,
         #[arg(long)]
         admin: Option<SocketAddr>,
     },
@@ -162,7 +163,7 @@ fn main() -> Result<()> {
             user_env,
             pass_env,
         } => engine.add_archive(&name, &url, user_env.as_deref(), pass_env.as_deref()),
-        Action::ArchivePolicy { path, json } => engine.set_cloud_policy(
+        Action::ArchivePolicy { path, json } => engine.set_archive_policy(
             &path,
             &serde_json::from_str::<archive::ArchivePolicy>(&json)?,
         ),
@@ -178,12 +179,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         Action::Mkdir { path } => engine.mkdir(&path),
-        Action::Serve { mountpoint, admin } => service::serve(
+        Action::Serve { socket, admin } => service::serve(
             engine,
-            &db,
-            &mountpoint
-                .or(settings.mountpoint)
-                .context("set mountpoint in tier.toml or supply it to serve")?,
+            &socket
+                .or(settings.socket)
+                .unwrap_or_else(|| db.with_extension("sock")),
             admin
                 .or(settings.admin)
                 .unwrap_or_else(|| ([127, 0, 0, 1], 9480).into()),

@@ -5,8 +5,7 @@ use std::os::fd::AsRawFd;
 /// this descriptor even if the configured mountpoint changes underneath us.
 pub(crate) struct TargetDirectory {
     directory: fs::File,
-    root: PathBuf,
-    registered: PathBuf,
+    pub(crate) root: PathBuf,
 }
 
 impl TargetDirectory {
@@ -17,22 +16,15 @@ impl TargetDirectory {
             fs::read_to_string(root.join(".tier-id"))?.trim() == identity,
             "target identity mismatch"
         );
-        Ok(Self {
-            directory,
-            root,
-            registered,
-        })
+        Ok(Self { directory, root })
     }
-    pub(super) fn open_object(&self, key: &str) -> io::Result<fs::File> {
+    pub(crate) fn open_object(&self, key: &str) -> io::Result<fs::File> {
         fs::File::open(self.root.join(key))
     }
-    pub(super) fn remove_object(&self, key: &str) -> io::Result<()> {
+    pub(crate) fn remove_object(&self, key: &str) -> io::Result<()> {
         fs::remove_file(self.root.join(key))
     }
-    pub(super) fn cache_key(&self, key: &str) -> PathBuf {
-        self.registered.join(key)
-    }
-    pub(super) fn stat(&self) -> Result<libc::statvfs> {
+    pub(crate) fn stat(&self) -> Result<libc::statvfs> {
         let mut stat = std::mem::MaybeUninit::uninit();
         // fstatvfs initializes stat on success and cannot resolve a replacement mount.
         if unsafe { libc::fstatvfs(self.directory.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
@@ -42,41 +34,6 @@ impl TargetDirectory {
     }
 }
 
-pub(super) struct Candidates<'a> {
-    remaining: Vec<(&'a String, String)>,
-    used: HashSet<String>,
-}
-impl<'a> Candidates<'a> {
-    pub(super) fn next(&mut self) -> Option<(&'a String, String)> {
-        if self.remaining.is_empty() {
-            return None;
-        }
-        let index = self
-            .remaining
-            .iter()
-            .position(|(_, domain)| !self.used.contains(domain))
-            .unwrap_or(0);
-        Some(self.remaining.remove(index))
-    }
-    pub(super) fn confirmed(&mut self, domain: String) {
-        self.used.insert(domain);
-    }
-}
-impl Engine {
-    pub(super) fn candidates<'a>(&self, targets: &'a [String]) -> Result<Candidates<'a>> {
-        let mut query = self
-            .db
-            .prepare_cached("SELECT domain FROM targets WHERE name=?")?;
-        let remaining = targets
-            .iter()
-            .map(|name| Ok((name, query.query_row([name], |r| r.get(0))?)))
-            .collect::<Result<_>>()?;
-        Ok(Candidates {
-            remaining,
-            used: HashSet::new(),
-        })
-    }
-}
 fn detect_domain(device: u64) -> String {
     let number = format!("{}:{}", libc::major(device), libc::minor(device));
     let Ok(block) = fs::canonicalize(format!("/sys/dev/block/{number}")) else {
@@ -101,273 +58,293 @@ impl Engine {
         allow_shared: bool,
     ) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
-        ensure!(!name.is_empty(), "empty target name");
-        let device = fs::metadata(path)?.dev();
+        ensure!(safe_name(name), "invalid target name");
+        let path = fs::canonicalize(path)?;
+        ensure!(path.is_dir(), "target must be directory");
+        let device = fs::metadata(&path)?.dev();
         let detected = detect_domain(device);
         let domain = domain
-            .filter(|value| !value.is_empty())
-            .unwrap_or(&detected);
-        let others = self
-            .db
-            .prepare("SELECT path,domain FROM targets")?
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let proposed = fs::canonicalize(path)?;
-        for (other, old_domain) in others {
-            let other = PathBuf::from(other);
+            .filter(|d| !d.is_empty())
+            .unwrap_or(&detected)
+            .to_owned();
+        let _guard = self.inner.namespace.write();
+        ensure!(
+            self.kv_get::<Target>(&key("target", name))?.is_none(),
+            "target already exists"
+        );
+        for (_, other) in self.scan::<Target>("target/")? {
             ensure!(
-                !proposed.starts_with(&other) && !other.starts_with(&proposed),
+                !path.starts_with(&other.path) && !other.path.starts_with(&path),
                 "overlapping targets"
             );
-            let shared_device = fs::metadata(&other)
-                .is_ok_and(|info| info.dev() == device || detect_domain(info.dev()) == detected);
+            let same = fs::metadata(&other.path)
+                .is_ok_and(|m| m.dev() == device || detect_domain(m.dev()) == detected);
             ensure!(
-                allow_shared || (!shared_device && old_domain != domain),
+                allow_shared || (!same && other.domain != domain),
                 "target shares a device or fault domain; explicit override required"
             );
         }
-        ensure!(path.is_dir(), "target directory must exist");
-        let path = fs::canonicalize(path)?;
         let marker = path.join(".tier-id");
         let identity = match fs::read_to_string(&marker) {
-            Ok(id) => Uuid::parse_str(id.trim())?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let id = Uuid::new_v4();
+            Ok(id) => Uuid::parse_str(id.trim())?.to_string(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let id = Uuid::new_v4().to_string();
                 let mut file = fs::OpenOptions::new()
-                    .write(true)
                     .create_new(true)
+                    .write(true)
                     .open(marker)?;
-                write!(file, "{id}")?;
+                file.write_all(id.as_bytes())?;
                 file.sync_all()?;
                 fs::File::open(&path)?.sync_all()?;
                 id
             }
             Err(e) => return Err(e.into()),
         };
-        self.db.execute(
-            "INSERT INTO targets VALUES(?,?,?,?)",
-            params![
-                name,
-                path.to_str().context("invalid path encoding")?,
-                identity.to_string(),
-                domain
-            ],
-        )?;
-        Ok(())
+        ensure!(
+            !self
+                .scan::<Target>("target/")?
+                .iter()
+                .any(|(_, t)| t.identity == identity),
+            "duplicate target identity"
+        );
+        self.put_record(
+            &key("target", name),
+            &Target {
+                name: name.into(),
+                path,
+                identity,
+                domain,
+            },
+            true,
+        )
     }
     pub(crate) fn target(&self, name: &str) -> Result<TargetDirectory> {
-        let (path, id): (String, String) = self.db.query_row(
-            "SELECT path,identity FROM targets WHERE name=?",
-            [name],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        TargetDirectory::open(path.into(), &id)
+        let t: Target = self.require(&key("target", name))?;
+        TargetDirectory::open(t.path, &t.identity)
     }
     pub(crate) fn target_stat(&self, name: &str) -> Result<libc::statvfs> {
         self.target(name)?.stat()
     }
+    pub(crate) fn filesystem_stat(&self) -> Result<(u64, u64)> {
+        let mut total = 0;
+        let mut free = 0;
+        let mut devices = HashSet::new();
+        for (_, t) in self.scan::<Target>("target/")? {
+            if devices.insert(t.domain)
+                && let Ok(s) = self.target_stat(&t.name)
+            {
+                total += s.f_blocks.saturating_mul(s.f_frsize);
+                free += s.f_bavail.saturating_mul(s.f_frsize);
+            }
+        }
+        Ok((total, free))
+    }
     pub fn set_policy(&self, path: &str, p: &Policy) -> Result<()> {
         let n = self.stat(path)?;
         ensure!(n.is_dir, "policy requires directory");
-        let mut p = p.clone();
-        if p.write_cache.is_empty() {
-            p.cache_copies = 0;
-            p.direct_fallback = false;
-            p.fallback_count = None;
-        }
-        for (names, count) in [
-            (&p.write_cache, p.cache_copies),
-            (&p.persistent_storage, p.persistent_copies),
-        ] {
-            ensure!(
-                count <= names.len() && names.iter().collect::<HashSet<_>>().len() == names.len(),
-                "invalid target count"
-            );
-            for name in names {
-                self.db
-                    .query_row("SELECT 1 FROM targets WHERE name=?", [name], |_| Ok(()))?;
-            }
-        }
         ensure!(
-            p.write_cache.is_empty() || (p.low_water < p.high_water && p.high_water <= 100),
+            p.persistent_copies <= p.persistent_storage.len(),
+            "invalid replica count"
+        );
+        ensure!(
+            !p.write_cache.is_empty() || p.persistent_copies > 0,
+            "select a storage target"
+        );
+        ensure!(
+            p.write_cache.is_empty() || p.low_water < p.high_water && p.high_water <= 100,
             "invalid watermarks"
         );
-        if p.direct_fallback {
-            ensure!(
-                (1..=p.persistent_storage.len())
-                    .contains(&p.fallback_count.unwrap_or(p.persistent_copies)),
-                "invalid direct fallback count"
-            );
-        }
         ensure!(
-            if p.write_cache.is_empty() {
-                p.persistent_copies > 0
-            } else {
-                p.cache_copies > 0
-            },
-            "select at least one confirmation target"
+            !p.direct_fallback || !p.persistent_storage.is_empty(),
+            "fallback requires persistent storage"
         );
-        self.db.execute(
-            "INSERT OR REPLACE INTO policies VALUES(?,?)",
-            params![n.id, serde_json::to_string(&p)?],
-        )?;
+        for names in [&p.write_cache, &p.persistent_storage] {
+            ensure!(
+                names.iter().collect::<HashSet<_>>().len() == names.len(),
+                "duplicate target"
+            );
+            for name in names {
+                let _: Target = self.require(&key("target", name))?;
+            }
+        }
+        let _guard = self.inner.namespace.write();
+        self.put_record(&key("policy", &n.id), p, true)?;
+        for r in self.subtree(&n.id)? {
+            if !r.node.is_dir {
+                self.schedule_file(&r.node.id)?;
+            }
+        }
         Ok(())
     }
-    pub(crate) fn policy(&self, id: &str) -> Result<Policy> {
-        inherited_policy(&self.db, id)
-    }
-    pub(super) fn store<R: Read + Seek>(
-        &self,
-        target: &str,
-        id: &str,
-        data: &mut R,
-    ) -> Result<String> {
-        let target = self.target(target)?;
-        let root = &target.root;
-        let dir = root.join("objects").join(id);
-        fs::create_dir_all(&dir)?;
-        let key = format!("objects/{id}/{}", Uuid::new_v4());
-        let mut f = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(root.join(&key))?;
-        let write = (|| -> Result<()> {
-            let len = data.seek(io::SeekFrom::End(0))?;
-            data.rewind()?;
-            if len > 0 {
-                // Reserve actual blocks on the verified target before copying bytes.
-                let result =
-                    unsafe { libc::posix_fallocate(f.as_raw_fd(), 0, i64::try_from(len)?) };
-                if result != 0 {
-                    return Err(io::Error::from_raw_os_error(result).into());
-                }
-            }
-            ensure!(io::copy(data, &mut f)? == len, "source length changed");
-            f.sync_all()?;
-            for d in [&dir, &root.join("objects"), root] {
-                fs::File::open(d)?.sync_all()?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = write {
-            let _ = fs::remove_file(root.join(&key));
-            return Err(error);
-        }
-        Ok(key)
-    }
-    pub(crate) fn matches_copy(&self, target: &str, key: &str, expected: &str) -> bool {
-        self.target(target)
-            .and_then(|r| Ok(fingerprint(&mut r.open_object(key)?)?.1 == expected))
-            .unwrap_or(false)
-    }
-    pub(super) fn relieve_pressure(
+    pub(crate) fn create_object(
         &self,
         name: &str,
-        threshold: u8,
-        incoming: Option<u64>,
-    ) -> Result<()> {
+        id: &str,
+    ) -> Result<(TargetDirectory, String, fs::File)> {
         let root = self.target(name)?;
-        let utilization = || -> Result<u64> {
-            let stat = root.stat()?;
-            let required_blocks = incoming.unwrap_or(0).div_ceil(stat.f_frsize.max(1));
-            Ok(100
+        let dir = root.root.join("objects").join(id);
+        fs::create_dir_all(&dir)?;
+        let object = format!("objects/{id}/{}", Uuid::new_v4());
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(root.root.join(&object))?;
+        Ok((root, object, file))
+    }
+    pub(crate) fn sync_object(root: &TargetDirectory, object: &str, file: &fs::File) -> Result<()> {
+        file.sync_all()?;
+        let path = root.root.join(object);
+        for dir in [
+            path.parent().context("invalid object")?.to_path_buf(),
+            root.root.join("objects"),
+            root.root.clone(),
+        ] {
+            fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    }
+    pub(crate) fn matches_copy(&self, target: &str, object: &str, hash: &str) -> bool {
+        self.target(target)
+            .and_then(|t| Ok(fingerprint(&mut t.open_object(object)?)?.1 == hash))
+            .unwrap_or(false)
+    }
+    pub(crate) fn relieve_cache(
+        &self,
+        name: &str,
+        exclude: &str,
+        additional: u64,
+        high_water: u8,
+    ) -> Result<bool> {
+        let fits = || -> Result<bool> {
+            let stat = self.target_stat(name)?;
+            let free = stat.f_bavail.saturating_mul(stat.f_frsize);
+            let used = 100
                 - stat
                     .f_bavail
-                    .saturating_sub(required_blocks)
+                    .saturating_sub(additional.div_ceil(stat.f_frsize.max(1)))
                     .saturating_mul(100)
-                    / stat.f_blocks.max(1))
+                    / stat.f_blocks.max(1);
+            Ok(free >= additional && used < u64::from(high_water))
         };
-        if utilization()? < threshold as u64 {
-            return Ok(());
+        if fits()? {
+            return Ok(true);
         }
-        // Cursor is local to this connection. Each attempt inspects a bounded window.
-        self.db.execute_batch("CREATE TEMP TABLE IF NOT EXISTS reclaim_cursor(target TEXT PRIMARY KEY,node TEXT NOT NULL)")?;
-        let cursor: String = self
-            .db
-            .query_row(
-                "SELECT node FROM reclaim_cursor WHERE target=?",
-                [name],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or_default();
-        let limit = if incoming.is_some() { 8 } else { 32 };
-        let keys = self
-            .db
-            .prepare(
-                "SELECT node,object FROM copies WHERE target=? AND node>? ORDER BY node LIMIT ?",
-            )?
-            .query_map(params![name, cursor, limit], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let next = if keys.len() == limit {
-            keys.last().map(|(id, _)| id.as_str()).unwrap_or("")
-        } else {
-            ""
-        };
-        self.db.execute(
-            "INSERT OR REPLACE INTO reclaim_cursor VALUES(?,?)",
-            params![name, next],
-        )?;
-        for (id, key) in keys {
-            let tx = self.db.unchecked_transaction()?;
-            let pending: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pending_writes WHERE node=?)",
-                [&id],
-                |r| r.get(0),
-            )?;
-            if pending {
-                continue;
-            }
-            let Ok(p) = self.policy(&id) else { continue };
-            if p.persistent_storage.iter().any(|v| v == name) || p.persistent_copies == 0 {
-                continue;
-            }
-            let hash: String =
-                tx.query_row("SELECT hash FROM nodes WHERE id=?", [&id], |r| r.get(0))?;
-            let mut available = 0;
-            for target in &p.persistent_storage {
-                let sql = "SELECT object
-                    FROM copies c
-                    JOIN nodes n ON c.node=n.id
-                    WHERE node=? AND target=? AND c.hash=n.hash";
-                let other: Option<String> = tx
-                    .query_row(sql, params![id, target], |r| r.get(0))
-                    .optional()?;
-                if other.is_some_and(|k| self.cached_verified(target, &k, &hash)) {
-                    available += 1;
-                    if available >= p.persistent_copies {
-                        break;
-                    }
-                }
-            }
-            if available < p.persistent_copies {
-                continue;
-            }
-            if tx.execute(
-                "DELETE FROM copies WHERE node=? AND target=? AND object=?",
-                params![id, name, key],
-            )? > 0
+        for (_, candidate) in self.scan::<Record>("node/")? {
+            let id = &candidate.node.id;
+            if id == exclude || candidate.node.is_dir || candidate.dirty || candidate.hash.is_none()
             {
-                tx.commit()?;
-                root.remove_object(&key)?;
-                if incoming.is_none() {
-                    return Ok(());
-                }
+                continue;
             }
-            if utilization()? < threshold as u64 {
-                return Ok(());
+            let lock = self.file_lock(id);
+            let Some(mut state) = lock.try_lock() else {
+                continue;
+            };
+            if state.handles != 0 {
+                continue;
+            }
+            let mut record = self.record(id)?;
+            if record.dirty || record.node.version != candidate.node.version {
+                continue;
+            }
+            let policy = self.policy(id)?;
+            if !policy.write_cache.contains(&name.to_owned())
+                || policy.persistent_storage.contains(&name.to_owned())
+                || policy.persistent_copies == 0
+            {
+                continue;
+            }
+            let copies = self.copies(id)?;
+            let Some(old) = copies.iter().find(|c| c.target == name) else {
+                continue;
+            };
+            let hash = record.hash.as_deref().context("missing protected digest")?;
+            let verified = copies
+                .iter()
+                .filter(|c| {
+                    c.target != name
+                        && c.version == record.node.version
+                        && policy.persistent_storage.contains(&c.target)
+                        && self.matches_copy(&c.target, &c.object, hash)
+                })
+                .collect::<Vec<_>>();
+            if verified.len() < policy.persistent_copies {
+                continue;
+            }
+            let _namespace = self.inner.namespace.read();
+            if self.policy(id)? != policy {
+                continue;
+            }
+            if record.primary.as_deref() == Some(name) {
+                record.primary = Some(verified[0].target.clone());
+            }
+            let garbage = format!("garbage/{name}/{}", Uuid::new_v4());
+            self.atomic(
+                vec![
+                    Self::encoded(key("node", id), &record)?,
+                    Self::encoded(garbage.clone(), old)?,
+                ],
+                vec![format!("copy/{id}/{name}")],
+                true,
+            )?;
+            state.body = None;
+            drop(_namespace);
+            if let Ok(root) = self.target(name)
+                && root.remove_object(&old.object).is_ok()
+            {
+                self.delete_record(&garbage)?;
+            }
+            if fits()? {
+                return Ok(true);
             }
         }
-        Err(io::Error::from_raw_os_error(libc::ENOSPC)).context("target above watermark")
+        fits()
+    }
+
+    pub(crate) fn choose_target(&self, policy: &Policy, id: &str) -> Result<String> {
+        let mut cache = policy.write_cache.clone();
+        rank(&mut cache, id);
+        let mut persistent = policy.persistent_storage.clone();
+        rank(&mut persistent, id);
+        for name in cache {
+            if let Ok(s) = self.target_stat(&name) {
+                let used = 100 - s.f_bavail.saturating_mul(100) / s.f_blocks.max(1);
+                if used < u64::from(policy.high_water)
+                    || self
+                        .relieve_cache(&name, id, 0, policy.high_water)
+                        .unwrap_or(false)
+                {
+                    return Ok(name);
+                }
+            }
+        }
+        if policy.write_cache.is_empty() || policy.direct_fallback {
+            for name in persistent {
+                if let Ok(s) = self.target_stat(&name)
+                    && s.f_bavail > 0
+                {
+                    return Ok(name);
+                }
+            }
+        }
+        Err(failure(libc::ENOSPC))
+    }
+    pub(crate) fn collect_garbage(&self) -> Result<()> {
+        for (k, c) in self.scan::<Copy>("garbage/")? {
+            if let Ok(t) = self.target(&c.target) {
+                match t.remove_object(&c.object) {
+                    Ok(()) => self.delete_record(&k)?,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => self.delete_record(&k)?,
+                    Err(_) => {}
+                }
+            }
+        }
+        Ok(())
     }
 }
-
 #[cfg(test)]
-mod target_directory_tests {
+mod tests {
     use super::*;
-
     #[test]
     fn remount_cannot_redirect_reads_or_deletes() -> Result<()> {
         let tmp = tempfile::tempdir()?;

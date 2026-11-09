@@ -14,21 +14,20 @@ export interface Health {
   required: number;
   readable_local: string[];
   readable_domains: number;
-  last_copy_cancelled: number | null;
   repair: string;
+  error: string | null;
 }
 export interface Policy {
   node: string;
   path: string;
   policy: {
     write_cache: string[];
-    cache_copies: number;
     persistent_storage: string[];
     persistent_copies: number;
     persist_delay_secs: number;
   };
 }
-export interface CloudPolicy {
+export interface ArchivePolicy {
   node: string;
   path: string;
   settings: {
@@ -62,8 +61,8 @@ export interface State {
   health: Health[];
 
   policies: Policy[];
-  cloud_policy: CloudPolicy[];
-  cloud_targets: Archive[];
+  archive_policy: ArchivePolicy[];
+  archive_targets: Archive[];
 
   archive_errors: { node: string; path: string; error: string }[];
   backup_schedule: {
@@ -94,7 +93,7 @@ export const actions: Record<string, string> = {
   repair: "修复副本",
   inspect: "恢复预检",
   archive: "添加归档目标",
-  cloud_policy: "配置归档策略",
+  archive_policy: "配置归档策略",
   backup_schedule: "设置快照计划",
   snapshot: "导出快照",
   restore: "恢复文件",
@@ -104,16 +103,15 @@ export const actions: Record<string, string> = {
   target: "添加存储设备",
 };
 export const statuses: Record<string, string> = {
-  healthy: "健康",
-  waiting: "等待复制",
+  healthy: "已保护",
+  waiting: "待保护",
   writing: "正在写入",
-  unconfirmed: "写入未确认",
   remote_only: "仅远端",
   needs_attention: "待修复",
   under_replicated: "副本不足",
 };
 export const needsAttention = (s: string) =>
-  ["unconfirmed", "needs_attention", "under_replicated"].includes(s);
+  ["needs_attention", "under_replicated"].includes(s);
 export function bytes(n: number | null | undefined) {
   if (n == null) return "—";
   const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];

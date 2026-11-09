@@ -9,6 +9,7 @@ build: web
 check: web
 	cd web && npm run fmt:check
 	cd web && npm test
+	clang-format --dry-run --Werror samba/*.c samba/*.h
 	cargo fmt --check
 	cargo clippy --locked --all-targets -- -D warnings
 	cargo test --locked

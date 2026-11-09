@@ -1,85 +1,112 @@
 use super::*;
-use std::time::Duration;
-fn unix_timestamp(seconds: i64, nanos: u32) -> SystemTime {
-    if seconds < 0 {
-        UNIX_EPOCH - Duration::from_secs(seconds.unsigned_abs())
-            + Duration::from_nanos(nanos.into())
-    } else {
-        UNIX_EPOCH + Duration::new(seconds as u64, nanos)
-    }
-}
-fn timestamp_parts(time: SystemTime) -> (i64, u32) {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
-        Err(error) => {
-            let d = error.duration();
-            let nanos = d.subsec_nanos();
-            if nanos == 0 {
-                (-(d.as_secs() as i64), 0)
-            } else {
-                (-(d.as_secs() as i64) - 1, 1_000_000_000 - nanos)
+impl Engine {
+    // Never wait for body I/O while holding the namespace lock. Resolve again
+    // after waiting because a competing rename may have changed the operands.
+    fn namespace_files<T>(
+        &self,
+        resolve: impl Fn() -> Result<Vec<String>>,
+        mut operation: impl FnMut(&[parking_lot::MutexGuard<'_, FileState>]) -> Result<T>,
+    ) -> Result<T> {
+        loop {
+            let namespace = self.inner.namespace.write();
+            let mut ids = resolve()?;
+            ids.sort();
+            ids.dedup();
+            let locks = ids.iter().map(|id| self.file_lock(id)).collect::<Vec<_>>();
+            let mut guards = Vec::new();
+            let mut busy = None;
+            for lock in &locks {
+                if let Some(guard) = lock.try_lock() {
+                    guards.push(guard);
+                } else {
+                    busy = Some(lock.clone());
+                    break;
+                }
             }
+            if let Some(busy) = busy {
+                drop(guards);
+                drop(namespace);
+                drop(busy.lock());
+                continue;
+            }
+            return operation(&guards);
         }
     }
-}
-const NODE_COLUMNS: &str = "id,dir,size,coalesce(display_mtime,mtime),coalesce(display_mtime_nsec,0),display_atime,coalesce(display_atime_nsec,0)";
-fn decode_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
-    let mtime = unix_timestamp(row.get(3)?, row.get(4)?);
-    let nanos = row.get(6)?;
-    let atime = row
-        .get::<_, Option<i64>>(5)?
-        .map(|s| unix_timestamp(s, nanos))
-        .unwrap_or(mtime);
-    Ok(Node {
-        id: row.get(0)?,
-        is_dir: row.get(1)?,
-        size: row.get(2)?,
-        mtime,
-        atime,
-    })
-}
-impl Engine {
+
     pub(crate) fn stat_id(&self, id: &str) -> Result<Node> {
-        Ok(self
-            .db
-            .prepare_cached(&format!("SELECT {NODE_COLUMNS} FROM nodes WHERE id=?"))?
-            .query_row([id], decode_node)?)
+        Ok(self.record(id)?.node)
+    }
+    pub(crate) fn parent_id(&self, id: &str) -> Result<String> {
+        Ok(self.record(id)?.parent.unwrap_or_else(|| "root".into()))
     }
     pub(crate) fn stat_child(&self, parent: &str, name: &str) -> Result<Node> {
-        Ok(self
-            .db
-            .prepare_cached(&format!(
-                "SELECT {NODE_COLUMNS} FROM nodes WHERE parent=? AND name=? COLLATE tier_name"
-            ))?
-            .query_row(params![parent, name], decode_node)?)
+        let _guard = self.inner.namespace.read();
+        self.stat_child_unlocked(parent, name)
+    }
+    fn stat_child_unlocked(&self, parent: &str, name: &str) -> Result<Node> {
+        if !self.record(parent)?.node.is_dir {
+            return Err(failure(libc::ENOTDIR));
+        }
+        let id: String = self.require(&entry(parent, name))?;
+        self.stat_id(&id)
     }
     pub(crate) fn children(&self, parent: &str) -> Result<Vec<(String, Node)>> {
-        Ok(self
-            .db
-            .prepare_cached(
-                &format!("SELECT {NODE_COLUMNS},name FROM nodes WHERE parent=? ORDER BY name COLLATE tier_name"),
-            )?
-            .query_map([parent], |r| Ok((r.get(7)?, decode_node(r)?)))?
-            .collect::<rusqlite::Result<_>>()?)
+        let mut out = vec![];
+        self.visit_children(parent, |name, node| {
+            out.push((name, node));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+    pub(crate) fn visit_children(
+        &self,
+        parent: &str,
+        mut visitor: impl FnMut(String, Node) -> Result<()>,
+    ) -> Result<()> {
+        let snapshot = {
+            let _guard = self.inner.namespace.read();
+            if !self.record(parent)?.node.is_dir {
+                return Err(failure(libc::ENOTDIR));
+            }
+            self.inner.db.snapshot()
+        };
+        let prefix = format!("entry/{parent}/");
+        for item in snapshot.iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward)) {
+            let (k, v) = item?;
+            if !k.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            let id: String = Self::decode(&v)?;
+            let bytes = snapshot
+                .get(key("node", &id))?
+                .ok_or_else(|| failure(libc::ENOENT))?;
+            let r: Record = Self::decode(&bytes)?;
+            visitor(r.name, r.node)?;
+        }
+        Ok(())
     }
     pub fn stat(&self, path: &str) -> Result<Node> {
+        let _guard = self.inner.namespace.read();
+        self.lookup_unlocked(path)
+    }
+    fn lookup_unlocked(&self, path: &str) -> Result<Node> {
         if path == "/" {
             return self.stat_id("root");
         }
-        let (parent, name) = split(path)?;
-        self.stat_child(&self.stat(parent)?.id, name)
-            .with_context(|| format!("lookup {path}"))
+        ensure!(path.starts_with('/'), "invalid path");
+        let mut node = self.stat_id("root")?;
+        for name in path[1..].split('/') {
+            ensure!(safe_name(name), "invalid path");
+            node = self.stat_child_unlocked(&node.id, name)?;
+        }
+        Ok(node)
     }
     pub fn list(&self, path: &str) -> Result<Vec<String>> {
-        let node = self.stat(path)?;
-        ensure!(node.is_dir, "not a directory");
-        let mut st = self
-            .db
-            .prepare("SELECT name FROM nodes WHERE parent=? ORDER BY name COLLATE tier_name")?;
-        let items = st
-            .query_map([node.id], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(items)
+        Ok(self
+            .children(&self.stat(path)?.id)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
     }
     pub(crate) fn set_times(
         &self,
@@ -87,155 +114,368 @@ impl Engine {
         atime: Option<SystemTime>,
         mtime: Option<SystemTime>,
     ) -> Result<()> {
-        let a = atime.map(timestamp_parts);
-        let m = mtime.map(timestamp_parts);
-        let sql = "UPDATE nodes SET display_atime=coalesce(?1,display_atime),
-            display_atime_nsec=coalesce(?2,display_atime_nsec),
-            display_mtime=coalesce(?3,display_mtime),display_mtime_nsec=coalesce(?4,display_mtime_nsec)
-            WHERE id=?5 AND ((?1 IS NOT NULL AND (display_atime IS NOT ?1 OR display_atime_nsec IS NOT ?2))
-            OR (?3 IS NOT NULL AND (display_mtime IS NOT ?3 OR display_mtime_nsec IS NOT ?4)))";
-        self.db.prepare_cached(sql)?.execute(params![
-            a.map(|t| t.0),
-            a.map(|t| t.1),
-            m.map(|t| t.0),
-            m.map(|t| t.1),
-            id
-        ])?;
-        Ok(())
+        let lock = self.file_lock(id);
+        let _guard = lock.lock();
+        let mut r = self.record(id)?;
+        if let Some(t) = atime {
+            r.node.atime = t;
+        }
+        if let Some(t) = mtime {
+            r.node.mtime = t;
+        }
+        r.node.ctime = SystemTime::now();
+        self.put_record(&key("node", id), &r, false)
+    }
+    pub(crate) fn set_birth_time(&self, id: &str, time: SystemTime) -> Result<()> {
+        let lock = self.file_lock(id);
+        let _guard = lock.lock();
+        let mut r = self.record(id)?;
+        r.node.btime = time;
+        self.put_record(&key("node", id), &r, false)
     }
     pub fn inherit_policy(&self, path: &str, archive: bool) -> Result<()> {
-        let directory = self.stat(path)?;
-        ensure!(directory.is_dir, "policy requires a directory");
-        let sql = if archive {
-            "DELETE FROM cloud_policy WHERE node=?"
-        } else {
-            ensure!(
-                directory.id != "root",
-                "the root directory requires a local policy"
-            );
-            "DELETE FROM policies WHERE node=?"
-        };
-        self.db.execute(sql, [directory.id])?;
+        let n = self.stat(path)?;
+        ensure!(n.is_dir, "policy requires directory");
+        ensure!(archive || n.id != "root", "root requires storage policy");
+        let _guard = self.inner.namespace.write();
+        self.delete_record(&key(
+            if archive { "archive_policy" } else { "policy" },
+            &n.id,
+        ))?;
+        for r in self.subtree(&n.id)? {
+            if !r.node.is_dir {
+                self.schedule_file(&r.node.id)?;
+            }
+        }
         Ok(())
     }
     pub fn mkdir(&self, path: &str) -> Result<()> {
-        let (parent, name) = split(path)?;
-        let p = self.stat(parent)?;
-        ensure!(p.is_dir, "not a directory");
-        self.db.execute(
-            "INSERT INTO nodes(id,parent,name,dir,mtime) VALUES(?,?,?,1,?)",
-            params![Uuid::new_v4().to_string(), p.id, name, now()?],
+        let (p, n) = split(path)?;
+        self.mkdir_at(&self.stat(p)?.id, n).map(|_| ())
+    }
+    pub(crate) fn mkdir_at(&self, parent: &str, name: &str) -> Result<Node> {
+        self.create_node(parent, name, true, true).map(|(n, _)| n)
+    }
+    pub(crate) fn create_file_at(&self, parent: &str, name: &str, exclusive: bool) -> Result<Node> {
+        self.create_node(parent, name, false, exclusive)
+            .map(|(n, _)| n)
+    }
+    pub(crate) fn create_file_at_result(
+        &self,
+        parent: &str,
+        name: &str,
+        exclusive: bool,
+    ) -> Result<(Node, bool)> {
+        self.create_node(parent, name, false, exclusive)
+    }
+    fn create_node(
+        &self,
+        parent: &str,
+        name: &str,
+        dir: bool,
+        exclusive: bool,
+    ) -> Result<(Node, bool)> {
+        ensure!(safe_name(name), "invalid name");
+        let _guard = self.inner.namespace.write();
+        if !self.record(parent)?.node.is_dir {
+            return Err(failure(libc::ENOTDIR));
+        }
+        let k = entry(parent, name);
+        if let Some(id) = self.kv_get::<String>(&k)? {
+            if exclusive {
+                return Err(failure(libc::EEXIST));
+            }
+            let n = self.stat_id(&id)?;
+            if n.is_dir {
+                return Err(failure(libc::EISDIR));
+            }
+            return Ok((n, false));
+        }
+        let r = Record::new(
+            Uuid::new_v4().to_string(),
+            Some(parent.into()),
+            name.into(),
+            dir,
+        );
+        self.atomic(
+            vec![
+                Self::encoded(key("node", &r.node.id), &r)?,
+                Self::encoded(k, &r.node.id)?,
+            ],
+            vec![],
+            false,
         )?;
-        Ok(())
+        Ok((r.node, true))
     }
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let n = self.stat(from)?;
-        ensure!(n.id != "root", "root cannot move");
-        let (p, name) = split(to)?;
-        let p = self.stat(p)?;
-        ensure!(p.is_dir, "not a directory");
-        let sql = "WITH RECURSIVE tree(id) AS (VALUES(?)
-            UNION ALL
-            SELECT n.id
-            FROM nodes n
-            JOIN tree ON n.parent=tree.id)
-            SELECT EXISTS(
-            SELECT 1
-            FROM tree
-            WHERE id=?)";
-        let cycle: bool = self.db.query_row(sql, params![n.id, p.id], |r| r.get(0))?;
-        ensure!(!cycle, "directory cycle");
-        let tx = self.write_transaction()?;
-        if let Ok(dst) = self.stat(to)
-            && dst.id != n.id
-        {
-            ensure!(dst.is_dir == n.is_dir, "type mismatch");
-            if dst.is_dir {
-                ensure!(self.list(to)?.is_empty(), "directory not empty")
-            }
-            self.detach(&dst.id, to)?;
-        }
-        tx.execute(
-            "UPDATE nodes SET parent=?,name=? WHERE id=?",
-            params![p.id, name, n.id],
-        )?;
-        tx.commit()?;
-        Ok(())
+        let (fp, fnm) = split(from)?;
+        let (tp, tnm) = split(to)?;
+        self.rename_at(&self.stat(fp)?.id, fnm, &self.stat(tp)?.id, tnm, true)
     }
-    fn detach(&self, id: &str, path: &str) -> Result<()> {
-        let ttl = self.policy(id)?.trash_ttl_secs;
+    pub(crate) fn rename_at(
+        &self,
+        fp: &str,
+        from: &str,
+        tp: &str,
+        to: &str,
+        replace: bool,
+    ) -> Result<()> {
+        ensure!(safe_name(from) && safe_name(to), "invalid name");
+        self.namespace_files(
+            || {
+                let mut ids = vec![self.stat_child_unlocked(fp, from)?.id];
+                if let Some(id) = self.kv_get::<String>(&entry(tp, to))? {
+                    ids.push(id);
+                }
+                Ok(ids)
+            },
+            |_| {
+                let src = self.stat_child_unlocked(fp, from)?;
+                if !self.record(tp)?.node.is_dir {
+                    return Err(failure(libc::ENOTDIR));
+                }
+                let mut parent = Some(tp.to_owned());
+                while let Some(id) = parent {
+                    if id == src.id {
+                        return Err(failure(libc::EINVAL));
+                    }
+                    parent = self.record(&id)?.parent;
+                }
+                let mut puts = vec![];
+                let mut deletes = vec![entry(fp, from)];
+                let destination = self.kv_get::<String>(&entry(tp, to))?;
+                if let Some(dst) = destination
+                    && dst != src.id
+                {
+                    if !replace {
+                        return Err(failure(libc::EEXIST));
+                    }
+                    let n = self.record(&dst)?;
+                    if n.node.is_dir != src.is_dir {
+                        return Err(failure(if n.node.is_dir {
+                            libc::EISDIR
+                        } else {
+                            libc::ENOTDIR
+                        }));
+                    }
+                    if n.node.is_dir && !self.scan::<String>(&format!("entry/{dst}/"))?.is_empty() {
+                        return Err(failure(libc::ENOTEMPTY));
+                    }
+                    let original = self.path_for(&dst)?.unwrap_or_default();
+                    self.detach_mutations(n, &original, &mut puts, &mut deletes)?;
+                }
+                let mut record = self.record(&src.id)?;
+                record.parent = Some(tp.into());
+                record.name = to.into();
+                record.node.ctime = SystemTime::now();
+                puts.push(Self::encoded(key("node", &src.id), &record)?);
+                puts.push(Self::encoded(entry(tp, to), &src.id)?);
+                // Deletions precede inserts when case-only renames share the same key.
+                deletes.retain(|k| !puts.iter().any(|(p, _)| p == k));
+                self.atomic(puts, deletes, false)?;
+                for r in self.subtree(&src.id)? {
+                    if !r.node.is_dir {
+                        self.schedule_file(&r.node.id)?;
+                    }
+                }
+                Ok(())
+            },
+        )
+    }
+
+    fn detach_mutations(
+        &self,
+        mut r: Record,
+        path: &str,
+        puts: &mut Vec<(String, Vec<u8>)>,
+        deletes: &mut Vec<String>,
+    ) -> Result<()> {
+        let policy = self.policy(&r.node.id)?;
+        let archive_policy = self.archive_policy(&r.node.id)?;
+        let ttl = policy.trash_ttl_secs;
         let time = now()?;
-        self.db
-            .execute("UPDATE nodes SET parent=NULL WHERE id=?", [id])?;
-        self.db.execute(
-            "INSERT INTO trash(node,original,deleted,expires) VALUES(?,?,?,?)",
-            params![id, path, time, time.saturating_add(ttl)],
-        )?;
+        if let Some(parent) = &r.parent {
+            deletes.push(entry(parent, &r.name));
+        }
+        let next = self.kv_get::<i64>("system/trash_seq")?.unwrap_or(0) + 1;
+        let trash = Trash {
+            id: next,
+            node: r.node.id.clone(),
+            original: path.into(),
+            deleted: time,
+            expires: time.saturating_add(ttl),
+            policy,
+            archive_policy,
+        };
+        r.parent = None;
+        puts.extend([
+            Self::encoded(key("node", &r.node.id), &r)?,
+            Self::encoded(format!("trash/{next:020}"), &trash)?,
+            Self::encoded("system/trash_seq".into(), &next)?,
+        ]);
         Ok(())
     }
     pub fn remove(&self, path: &str) -> Result<()> {
-        let n = self.stat(path)?;
-        ensure!(n.id != "root", "cannot remove root");
-        let tx = self.write_transaction()?;
-        self.detach(&n.id, path)?;
-        tx.commit()?;
-        Ok(())
+        self.namespace_files(
+            || Ok(vec![self.lookup_unlocked(path)?.id]),
+            |_| {
+                let n = self.lookup_unlocked(path)?;
+                ensure!(n.id != "root", "cannot remove root");
+                let mut puts = vec![];
+                let mut deletes = vec![];
+                self.detach_mutations(self.record(&n.id)?, path, &mut puts, &mut deletes)?;
+                self.atomic(puts, deletes, false)
+            },
+        )
+    }
+    pub(crate) fn unlink_at(&self, parent: &str, name: &str, is_dir: bool) -> Result<()> {
+        self.namespace_files(
+            || Ok(vec![self.stat_child_unlocked(parent, name)?.id]),
+            |_| {
+                let n = self.stat_child_unlocked(parent, name)?;
+                if n.is_dir != is_dir {
+                    return Err(failure(if n.is_dir {
+                        libc::EISDIR
+                    } else {
+                        libc::ENOTDIR
+                    }));
+                }
+                if is_dir && !self.scan::<String>(&format!("entry/{}/", n.id))?.is_empty() {
+                    return Err(failure(libc::ENOTEMPTY));
+                }
+                let path = self.path_for(&n.id)?.unwrap_or_default();
+                let mut puts = vec![];
+                let mut deletes = vec![];
+                self.detach_mutations(self.record(&n.id)?, &path, &mut puts, &mut deletes)?;
+                self.atomic(puts, deletes, false)
+            },
+        )
     }
     pub fn restore(&self, id: i64, path: &str) -> Result<()> {
         let (p, name) = split(path)?;
-        let p = self.stat(p)?;
-        ensure!(p.is_dir, "not directory");
-        let tx = self.write_transaction()?;
-        ensure!(
-            tx.execute(
-                "UPDATE nodes SET parent=?,name=? WHERE id=(SELECT node FROM trash WHERE id=?)",
-                params![p.id, name, id]
-            )? == 1,
-            "unknown trash entry"
-        );
-        tx.execute("DELETE FROM trash WHERE id=?", [id])?;
-        tx.commit()?;
-        Ok(())
+        self.namespace_files(
+            || {
+                Ok(vec![
+                    self.require::<Trash>(&format!("trash/{id:020}"))?.node,
+                ])
+            },
+            |_| {
+                let parent = self.lookup_unlocked(p)?;
+                if !parent.is_dir {
+                    return Err(failure(libc::ENOTDIR));
+                }
+                if self.kv_get::<String>(&entry(&parent.id, name))?.is_some() {
+                    return Err(failure(libc::EEXIST));
+                }
+                let t: Trash = self.require(&format!("trash/{id:020}"))?;
+                let mut r = self.record(&t.node)?;
+                r.parent = Some(parent.id.clone());
+                r.name = name.into();
+                self.atomic(
+                    vec![
+                        Self::encoded(key("node", &t.node), &r)?,
+                        Self::encoded(entry(&parent.id, name), &t.node)?,
+                    ],
+                    vec![format!("trash/{id:020}")],
+                    false,
+                )?;
+                for r in self.subtree(&t.node)? {
+                    if !r.node.is_dir {
+                        self.schedule_file(&r.node.id)?;
+                    }
+                }
+                Ok(())
+            },
+        )
+    }
+    pub(crate) fn subtree(&self, id: &str) -> Result<Vec<Record>> {
+        let mut out = vec![];
+        let mut todo = vec![id.to_owned()];
+        while let Some(id) = todo.pop() {
+            let r = self.record(&id)?;
+            if r.node.is_dir {
+                todo.extend(
+                    self.scan::<String>(&format!("entry/{id}/"))?
+                        .into_iter()
+                        .map(|(_, id)| id),
+                );
+            }
+            out.push(r);
+        }
+        Ok(out)
     }
     pub fn purge(&self, id: i64) -> Result<()> {
-        let tx = self.write_transaction()?;
-        let node: String = tx.query_row("SELECT node FROM trash WHERE id=?", [id], |r| r.get(0))?;
-        let tree = "WITH RECURSIVE subtree(id) AS (VALUES(?) UNION ALL SELECT nodes.id FROM nodes JOIN subtree ON parent=subtree.id)";
-        let mut objects = vec![];
-        {
-            let mut st = tx.prepare(&format!(
-                "{tree} SELECT target,object FROM copies WHERE node IN subtree"
-            ))?;
-            for row in st.query_map([&node], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })? {
-                objects.push(row?)
-            }
-        }
-        for table in [
-            "copies",
-            "policies",
-            "pending_writes",
-            "protection",
-            "cloud_policy",
-            "cloud_copies",
-        ] {
-            tx.execute(
-                &format!("{tree} DELETE FROM {table} WHERE node IN subtree"),
-                [&node],
-            )?;
-        }
-        tx.execute("DELETE FROM trash WHERE id=?", [id])?;
-        tx.execute(
-            &format!("{tree} DELETE FROM nodes WHERE id IN subtree"),
-            [&node],
-        )?;
-        tx.commit()?;
-        for (name, key) in objects {
-            if let Ok(root) = self.target(&name) {
-                let _ = root.remove_object(&key);
-            }
-        }
+        self.namespace_files(
+            || {
+                let t: Trash = self.require(&format!("trash/{id:020}"))?;
+                Ok(self
+                    .subtree(&t.node)?
+                    .into_iter()
+                    .map(|r| r.node.id)
+                    .collect())
+            },
+            |guards| {
+                let t: Trash = self.require(&format!("trash/{id:020}"))?;
+                let records = self.subtree(&t.node)?;
+                ensure!(guards.iter().all(|g| g.handles == 0), "file is open");
+                let mut puts = vec![];
+                let mut deletes = vec![format!("trash/{id:020}")];
+                for r in records {
+                    let nid = &r.node.id;
+                    for c in self.copies(nid)? {
+                        puts.push(Self::encoded(
+                            format!("garbage/{}/{}", c.target, Uuid::new_v4()),
+                            &c,
+                        )?);
+                        deletes.push(format!("copy/{nid}/{}", c.target));
+                    }
+                    for (k, c) in
+                        self.scan::<crate::archive::ArchiveCopy>(&format!("archive_copy/{nid}/"))?
+                    {
+                        puts.push(Self::encoded(format!("archive_gc/{}", Uuid::new_v4()), &c)?);
+                        deletes.push(k);
+                    }
+                    for prefix in ["node", "policy", "archive_policy"] {
+                        deletes.push(key(prefix, nid));
+                    }
+                    for (k, _) in self.scan::<String>(&format!("entry/{nid}/"))? {
+                        deletes.push(k);
+                    }
+                }
+                self.atomic(puts, deletes, true)
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waiting_for_file_io_does_not_block_other_namespace_operations() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let engine = Engine::open(&root.path().join("metadata"))?;
+        engine.mkdir("/busy")?;
+        let node = engine.stat("/busy")?;
+        let file_lock = engine.file_lock(&node.id);
+        let held_io = file_lock.lock();
+        std::thread::scope(|scope| -> Result<()> {
+            let rename = scope.spawn(|| engine.rename("/busy", "/moved"));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let (send, receive) = std::sync::mpsc::channel();
+            let shared = &engine;
+            scope.spawn(move || {
+                send.send(shared.mkdir("/unrelated")).unwrap();
+            });
+            let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+            drop(held_io);
+            rename.join().unwrap()?;
+            result.context("unrelated metadata blocked behind file I/O")??;
+            Ok(())
+        })?;
+        assert!(engine.stat("/unrelated")?.is_dir);
+        assert!(engine.stat("/moved")?.is_dir);
         Ok(())
     }
 }
