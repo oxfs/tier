@@ -351,7 +351,11 @@ int tier_wait(struct tier_call *p)
 		}
 		remaining = (p->deadline.tv_sec - now.tv_sec) * 1000 +
 			    (p->deadline.tv_nsec - now.tv_nsec) / 1000000;
-		ret = poll(&fd, 1, remaining > 0 ? (int)remaining : 0);
+		if (remaining <= 0) {
+			fail(p->client, ETIMEDOUT);
+			break;
+		}
+		ret = poll(&fd, 1, (int)remaining);
 		if (ret < 0 && errno == EINTR)
 			continue;
 		if (ret <= 0) {
