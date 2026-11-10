@@ -268,16 +268,36 @@ mod tests {
             json!({"path":"/","write_cache":["disk"],"persistent_storage":["disk"],"persistent_copies":1,"persist_delay_secs":0}),
             200,
         )?;
-        let path = root.path().join("snapshot.json");
-        post("snapshot", json!({"path":path}), 200)?;
-        assert!(
-            crate::snapshot::load(&path)?["records"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|r| r["key"] == "target/disk")
+        let path = root.path().join("files.csv");
+        post("export", json!({"path":path}), 200)?;
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            "logical_path,physical_path\n/,\n"
         );
-        let report = post("inspect", json!({"path":path,"roots":[target]}), 200)?.into_string()?;
+        let export_dir = root.path().join("exports");
+        let metadata_dir = root.path().join("backups");
+        for (kind, directory) in [("export", &export_dir), ("metadata", &metadata_dir)] {
+            std::fs::create_dir(directory)?;
+            post(
+                "backup_schedule",
+                json!({"kind":kind,"enabled":false,"directories":[directory],"seconds":3600,"keep":2}),
+                200,
+            )?;
+            post("backup", json!({"kind":kind}), 200)?;
+        }
+        let state: Value = serde_json::from_reader(
+            ureq::get(&format!("{origin}/api/state"))
+                .call()?
+                .into_reader(),
+        )?;
+        assert_eq!(state["backup_schedules"].as_array().unwrap().len(), 2);
+        assert_eq!(state["backup_status"].as_array().unwrap().len(), 2);
+        let report = post(
+            "inspect",
+            json!({"path":metadata_dir,"roots":[target]}),
+            200,
+        )?
+        .into_string()?;
         assert_eq!(
             serde_json::from_str::<Value>(&report)?["verified"],
             json!([])

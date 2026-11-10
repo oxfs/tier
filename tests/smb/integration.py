@@ -1,14 +1,15 @@
 """Real SMB2/3 behavior and failure tests against an installed Tier VFS module."""
 
 import concurrent.futures
+import csv
 import errno
-import json
 import os
 import signal
 import subprocess
 import sys
 import time
 import unittest
+from pathlib import Path
 
 import smbclient
 from smbclient._os import _set_basic_information
@@ -23,7 +24,7 @@ class ConnectedTest(unittest.TestCase):
 
 
 class SMBTests(ConnectedTest):
-    def test_physical_names_and_readable_snapshot(self):
+    def test_physical_names_and_mapping_export(self):
         self.env.write("physical-before.txt", b"portable contents")
         initial = list((self.env.root / "objects").rglob("*--physical-before.txt"))
         self.assertEqual(len(initial), 1)
@@ -32,14 +33,14 @@ class SMBTests(ConnectedTest):
             self.env.path("physical-before.txt"), self.env.path(latest_name), **self.env.config
         )
         self.env.action("repair", {})
-        snapshot = self.env.root / "readable-snapshot.json"
-        self.env.action("snapshot", {"path": str(snapshot)})
-        image = json.loads(snapshot.read_text())["metadata"]
-        entry = next(item for item in image["paths"] if item["path"] == "/" + latest_name)
-        current = [copy for copy in entry["copies"] if copy["kind"] == "local" and copy["current"]]
+        mapping = self.env.root / "files.csv"
+        self.env.action("export", {"path": str(mapping)})
+        with mapping.open(newline="") as stream:
+            rows = csv.DictReader(stream)
+            self.assertEqual(rows.fieldnames, ["logical_path", "physical_path"])
+            current = [row for row in rows if row["logical_path"] == "/" + latest_name]
         self.assertEqual(len(current), 1)
-        physical = self.env.root / "objects" / current[0]["relative_path"]
-        self.assertEqual(str(physical), current[0]["physical_path"])
+        physical = Path(current[0]["physical_path"])
         self.assertTrue(physical.name.endswith("--" + latest_name))
         self.assertEqual(physical.name[:36], initial[0].name[:36])
         self.assertEqual(physical.read_bytes(), b"portable contents")

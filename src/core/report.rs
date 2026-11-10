@@ -135,12 +135,8 @@ impl Engine {
             };
             health.push(json!({"path":path,"status":status,"current":current,"required":required,"readable_local":locations,"readable_domains":domains.len(),"repair":if p.manual_repair{"manual"}else{"auto"},"error":r.error}));
         }
-        let schedule = self
-            .kv_get::<crate::backup::Schedule>(schema::BACKUP_SCHEDULE)?
-            .map(|s| vec![json!({"config":s})])
-            .unwrap_or_default();
         Ok(
-            json!({"seq":self.business_revision()?,"targets":targets,"trash_count":self.scan::<Trash>(schema::TRASH)?.len(),"archive_targets":archive_targets,"policies":policies,"archive_policy":archive_policy,"archive_errors":errors,"health":health,"backup_schedule":schedule,"backup_status":self.backup_status()?}),
+            json!({"targets":targets,"trash_count":self.scan::<Trash>(schema::TRASH)?.len(),"archive_targets":archive_targets,"policies":policies,"archive_policy":archive_policy,"archive_errors":errors,"health":health,"backup_schedules":self.backup_schedules()?,"backup_status":self.backup_status()?}),
         )
     }
 }

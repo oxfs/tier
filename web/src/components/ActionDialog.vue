@@ -132,6 +132,20 @@ async function submit() {
               :aria-describedby="field.hint ? field.key + '-hint' : undefined"
               v-model="values[field.key]"
             />
+            <select
+              v-else-if="field.kind === 'select'"
+              :id="field.key"
+              v-model="values[field.key]"
+              required
+            >
+              <option
+                v-for="choice in field.choices"
+                :key="choice.value"
+                :value="choice.value"
+              >
+                {{ choice.label }}
+              </option>
+            </select>
             <input
               v-else
               :id="field.key"

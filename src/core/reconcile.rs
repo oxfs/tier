@@ -10,10 +10,11 @@ impl Engine {
         let Some(_maintenance) = self.inner.maintenance.try_lock() else {
             return Ok(());
         };
+        self.resume_rescans()?;
         let mut errors = vec![];
-        for id in self.due_work("local", manual)? {
+        for id in self.due_work(schema::WorkKind::Local, manual)? {
             if !self.record(&id).is_ok_and(|r| !r.node.is_dir) || !self.live(&id)? {
-                self.reschedule_work("local", &id, false)?;
+                self.reschedule_work(schema::WorkKind::Local, &id, false)?;
                 continue;
             }
             let result = self.reconcile_one(&id, manual);
@@ -28,7 +29,7 @@ impl Engine {
                 }
                 errors.push(format!("{id}: {e:#}"));
             }
-            self.reschedule_work("local", &id, failed)?;
+            self.reschedule_work(schema::WorkKind::Local, &id, failed)?;
         }
         for (_, t) in self.scan::<Trash>(schema::TRASH)? {
             if t.expires <= now()?

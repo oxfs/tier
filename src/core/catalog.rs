@@ -89,7 +89,8 @@ impl Engine {
         let _guard = self.inner.namespace.read();
         self.lookup_unlocked(path)
     }
-    fn lookup_unlocked(&self, path: &str) -> Result<Node> {
+    /// Caller holds the namespace lock while resolving and using this identity.
+    pub(crate) fn lookup_unlocked(&self, path: &str) -> Result<Node> {
         if path == "/" {
             return self.stat_id("root");
         }
@@ -134,20 +135,19 @@ impl Engine {
         self.put_record(&schema::node(id), &r, false)
     }
     pub fn inherit_policy(&self, path: &str, archive: bool) -> Result<()> {
-        let n = self.stat(path)?;
+        let _guard = self.inner.namespace.write();
+        let n = self.lookup_unlocked(path)?;
         ensure!(n.is_dir, "policy requires directory");
         ensure!(archive || n.id != "root", "root requires storage policy");
-        let _guard = self.inner.namespace.write();
-        self.delete_record(&if archive {
-            schema::archive_policy(&n.id)
-        } else {
-            schema::policy(&n.id)
-        })?;
-        for r in self.subtree(&n.id)? {
-            if !r.node.is_dir {
-                self.schedule_file(&r.node.id)?;
-            }
-        }
+        self.atomic(
+            vec![Self::rescan_record(&n.id)?],
+            vec![if archive {
+                schema::archive_policy(&n.id)
+            } else {
+                schema::policy(&n.id)
+            }],
+            false,
+        )?;
         Ok(())
     }
     pub fn mkdir(&self, path: &str) -> Result<()> {
@@ -271,14 +271,8 @@ impl Engine {
                 record.node.ctime = SystemTime::now();
                 puts.push(Self::encoded(schema::node(&src.id), &record)?);
                 puts.push(Self::encoded(entry(tp, to), &src.id)?);
-                // Deletions precede inserts when case-only renames share the same key.
-                deletes.retain(|k| !puts.iter().any(|(p, _)| p == k));
+                puts.push(Self::rescan_record(&src.id)?);
                 self.atomic(puts, deletes, false)?;
-                for r in self.subtree(&src.id)? {
-                    if !r.node.is_dir {
-                        self.schedule_file(&r.node.id)?;
-                    }
-                }
                 Ok(())
             },
         )
@@ -372,15 +366,11 @@ impl Engine {
                     vec![
                         Self::encoded(schema::node(&t.node), &r)?,
                         Self::encoded(entry(&parent.id, name), &t.node)?,
+                        Self::rescan_record(&t.node)?,
                     ],
                     vec![schema::trash(id)],
                     false,
                 )?;
-                for r in self.subtree(&t.node)? {
-                    if !r.node.is_dir {
-                        self.schedule_file(&r.node.id)?;
-                    }
-                }
                 Ok(())
             },
         )
@@ -433,6 +423,7 @@ impl Engine {
                         schema::node(nid),
                         schema::policy(nid),
                         schema::archive_policy(nid),
+                        schema::rescan(nid),
                     ]);
                     for (k, _) in self.scan::<String>(&schema::entries(nid))? {
                         deletes.push(k);

@@ -66,18 +66,22 @@ pub fn serve(engine: Engine, socket: &Path, addr: SocketAddr) -> Result<()> {
         let active = &running;
         let copies = scope
             .spawn(move || periodically(active, Duration::from_secs(2), || maintenance.tick()));
-        let snapshots = engine.clone();
-        let backups = scope.spawn(move || periodically(active, Duration::from_secs(1), || {
-            if let Err(error) = snapshots.schedule_backups() {
-                tracing::error!(error = %format_args!("{error:#}"), "scheduled snapshot failed");
-            }
-        }));
+        let backups = [crate::backup::Kind::Export, crate::backup::Kind::Metadata].map(|kind| {
+            let engine = engine.clone();
+            scope.spawn(move || periodically(active, Duration::from_secs(1), || {
+                if let Err(error) = engine.schedule_backup(kind) {
+                    tracing::error!(kind = kind.as_str(), error = %format_args!("{error:#}"), "scheduled backup or export failed");
+                }
+            }))
+        });
         admin.runtime.block_on(async {
             tokio::select! { _ = terminate.recv() => (), _ = interrupt.recv() => () }
         });
         running.store(false, Ordering::Release);
         copies.thread().unpark();
-        backups.thread().unpark();
+        for backup in &backups {
+            backup.thread().unpark();
+        }
         ipc.shutdown();
     });
     engine.sync_metadata()?;

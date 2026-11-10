@@ -16,7 +16,7 @@ EXTENDS Naturals, FiniteSets, TLC
 \* together at publication is safe because that alias becomes the live mapping.
 \* The model checks these boundaries, not Rust lock implementation or liveness.
 \* It assumes successful filesystem calls and honest fsync/WAL, same filesystem
-\* hard links, atomic RocksDB transactions, and no concurrent physical unlink
+\* hard links, atomic RocksDB batches, and no concurrent physical unlink
 \* outside GC. GC drops a stale job without unlinking its current mapping.
 \* Directory cleanup must never recursively remove an object directory.
 CONSTANTS Names, CheckIntent, CheckLinkSync, CheckMappingSync, CheckGCCurrent
