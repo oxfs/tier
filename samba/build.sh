@@ -22,33 +22,41 @@ if [[ ! -d "$source_dir" ]]; then
     dpkg-source -x "${descriptors[0]}" "$source_dir"
 fi
 [[ $(dpkg-parsechangelog -l "$source_dir/debian/changelog" -S Version) == "$source_version" ]]
+cp "$repo/samba/"{vfs_tier.c,tier_client.c,tier_client.h} "$source_dir/source3/modules/"
+protoc-c -I "$repo/proto" --c_out="$source_dir/source3/modules" "$repo/proto/tier.proto"
+python3 - "$source_dir" <<'PY'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+p = root / 'source3/wscript'
+s = p.read_text()
+check = "    conf.CHECK_LIB('protobuf-c', shlib=True, mandatory=True)"
+if check not in s:
+    p.write_text(s.replace('def configure(conf):', 'def configure(conf):\n' + check, 1))
+    (root / 'bin/configured.stamp').unlink(missing_ok=True)
+p = root / 'source3/modules/wscript_build'
+s = p.read_text()
+if "bld.SAMBA3_MODULE('vfs_tier'" not in s:
+    p.write_text(s + """
+bld.SAMBA3_MODULE('vfs_tier', subsystem='vfs',
+    source='vfs_tier.c tier_client.c tier.pb-c.c',
+    deps='samba-util protobuf-c', cflags='-fvisibility=hidden',
+    init_function='', internal_module=False, enabled=True)
+""")
+PY
 cd "$source_dir"
+if command -v ccache >/dev/null; then
+    export PATH="/usr/lib/ccache:$PATH"
+    export CCACHE_BASEDIR="$work"
+fi
 make -f debian/rules bin/configured.stamp
-# samba-dev omits private VFS headers. Use Samba's own generators without
-# invoking Waf's build groups, which also build unrelated compiler helpers.
-"$repo/samba/generate-headers.sh" "$source_dir"
-
-protoc-c -I "$repo/proto" --c_out="$out" "$repo/proto/tier.proto"
-read -r -a cflags <<<"$(dpkg-buildflags --get CFLAGS)"
-read -r -a cppflags <<<"$(dpkg-buildflags --get CPPFLAGS)"
-read -r -a ldflags <<<"$(dpkg-buildflags --get LDFLAGS)"
-libdir="/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
-includes=(-I"$out" -I"$source_dir/bin/default/include" -I"$source_dir/source3"
-    -I"$source_dir/source3/include" -I"$source_dir/lib/replace" -I"$source_dir"
-    -I"$source_dir/bin/default" -I"$source_dir/bin/default/source3")
-for unit in vfs_tier tier_client; do
-    cc "${cflags[@]}" "${cppflags[@]}" "${includes[@]}" -fPIC \
-        -DHAVE_CONFIG_H=1 -D_SAMBA_BUILD_=4 -D_GNU_SOURCE=1 -D__STDC_WANT_LIB_EXT1__=1 \
-        -Werror=implicit-function-declaration -c "$repo/samba/$unit.c" -o "$out/$unit.o"
-done
-cc "${cflags[@]}" "${cppflags[@]}" -fPIC -c "$out/tier.pb-c.c" -o "$out/tier.pb-c.o"
-# All libraries are from the installed matching Debian packages. Undefined
-# symbols fail the build; there is no runtime path into this source tree.
-cc -shared "${ldflags[@]}" -Wl,-z,now -Wl,--as-needed -Wl,--no-undefined \
-    -o "$out/tier.so" "$out/vfs_tier.o" "$out/tier_client.o" "$out/tier.pb-c.o" \
-    -lsamba-util -ltevent -ltalloc -lsmbconf -ltevent-util -lprotobuf-c \
-    -L"$libdir/samba" -l:libsmbd-base-private-samba.so.0 \
-    -l:libreplace-private-samba.so.0 -l:libsamba-debug-private-samba.so.0 \
-    -l:libsmbd-shim-private-samba.so.0
+PYTHONHASHSEED=1 ./buildtools/bin/waf build --targets=vfs_tier -j "${JOBS:-2}"
+module=bin/modules/vfs/tier.so
+[[ $(nm -D --defined-only --format=posix "$module" | awk '$2 != "A" {sub(/@.*/, "", $1); print $1}') == samba_init_module ]]
+if readelf -d "$module" | grep -E '(RPATH|RUNPATH)' | grep -F "$work"; then
+    echo 'Module contains a build-directory runtime path' >&2
+    exit 1
+fi
+install -m755 "$module" "$out/tier.so"
 printf '%s\n' "$version" >"$out/samba-version"
 printf '%s\n' "$(dpkg --print-architecture)" >"$out/architecture"

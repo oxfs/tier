@@ -69,14 +69,32 @@ jobs:
       - name: Verify release version
         if: startsWith(github.ref, 'refs/tags/v')
         run: test "v$(target/release/tier --version | cut -d' ' -f2)" = "$GITHUB_REF_NAME"
-      - name: Build Debian Samba package
+      - name: Prepare Debian build environment
+        id: samba-environment
         run: |
           mkdir -p "$RUNNER_TEMP/tier-debian"
-          docker run --rm \
+          docker run -d --name tier-builder \
             -v "$PWD:/workspace" \
             -v "$RUNNER_TEMP/tier-debian:/build" \
             -e TIER_BIN=/workspace/target/release/tier \
-            -w /workspace debian:13-slim /workspace/ci/build-debian.sh
+            -w /workspace debian:13-slim sleep infinity
+          docker exec tier-builder /workspace/ci/build-debian.sh prepare
+          echo "key=$(cat "$RUNNER_TEMP/tier-debian/environment-key")" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: samba-cache
+        with:
+          path: ${{ runner.temp }}/tier-debian/ccache
+          key: samba-${{ steps.samba-environment.outputs.key }}-${{ hashFiles('samba/build.sh', 'ci/build-debian.sh') }}-${{ github.sha }}
+          restore-keys: |
+            samba-${{ steps.samba-environment.outputs.key }}-${{ hashFiles('samba/build.sh', 'ci/build-debian.sh') }}-
+      - name: Build Debian Samba package
+        id: samba-build
+        run: docker exec tier-builder /workspace/ci/build-debian.sh
+      - uses: actions/cache/save@v4
+        if: ${{ !cancelled() && steps.samba-build.outcome == 'success' && steps.samba-cache.outputs.cache-primary-key != '' && steps.samba-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: ${{ runner.temp }}/tier-debian/ccache
+          key: ${{ steps.samba-cache.outputs.cache-primary-key }}
       - name: Test package in clean Debian runtime
         run: |
           docker run --rm \
@@ -90,3 +108,6 @@ jobs:
           name: tier-debian13-amd64
           path: ${{ runner.temp }}/tier-debian/artifacts/*
           if-no-files-found: warn
+      - name: Remove build container
+        if: always()
+        run: docker rm -f tier-builder || true
