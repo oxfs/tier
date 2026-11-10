@@ -2,6 +2,34 @@ db = "/var/lib/tier/metadata"
 socket = "/run/tier/tier.sock"
 admin = "127.0.0.1:9480"
 
+# Restart Tier after changing runtime settings. Tokio scheduling follows CPU availability.
+[runtime]
+max_blocking_threads = 32
+# worker_threads is omitted to follow available CPUs; set a positive count to override.
+admin_request_limit = 2
+background_task_limit = 1
+
+# Requests are bounded before entering the blocking pool.
+# Data/control buffers use positive multiples of 4 MiB per request/reply slot.
+# These buffer budgets do not include decoded metadata or RocksDB memory.
+[ipc]
+max_connections = 64
+# The Samba client currently uses at most 32 in-flight requests per connection.
+max_inflight_per_connection = 32
+max_running_requests = 128
+max_handles_per_connection = 4096
+data_buffer_mib = 128
+control_buffer_mib = 128
+connection_data_buffer_mib = 16
+connection_control_buffer_mib = 16
+# Samba also enforces its own 60-second request deadline.
+reply_timeout_secs = 30
+# Directory cursors spill to disk when their memory budget is exhausted.
+global_cursor_memory_mib = 128
+connection_cursor_memory_mib = 64
+per_cursor_memory_kib = 256
+cursor_buffer_kib = 64
+
 # Restart Tier after changing these settings. Cache + write buffers are not a
 # total process-memory limit; leave room for indexes, compaction and file cache.
 [rocksdb]

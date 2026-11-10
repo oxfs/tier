@@ -12,9 +12,11 @@ Tier 将 NAS 上的多个存储目录组织成一个 SMB 共享，通过 Web 控
 
 使用 x86-64 和 Debian 官方源的 Samba。从 [Releases](https://github.com/RainMark/tier/releases) 下载 `tier-debian13-amd64.tar.gz` 与 `SHA256SUMS` 到同一目录；安装程序会检查架构和完整 Samba 包版本是否匹配。
 
+0.5 版本使用新的存储格式，不支持从旧版 FUSE/SQLite 安装原地升级。
+
 ```sh
 sudo apt update
-sudo apt install samba libprotobuf-c1
+sudo apt install samba libprotobuf-c1 libjemalloc2
 sha256sum --check SHA256SUMS
 tar -xzf tier-debian13-amd64.tar.gz
 cd tier-debian13-amd64

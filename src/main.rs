@@ -221,6 +221,8 @@ fn main() -> Result<()> {
             admin
                 .or(settings.admin)
                 .unwrap_or_else(|| ([127, 0, 0, 1], 9480).into()),
+            &settings.runtime,
+            &settings.ipc,
         ),
         Action::Restore { .. } | Action::Inspect { .. } | Action::Backups { .. } => unreachable!(),
     }

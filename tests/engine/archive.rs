@@ -1,10 +1,11 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::{
     collections::HashMap,
     fs,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::Duration,
@@ -12,6 +13,83 @@ use std::{
 use tempfile::tempdir;
 use tier::{archive::ArchivePolicy, core::Engine};
 use tiny_http::{Method, Response, Server};
+
+#[test]
+fn discarded_upload_cleanup_does_not_block_namespace_writes() -> Result<()> {
+    let http = Server::http("127.0.0.1:0").map_err(|e| anyhow::anyhow!("{e}"))?;
+    let work = tempdir()?;
+    let disk = work.path().join("disk");
+    fs::create_dir(&disk)?;
+    let engine = Engine::open(&work.path().join("db"))?;
+    engine.add_target("disk", &disk)?;
+    engine.set_policy(
+        "/",
+        &tier::core::Policy {
+            write_cache: vec!["disk".into()],
+            low_water: 99,
+            high_water: 100,
+            ..Default::default()
+        },
+    )?;
+    engine.add_archive(
+        "remote",
+        &format!("http://{}/dav", http.server_addr()),
+        None,
+        None,
+    )?;
+    engine.set_archive_policy(
+        "/",
+        &ArchivePolicy {
+            targets: vec!["remote".into()],
+            copies: 1,
+            delay_secs: 0,
+            retain_local: 1,
+        },
+    )?;
+    let contents = b"photo bytes";
+    engine.put("/photo", contents)?;
+
+    thread::scope(|scope| -> Result<()> {
+        let archive = scope.spawn(|| engine.archive_tick());
+        let receive = || {
+            http.recv_timeout(Duration::from_secs(5))?
+                .context("expected WebDAV request")
+        };
+        let mut upload = receive()?;
+        assert_eq!(upload.method(), &Method::Put);
+        let object = upload.url().to_owned();
+        let mut body = Vec::new();
+        upload.as_reader().read_to_end(&mut body)?;
+        assert_eq!(body, contents);
+        // Change the name before upload completes so publication must discard it.
+        engine.rename("/photo", "/renamed")?;
+        upload.respond(Response::empty(201))?;
+        let verification = receive()?;
+        assert_eq!(verification.method(), &Method::Get);
+        assert_eq!(verification.url(), object);
+        verification.respond(Response::from_data(body))?;
+        let cleanup = receive()?;
+        assert_eq!(cleanup.method(), &Method::Delete);
+        assert_eq!(cleanup.url(), object);
+
+        let (send, receive) = mpsc::channel();
+        let shared = &engine;
+        let mkdir = scope.spawn(move || {
+            send.send(shared.mkdir("/unrelated")).unwrap();
+        });
+        let result = receive.recv_timeout(Duration::from_secs(2));
+        // Always release the remote request before asserting, including on failure.
+        cleanup.respond(Response::empty(204))?;
+        archive.join().unwrap()?;
+        mkdir.join().unwrap();
+        result.context("namespace write blocked behind remote cleanup")??;
+        Ok(())
+    })?;
+    assert!(engine.stat("/unrelated")?.is_dir);
+    assert_eq!(engine.get("/renamed")?, contents);
+    assert_eq!(engine.state()?["archive_targets"][0]["object_count"], 0);
+    Ok(())
+}
 
 #[test]
 fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {

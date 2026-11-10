@@ -333,13 +333,14 @@ impl Engine {
             let object = client.upload(&mut source, hash, &r.name)?;
             let lock = self.file_lock(id);
             let guard = lock.lock();
-            let _namespace = self.inner.namespace.read();
+            let namespace = self.inner.namespace.read();
             let latest = self.record(id)?;
             if guard.writer
                 || latest.node.version != r.node.version
                 || latest.name != r.name
                 || self.archive_policy(id)?.as_ref() != Some(&p)
             {
+                drop(namespace);
                 drop(guard);
                 client.remove(&object)?;
                 return Ok(());

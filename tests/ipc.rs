@@ -1,16 +1,20 @@
 use anyhow::{Context, Result};
 use prost::Message;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{Cursor, Read, Write},
+    net::Shutdown,
     os::unix::net::{UnixListener, UnixStream},
     path::Path,
     time::Duration,
 };
 use tier::{
     core::{Engine, Policy},
-    ipc::{Frame, IpcServer, MAGIC, MAX_DATA, MAX_MESSAGE, VERSION, protocol::*},
+    ipc::{
+        Frame, IpcOptions, IpcServer, MAGIC, MAX_DATA, MAX_INFLIGHT, MAX_MESSAGE, VERSION,
+        protocol::*,
+    },
 };
 
 struct Client {
@@ -22,6 +26,7 @@ impl Client {
     fn connect(path: &Path) -> Result<Self> {
         let stream = UnixStream::connect(path)?;
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
         let mut client = Self {
             stream,
             next: 1,
@@ -54,7 +59,7 @@ impl Client {
         Ok(id)
     }
     fn receive(&mut self) -> Result<(u64, Response, Vec<u8>)> {
-        let frame = Frame::read(&mut self.stream)?.unwrap();
+        let frame = Frame::read(&mut self.stream)?.context("IPC connection closed before reply")?;
         Ok((
             frame.id,
             Response::decode(frame.message.as_slice())?,
@@ -85,7 +90,55 @@ impl Client {
             .handle)
     }
 }
-fn fixture() -> Result<(tempfile::TempDir, Engine, IpcServer)> {
+struct TestServer {
+    runtime: tokio::runtime::Runtime,
+    server: Option<IpcServer>,
+}
+impl TestServer {
+    fn start(engine: Engine, path: &Path, blocking_threads: usize) -> Result<Self> {
+        Self::with_options(engine, path, blocking_threads, &IpcOptions::default())
+    }
+    fn with_options(
+        engine: Engine,
+        path: &Path,
+        blocking_threads: usize,
+        options: &IpcOptions,
+    ) -> Result<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(blocking_threads)
+            .enable_all()
+            .build()?;
+        let server = runtime.block_on(IpcServer::start(engine, path, options))?;
+        Ok(Self {
+            runtime,
+            server: Some(server),
+        })
+    }
+    fn shutdown(&mut self) {
+        if let Some(server) = self.server.take() {
+            self.runtime.block_on(server.shutdown());
+        }
+    }
+}
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn fixture() -> Result<(tempfile::TempDir, Engine, TestServer)> {
+    fixture_with_threads(2)
+}
+fn fixture_with_threads(
+    blocking_threads: usize,
+) -> Result<(tempfile::TempDir, Engine, TestServer)> {
+    fixture_with_options(blocking_threads, &IpcOptions::default())
+}
+fn fixture_with_options(
+    blocking_threads: usize,
+    options: &IpcOptions,
+) -> Result<(tempfile::TempDir, Engine, TestServer)> {
     let temp = tempfile::tempdir()?;
     let engine = Engine::open(&temp.path().join("metadata"))?;
     let target = temp.path().join("storage");
@@ -99,7 +152,12 @@ fn fixture() -> Result<(tempfile::TempDir, Engine, IpcServer)> {
             ..Default::default()
         },
     )?;
-    let server = IpcServer::start(engine.clone(), &temp.path().join("tier.sock"))?;
+    let server = TestServer::with_options(
+        engine.clone(),
+        &temp.path().join("tier.sock"),
+        blocking_threads,
+        options,
+    )?;
     Ok((temp, engine, server))
 }
 
@@ -162,7 +220,7 @@ fn framing_rejects_bad_headers_and_truncated_payloads() -> Result<()> {
 }
 
 #[test]
-fn ordered_write_sync_and_read_across_two_handles() -> Result<()> {
+fn pipelined_write_sync_read_and_close_across_two_handles() -> Result<()> {
     let (temp, engine, _server) = fixture()?;
     let mut client = Client::connect(&temp.path().join("tier.sock"))?;
     let writer = client.open("file", Access::ReadWrite, Disposition::CreateNew)?;
@@ -194,16 +252,7 @@ fn ordered_write_sync_and_read_across_two_handles() -> Result<()> {
         },
         vec![],
     )?;
-    let mut responses = HashMap::new();
-    for _ in 0..3 {
-        let (id, response, data) = client.receive()?;
-        assert_eq!(response.error, 0, "{}", response.message);
-        responses.insert(id, (response, data));
-    }
-    assert_eq!(responses[&write].0.count, MAX_DATA as u32);
-    assert_eq!(responses[&sync].0.error, 0);
-    assert_eq!(responses[&read].1, data);
-    client.call(
+    let close = client.submit(
         Request {
             method: Method::Close as i32,
             handle: writer,
@@ -211,6 +260,25 @@ fn ordered_write_sync_and_read_across_two_handles() -> Result<()> {
         },
         vec![],
     )?;
+    let mut responses = HashMap::new();
+    for _ in 0..4 {
+        let (id, response, data) = client.receive()?;
+        assert_eq!(response.error, 0, "{}", response.message);
+        responses.insert(id, (response, data));
+    }
+    assert_eq!(responses[&write].0.count, MAX_DATA as u32);
+    assert_eq!(responses[&sync].0.error, 0);
+    assert_eq!(responses[&read].1, data);
+    assert_eq!(responses[&close].0.error, 0);
+    client.submit(
+        Request {
+            method: Method::Getattr as i32,
+            handle: writer,
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    assert_eq!(client.receive()?.1.error, libc::EBADF);
     assert_eq!(engine.get("/file")?, data);
     Ok(())
 }
@@ -297,23 +365,37 @@ fn stable_handles_survive_rename_and_directory_cursor_is_a_view() -> Result<()> 
 
 #[test]
 fn disconnect_drains_writes_and_new_session_rejects_old_handles() -> Result<()> {
-    let (temp, engine, server) = fixture()?;
+    let (temp, engine, mut server) = fixture()?;
     let path = temp.path().join("tier.sock");
     let mut client = Client::connect(&path)?;
     let writer = client.open("file", Access::ReadWrite, Disposition::CreateNew)?;
-    client.call(
-        Request {
-            method: Method::Write as i32,
-            handle: writer,
-            length: 4,
-            stable: true,
-            ..Default::default()
-        },
-        b"safe".to_vec(),
-    )?;
-    drop(client);
+    let mut writes = HashSet::new();
+    for index in 0..8 {
+        writes.insert(client.submit(
+            Request {
+                method: Method::Write as i32,
+                handle: writer,
+                offset: index * 4,
+                length: 4,
+                stable: index == 7,
+                ..Default::default()
+            },
+            b"safe".to_vec(),
+        )?);
+    }
+    // EOF follows the complete requests. The server must finish accepted work
+    // and drain its replies even when the client has stopped sending.
+    client.stream.shutdown(Shutdown::Write)?;
+    for _ in 0..writes.len() {
+        let (id, response, _) = client.receive()?;
+        assert!(writes.remove(&id), "unexpected or duplicate write reply");
+        assert_eq!(response.error, 0, "{}", response.message);
+        assert_eq!(response.count, 4);
+    }
+    assert!(Frame::read(&mut client.stream)?.is_none());
     server.shutdown();
-    let _server = IpcServer::start(engine.clone(), &path)?;
+    drop(client);
+    let _server = TestServer::start(engine.clone(), &path, 2)?;
     let mut next = Client::connect(&path)?;
     next.submit(
         Request {
@@ -325,13 +407,15 @@ fn disconnect_drains_writes_and_new_session_rejects_old_handles() -> Result<()> 
         vec![],
     )?;
     assert_eq!(next.receive()?.1.error, libc::EBADF);
-    assert_eq!(engine.get("/file")?, b"safe");
+    assert_eq!(engine.get("/file")?, b"safe".repeat(8));
+    // Disconnect cleanup releases the writer reservation as well as IPC handles.
+    engine.open_file("/file", true, false, false)?.close()?;
     Ok(())
 }
 
 #[test]
 fn malformed_session_does_not_kill_listener_and_stale_socket_is_replaced() -> Result<()> {
-    let (temp, engine, server) = fixture()?;
+    let (temp, engine, mut server) = fixture()?;
     let path = temp.path().join("tier.sock");
     let mut bad = UnixStream::connect(&path)?;
     let mut header = [0u8; 24];
@@ -342,12 +426,85 @@ fn malformed_session_does_not_kill_listener_and_stale_socket_is_replaced() -> Re
     bad.set_read_timeout(Some(Duration::from_secs(2)))?;
     assert_eq!(bad.read(&mut [0u8; 1])?, 0);
     let _client = Client::connect(&path)?;
-    assert!(IpcServer::start(engine.clone(), &path).is_err());
+    assert!(TestServer::start(engine.clone(), &path, 2).is_err());
     server.shutdown();
     let stale = UnixListener::bind(&path)?;
     drop(stale);
-    let _server = IpcServer::start(engine, &path)?;
+    let _server = TestServer::start(engine, &path, 2)?;
     let _client = Client::connect(&path)?;
+    Ok(())
+}
+
+#[test]
+fn partial_frame_does_not_block_other_sessions_or_shutdown() -> Result<()> {
+    let (temp, _engine, mut server) = fixture_with_threads(1)?;
+    let path = temp.path().join("tier.sock");
+    let mut stalled = UnixStream::connect(&path)?;
+    let mut bytes = Vec::new();
+    Frame::request(
+        1,
+        &Request {
+            method: Method::Hello as i32,
+            protocol_version: VERSION.into(),
+            ..Default::default()
+        },
+        vec![],
+    )
+    .write(&mut bytes)?;
+    stalled.write_all(&bytes[..12])?;
+    let mut active = Client::connect(&path)?;
+    active.open("progress", Access::Metadata, Disposition::CreateNew)?;
+    let started = std::time::Instant::now();
+    server.shutdown();
+    anyhow::ensure!(
+        started.elapsed() < Duration::from_secs(2),
+        "shutdown waited for an incomplete IPC frame"
+    );
+    Ok(())
+}
+
+#[test]
+fn completing_requests_preserve_the_next_partially_received_frame() -> Result<()> {
+    let (temp, engine, _server) = fixture_with_threads(1)?;
+    let mut client = Client::connect(&temp.path().join("tier.sock"))?;
+    let handle = client.open("file", Access::ReadWrite, Disposition::CreateNew)?;
+    let payload = vec![0x61; 64];
+    for split in [1, 12, 23, 24, 32, 63] {
+        let first = client.submit(
+            Request {
+                method: Method::Getattr as i32,
+                handle,
+                ..Default::default()
+            },
+            vec![],
+        )?;
+        let second = client.next;
+        client.next += 1;
+        let mut bytes = Vec::new();
+        Frame::request(
+            second,
+            &Request {
+                method: Method::Write as i32,
+                handle,
+                length: payload.len() as u32,
+                ..Default::default()
+            },
+            payload.clone(),
+        )
+        .write(&mut bytes)?;
+        client.stream.write_all(&bytes[..split])?;
+        // Complete the earlier operation while the next frame is incomplete.
+        // Its completion must not cancel/restart the in-progress socket read.
+        let (id, response, _) = client.receive()?;
+        assert_eq!(id, first);
+        assert_eq!(response.error, 0, "{}", response.message);
+        client.stream.write_all(&bytes[split..])?;
+        let (id, response, _) = client.receive()?;
+        assert_eq!(id, second);
+        assert_eq!(response.error, 0, "{}", response.message);
+        assert_eq!(response.count, payload.len() as u32);
+    }
+    assert_eq!(engine.get("/file")?, payload);
     Ok(())
 }
 
@@ -501,14 +658,12 @@ fn attach_rejects_an_unsupported_subdirectory_instead_of_exporting_root() -> Res
 
 #[test]
 fn stalled_read_replies_do_not_starve_other_sessions() -> Result<()> {
-    let (temp, engine, server) = fixture()?;
+    let (temp, engine, mut server) = fixture_with_threads(1)?;
     let path = temp.path().join("tier.sock");
-    let workers = std::thread::available_parallelism()
-        .map_or(4, usize::from)
-        .clamp(4, 32);
+    let stalled_sessions = 8;
     let mut stalled = Vec::new();
     let mut handles = Vec::new();
-    for index in 0..workers {
+    for index in 0..stalled_sessions {
         let name = format!("slow-reader-{index}");
         engine.put(&format!("/{name}"), &vec![0x5a; MAX_DATA])?;
         let mut client = Client::connect(&path)?;
@@ -522,15 +677,17 @@ fn stalled_read_replies_do_not_starve_other_sessions() -> Result<()> {
         .set_read_timeout(Some(Duration::from_secs(2)))?;
     let progress = (|| -> Result<()> {
         for (client, handle) in stalled.iter_mut().zip(handles) {
-            client.submit(
-                Request {
-                    method: Method::Read as i32,
-                    handle,
-                    length: MAX_DATA as u32,
-                    ..Default::default()
-                },
-                vec![],
-            )?;
+            for _ in 0..MAX_INFLIGHT {
+                client.submit(
+                    Request {
+                        method: Method::Read as i32,
+                        handle,
+                        length: MAX_DATA as u32,
+                        ..Default::default()
+                    },
+                    vec![],
+                )?;
+            }
             // Wait for the response to start, then deliberately stop consuming
             // its large body. Each request uses a distinct file and session.
             let mut header = [0; 24];
@@ -573,4 +730,131 @@ fn stalled_read_replies_do_not_starve_other_sessions() -> Result<()> {
         "blocked IPC shutdown"
     );
     progress
+}
+
+#[test]
+fn configured_single_slot_limits_keep_protocol_and_storage_usable() -> Result<()> {
+    let options = IpcOptions {
+        max_connections: 2,
+        max_inflight_per_connection: 1,
+        max_running_requests: 1,
+        max_handles_per_connection: 2,
+        data_buffer_mib: 4,
+        control_buffer_mib: 4,
+        connection_data_buffer_mib: 4,
+        connection_control_buffer_mib: 4,
+        global_cursor_memory_mib: 0,
+        connection_cursor_memory_mib: 0,
+        per_cursor_memory_kib: 0,
+        cursor_buffer_kib: 0,
+        ..Default::default()
+    };
+    let (temp, engine, mut server) = fixture_with_options(1, &options)?;
+    let path = temp.path().join("tier.sock");
+    let mut client = Client {
+        stream: UnixStream::connect(&path)?,
+        next: 1,
+        root: 0,
+    };
+    client
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(2)))?;
+    assert_eq!(
+        client
+            .call(
+                Request {
+                    method: Method::Hello as i32,
+                    protocol_version: VERSION.into(),
+                    ..Default::default()
+                },
+                vec![]
+            )?
+            .0
+            .max_inflight,
+        1
+    );
+    client.root = client
+        .call(
+            Request {
+                method: Method::Attach as i32,
+                ..Default::default()
+            },
+            vec![],
+        )?
+        .0
+        .handle;
+    let handle = client.open("limited", Access::ReadWrite, Disposition::CreateNew)?;
+    client.submit(
+        Request {
+            method: Method::Open as i32,
+            parent: client.root,
+            name: "limited".into(),
+            access: Access::Metadata as i32,
+            disposition: Disposition::Existing as i32,
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    assert_eq!(client.receive()?.1.error, libc::EMFILE);
+    let body = vec![0x5a; MAX_DATA];
+    client.call(
+        Request {
+            method: Method::Write as i32,
+            handle,
+            length: body.len() as u32,
+            ..Default::default()
+        },
+        body.clone(),
+    )?;
+    assert_eq!(
+        client
+            .call(
+                Request {
+                    method: Method::Read as i32,
+                    handle,
+                    length: body.len() as u32,
+                    ..Default::default()
+                },
+                vec![]
+            )?
+            .1,
+        body
+    );
+    client.call(
+        Request {
+            method: Method::Close as i32,
+            handle,
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    let cursor = client
+        .call(
+            Request {
+                method: Method::Opendir as i32,
+                handle: client.root,
+                ..Default::default()
+            },
+            vec![],
+        )?
+        .0
+        .handle;
+    let page = client
+        .call(
+            Request {
+                method: Method::Readdir as i32,
+                handle: cursor,
+                max_entries: 10,
+                max_bytes: 4096,
+                ..Default::default()
+            },
+            vec![],
+        )?
+        .0;
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].name, "limited");
+    assert!(page.eof);
+    server.shutdown();
+    assert_eq!(engine.get("/limited")?, body);
+    Ok(())
 }

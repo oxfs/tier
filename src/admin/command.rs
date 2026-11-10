@@ -79,7 +79,7 @@ impl Command {
             } => {
                 return recovery::inspect_backup(&path, backup_id, &roots, None);
             }
-            Self::Repair {} => backend.maintenance.repair()?,
+            Self::Repair {} => crate::service::repair(engine)?,
             Self::Export { path } => {
                 ensure!(path.is_absolute(), "use an absolute export path");
                 crate::export::write(engine, &path)?;

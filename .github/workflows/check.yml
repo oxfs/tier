@@ -38,8 +38,20 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/lint"
           "$RUNNER_TEMP/lint/bin/pip" install -r tests/requirements-dev.txt
           echo "$RUNNER_TEMP/lint/bin" >> "$GITHUB_PATH"
-      - run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy --component rust-analyzer
+      - run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - run: rustup default stable
+      - name: Install rust-analyzer
+        run: |
+          tools="$RUNNER_TEMP/tier-tools"
+          mkdir -p "$tools"
+          curl --fail --location --retry 3 \
+            --output "$tools/rust-analyzer.gz" \
+            https://github.com/rust-lang/rust-analyzer/releases/download/2026-11-09/rust-analyzer-x86_64-unknown-linux-gnu.gz
+          echo "8c039b25cb338b3970c731646677a4c9d4e9dd7a92c9ab9ae459c71467fbf4a9  $tools/rust-analyzer.gz" | sha256sum --check
+          gzip -dc "$tools/rust-analyzer.gz" > "$tools/rust-analyzer"
+          chmod +x "$tools/rust-analyzer"
+          "$tools/rust-analyzer" --version
+          echo "$tools" >> "$GITHUB_PATH"
       - id: rust-version
         run: echo "version=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
       - uses: actions/cache/restore@v4

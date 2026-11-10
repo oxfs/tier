@@ -144,9 +144,9 @@ fn scheduled_backups_obey_interval_and_forced_backups_apply_retention() -> Resul
     let destination = work.path().join("snapshots");
     fs::create_dir(&destination)?;
     schedule(&engine, vec![destination.clone()], 3600, 2)?;
-    engine.schedule_backups()?;
+    engine.schedule_backup(Kind::Metadata)?;
     for _ in 0..5 {
-        engine.schedule_backups()?;
+        engine.schedule_backup(Kind::Metadata)?;
     }
     let count = || -> Result<usize> { Ok(backup::list(&destination)?.len()) };
     assert_eq!(count()?, 1);
@@ -167,12 +167,12 @@ fn offline_backup_destination_backs_off_without_delaying_healthy_targets() -> Re
     fs::create_dir(&a)?;
     fs::create_dir(&b)?;
     schedule(&engine, vec![a.clone(), b.clone()], 60, 2)?;
-    engine.schedule_backups()?;
+    engine.schedule_backup(Kind::Metadata)?;
     fs::rename(&a, root.path().join("offline"))?;
     engine.mkdir("/new")?;
     assert!(engine.backup_tick(Kind::Metadata).is_err());
     // Failed destinations back off; repeating a scheduler tick does not repeat I/O.
-    engine.schedule_backups()?;
+    engine.schedule_backup(Kind::Metadata)?;
     let status = engine.state()?;
     assert!(
         status["backup_status"]

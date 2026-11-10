@@ -1,73 +1,86 @@
-use super::pool::Pool;
-use super::{Frame, MAX_DATA, MAX_INFLIGHT, MAX_MESSAGE, VERSION, protocol::*};
+use super::scheduler::FileOrder;
+use super::{BUFFER_MIB_PER_SLOT, Frame, IpcOptions, MAX_DATA, MAX_MESSAGE, VERSION, protocol::*};
 use crate::core::{Engine, FileHandle, Node};
 use anyhow::{Result, anyhow};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use prost::Message;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{self, BufReader, BufWriter, Read, Seek, Write},
-    net::Shutdown,
     os::{
         fd::AsRawFd,
-        unix::{
-            fs::{FileTypeExt, OpenOptionsExt, PermissionsExt},
-            net::{UnixListener, UnixStream},
-        },
+        unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt},
     },
-    path::{Path, PathBuf},
-    sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, SyncSender},
-    },
-    thread::{self, JoinHandle},
+    path::Path,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::{
+    net::{UnixListener, UnixStream},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
+    task::JoinSet,
+};
 
-const MAX_SESSIONS: usize = 64;
-const MAX_HANDLES: usize = 4096;
-const MAX_REQUESTS: usize = 128;
-const MAX_CURSOR_BYTES: usize = 64 * 1024 * 1024;
-const GLOBAL_CURSOR_BYTES: usize = 128 * 1024 * 1024;
-const CURSOR_MEMORY_BYTES: usize = 256 * 1024;
-const CURSOR_BUFFER_BYTES: usize = 64 * 1024;
-
+struct Shared {
+    options: Arc<IpcOptions>,
+    engine: Engine,
+    workers: Arc<Semaphore>,
+    buffers: Buffers,
+    file_order: Arc<FileOrder>,
+    cursor_budget: Arc<Mutex<usize>>,
+    instance: String,
+}
+struct Buffers {
+    data: Arc<Semaphore>,
+    control: Arc<Semaphore>,
+}
+impl Buffers {
+    fn new(options: &IpcOptions) -> Self {
+        Self {
+            data: Arc::new(Semaphore::new(
+                options.data_buffer_mib / BUFFER_MIB_PER_SLOT,
+            )),
+            control: Arc::new(Semaphore::new(
+                options.control_buffer_mib / BUFFER_MIB_PER_SLOT,
+            )),
+        }
+    }
+}
+struct BufferPermit {
+    _global: OwnedSemaphorePermit,
+    _connection: OwnedSemaphorePermit,
+}
+impl Buffers {
+    async fn reserve(
+        &self,
+        method: Method,
+        data: Arc<Semaphore>,
+        control: Arc<Semaphore>,
+    ) -> BufferPermit {
+        let (global, connection) =
+            if matches!(method, Method::Read | Method::Write | Method::Readdir) {
+                (&self.data, data)
+            } else {
+                (&self.control, control)
+            };
+        // A saturated connection waits locally, without reserving global space
+        // needed by another connection in the same traffic class.
+        let connection = connection.acquire_owned().await.unwrap();
+        let global = global.clone().acquire_owned().await.unwrap();
+        BufferPermit {
+            _global: global,
+            _connection: connection,
+        }
+    }
+}
 fn errno(code: i32) -> anyhow::Error {
     io::Error::from_raw_os_error(code).into()
 }
 
-#[derive(Default)]
-struct Counter {
-    count: Mutex<usize>,
-    changed: Condvar,
-}
-impl Counter {
-    fn acquire(self: &Arc<Self>, maximum: usize) -> Permit {
-        let mut count = self.count.lock().unwrap();
-        while *count >= maximum {
-            count = self.changed.wait(count).unwrap();
-        }
-        *count += 1;
-        Permit(self.clone())
-    }
-    fn wait_empty(&self) {
-        let mut count = self.count.lock().unwrap();
-        while *count != 0 {
-            count = self.changed.wait(count).unwrap();
-        }
-    }
-}
-struct Permit(Arc<Counter>);
-impl Drop for Permit {
-    fn drop(&mut self) {
-        *self.0.count.lock().unwrap() -= 1;
-        self.0.changed.notify_all();
-    }
-}
-
 struct Handle {
     node: String,
+    // Only blocking operations access this lock; it never crosses an await.
     file: Option<Mutex<FileHandle>>,
     readable: bool,
     writable: bool,
@@ -77,9 +90,9 @@ struct CursorBudget {
     bytes: usize,
 }
 impl CursorBudget {
-    fn reserve(used: Arc<Mutex<usize>>, limit: usize) -> Result<Self> {
+    fn reserve(used: Arc<Mutex<usize>>, limit: usize, global_limit: usize) -> Result<Self> {
         let mut total = used.lock().unwrap();
-        let bytes = limit.min(GLOBAL_CURSOR_BYTES.saturating_sub(*total));
+        let bytes = limit.min(global_limit.saturating_sub(*total));
         *total += bytes;
         drop(total);
         Ok(Self { used, bytes })
@@ -106,15 +119,17 @@ struct Cursor {
     remaining: usize,
     memory_bytes: usize,
     budget: CursorBudget,
+    buffer_bytes: usize,
 }
 impl Cursor {
-    fn new(budget: CursorBudget) -> Self {
+    fn new(budget: CursorBudget, buffer_bytes: usize) -> Self {
         Self {
             source: CursorSource::Memory(VecDeque::new()),
             pending: None,
             remaining: 0,
             memory_bytes: 0,
             budget,
+            buffer_bytes,
         }
     }
     fn append(&mut self, entry: Entry) -> Result<()> {
@@ -133,8 +148,7 @@ impl Cursor {
             // Release the in-memory entries before allocating the spool buffer.
             // A fully exhausted global/session budget keeps unbuffered I/O.
             self.source = CursorSource::Memory(VecDeque::new());
-            self.budget
-                .shrink(self.budget.bytes.min(CURSOR_BUFFER_BYTES));
+            self.budget.shrink(self.budget.bytes.min(self.buffer_bytes));
             self.source = CursorSource::Spooling(BufWriter::with_capacity(self.budget.bytes, file));
         }
         match &mut self.source {
@@ -202,6 +216,7 @@ impl Cursor {
 }
 
 struct Session {
+    options: Arc<IpcOptions>,
     engine: Engine,
     handles: HashMap<u64, Arc<Handle>>,
     cursors: HashMap<u64, Cursor>,
@@ -219,7 +234,7 @@ impl Session {
             .ok_or_else(|| errno(libc::EBADF))
     }
     fn insert(&mut self, handle: Handle) -> Result<u64> {
-        if self.handles.len() + self.cursors.len() >= MAX_HANDLES {
+        if self.handles.len() + self.cursors.len() >= self.options.max_handles_per_connection {
             return Err(errno(libc::EMFILE));
         }
         let id = self.next;
@@ -281,180 +296,201 @@ impl Session {
 }
 
 /// Owns the listener and drains admitted operations before releasing sessions.
+/// Drop signals cancellation; callers use shutdown to await storage cleanup.
 pub struct IpcServer {
-    stop: Arc<AtomicBool>,
-    listener: Option<JoinHandle<()>>,
-    streams: Arc<Mutex<HashMap<u64, UnixStream>>>,
-    sessions: Arc<Counter>,
-    path: PathBuf,
-    _lock: fs::File,
+    stop: watch::Sender<bool>,
+    listener: Option<tokio::task::JoinHandle<()>>,
 }
 impl IpcServer {
-    pub fn start(engine: Engine, path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path.with_extension("lock"))?;
-        // The sidecar lock survives crashes and prevents racing stale-socket removal.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_socket() => match UnixStream::connect(path) {
-                Ok(_) => return Err(anyhow!("IPC socket is active: {}", path.display())),
-                Err(error) if error.raw_os_error() == Some(libc::ECONNREFUSED) => {
-                    fs::remove_file(path)?
+    pub async fn start(engine: Engine, path: &Path, options: &IpcOptions) -> Result<Self> {
+        options.validate()?;
+        let options = Arc::new(options.clone());
+        let path = path.to_owned();
+        let (listener, lock, path) = tokio::task::spawn_blocking(move || -> Result<_> {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let lock = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path.with_extension("lock"))?;
+            // The sidecar lock survives crashes and prevents racing stale-socket removal.
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_socket() => {
+                    match std::os::unix::net::UnixStream::connect(&path) {
+                        Ok(_) => return Err(anyhow!("IPC socket is active: {}", path.display())),
+                        Err(error) if error.raw_os_error() == Some(libc::ECONNREFUSED) => {
+                            fs::remove_file(&path)?
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 }
+                Ok(_) => return Err(anyhow!("IPC path is not a socket: {}", path.display())),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
-            },
-            Ok(_) => return Err(anyhow!("IPC path is not a socket: {}", path.display())),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        let listener = UnixListener::bind(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        listener.set_nonblocking(true)?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let streams = Arc::new(Mutex::new(HashMap::new()));
-        let sessions = Arc::new(Counter::default());
-        let workers = Arc::new(Counter::default());
-        let pool = Pool::new();
-        let cursor_budget = Arc::new(Mutex::new(0));
-        let instance = uuid::Uuid::new_v4().to_string();
-        let listener_thread = {
-            let stop = stop.clone();
-            let streams = streams.clone();
-            let sessions = sessions.clone();
-            thread::spawn(move || {
-                let mut next = 0u64;
-                while !stop.load(Ordering::Acquire) {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            if !trusted_peer(&stream)
-                                || *sessions.count.lock().unwrap() >= MAX_SESSIONS
-                            {
-                                continue;
+            }
+            let listener = std::os::unix::net::UnixListener::bind(&path)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            listener.set_nonblocking(true)?;
+            Ok((listener, lock, path))
+        })
+        .await??;
+        let listener = UnixListener::from_std(listener)?;
+        let (stop, mut stopped) = watch::channel(false);
+        let shutdown = stop.clone();
+        let listener = tokio::spawn(async move {
+            let shared = Arc::new(Shared {
+                engine,
+                workers: Arc::new(Semaphore::new(options.max_running_requests)),
+                buffers: Buffers::new(&options),
+                options,
+                file_order: Arc::new(FileOrder::default()),
+                cursor_budget: Arc::new(Mutex::new(0)),
+                instance: uuid::Uuid::new_v4().to_string(),
+            });
+            let mut sessions = JoinSet::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = async { let _ = stopped.wait_for(|value| *value).await; } => break,
+                    result = sessions.join_next(), if !sessions.is_empty() => {
+                        if let Some(Err(error)) = result { tracing::error!(%error, "IPC session failed"); }
+                    }
+                    incoming = listener.accept() => {
+                        match incoming {
+                            Ok((stream, _)) if trusted_peer(&stream) && sessions.len() < shared.options.max_connections => {
+                                sessions.spawn(serve(stream, shared.clone(), stopped.clone()));
                             }
-                            let Ok(control) = stream.try_clone() else {
-                                continue;
-                            };
-                            next += 1;
-                            let id = next;
-                            streams.lock().unwrap().insert(id, control);
-                            let permit = sessions.acquire(MAX_SESSIONS);
-                            let streams = streams.clone();
-                            let engine = engine.clone();
-                            let workers = workers.clone();
-                            let instance = instance.clone();
-                            let pool = pool.clone();
-                            let cursor_budget = cursor_budget.clone();
-                            thread::spawn(move || {
-                                let _permit = permit;
-                                serve(stream, engine, workers, pool, cursor_budget, &instance);
-                                streams.lock().unwrap().remove(&id);
-                            });
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(10))
-                        }
-                        Err(error) => {
-                            tracing::error!(%error, "IPC accept failed");
-                            break;
+                            Ok(_) => {},
+                            Err(error) => { tracing::error!(%error, "IPC accept failed"); break; }
                         }
                     }
                 }
+            }
+            shutdown.send_replace(true);
+            drop(listener);
+            // Keep the lock until all FileHandles have been released, even when
+            // the public server was dropped without explicitly awaiting shutdown.
+            while let Some(result) = sessions.join_next().await {
+                if let Err(error) = result {
+                    tracing::error!(%error, "IPC session failed while draining");
+                }
+            }
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = fs::remove_file(path);
+                drop(shared);
+                drop(lock);
             })
-        };
+            .await;
+        });
         Ok(Self {
             stop,
-            listener: Some(listener_thread),
-            streams,
-            sessions,
-            path: path.to_owned(),
-            _lock: lock,
+            listener: Some(listener),
         })
     }
-    pub fn shutdown(mut self) {
-        self.stop();
-    }
-    fn stop(&mut self) {
-        let Some(listener) = self.listener.take() else {
-            return;
-        };
-        self.stop.store(true, Ordering::Release);
-        let _ = listener.join();
-        for stream in self.streams.lock().unwrap().values() {
-            let _ = stream.shutdown(Shutdown::Both);
+    pub async fn shutdown(mut self) {
+        self.stop.send_replace(true);
+        if let Some(listener) = self.listener.take()
+            && let Err(error) = listener.await
+        {
+            tracing::error!(%error, "IPC listener failed");
         }
-        self.sessions.wait_empty();
-        let _ = fs::remove_file(&self.path);
     }
 }
 impl Drop for IpcServer {
     fn drop(&mut self) {
-        self.stop();
+        self.stop.send_replace(true);
     }
 }
 
 fn trusted_peer(stream: &UnixStream) -> bool {
-    let mut credentials = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SO_PEERCRED is kernel-provided, not a client assertion.
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut credentials as *mut libc::ucred).cast(),
-            &mut length,
-        )
-    };
-    result == 0 && (credentials.uid == 0 || credentials.uid == unsafe { libc::geteuid() })
+    stream.peer_cred().is_ok_and(|credentials| {
+        credentials.uid() == 0 || credentials.uid() == unsafe { libc::geteuid() }
+    })
 }
 
-fn serve(
-    mut stream: UnixStream,
-    engine: Engine,
-    workers: Arc<Counter>,
-    pool: Arc<Pool>,
-    cursor_budget: Arc<Mutex<usize>>,
-    instance: &str,
-) {
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
-    let Ok(writer) = stream.try_clone() else {
-        return;
-    };
-    let session = Arc::new(Mutex::new(Session {
-        engine,
+async fn serve(stream: UnixStream, shared: Arc<Shared>, mut stopped: watch::Receiver<bool>) {
+    let (mut reader, mut writer) = stream.into_split();
+    let mut session = Some(Session {
+        options: shared.options.clone(),
+        engine: shared.engine.clone(),
         handles: HashMap::new(),
         cursors: HashMap::new(),
         next: u64::from_le_bytes(uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap()) >> 1,
         cursor_bytes: 0,
-        cursor_budget,
+        cursor_budget: shared.cursor_budget.clone(),
         hello: false,
         attached: false,
-    }));
-    let pending = Arc::new(Counter::default());
+    });
+    let limiter = Arc::new(Semaphore::new(shared.options.max_inflight_per_connection));
+    let data_buffers = Arc::new(Semaphore::new(
+        shared.options.connection_data_buffer_mib / BUFFER_MIB_PER_SLOT,
+    ));
+    let control_buffers = Arc::new(Semaphore::new(
+        shared.options.connection_control_buffer_mib / BUFFER_MIB_PER_SLOT,
+    ));
+    // This lock protects only an in-memory set; it never crosses await or I/O.
     let ids = Arc::new(Mutex::new(HashSet::new()));
-    let Ok((replies, reply_writer)) = Replies::start(writer, ids.clone()) else {
-        return;
-    };
-    let replies = Arc::new(replies);
-    loop {
-        // Backpressure before allocating the next frame, including its body.
-        let local = pending.acquire(MAX_INFLIGHT);
-        let frame = match Frame::read(&mut stream) {
+    let (replies, mut responses) =
+        mpsc::channel::<Outbound>(shared.options.max_inflight_per_connection);
+    let (failed, mut failure) = watch::channel(false);
+    let writer_ids = ids.clone();
+    let mut writer_failure = failure.clone();
+    let writer_failed = failed.clone();
+    let mut writer_stop = stopped.clone();
+    let reply_timeout = Duration::from_secs(shared.options.reply_timeout_secs);
+    let reply_writer = tokio::spawn(async move {
+        loop {
+            let response = tokio::select! {
+                biased;
+                _ = async { let _ = writer_stop.wait_for(|value| *value).await; } => break,
+                _ = async { let _ = writer_failure.wait_for(|value| *value).await; } => break,
+                response = responses.recv() => match response { Some(response) => response, None => break },
+            };
+            let result = tokio::select! {
+                biased;
+                _ = async { let _ = writer_stop.wait_for(|value| *value).await; } => break,
+                _ = async { let _ = writer_failure.wait_for(|value| *value).await; } => break,
+                result = tokio::time::timeout(reply_timeout, response.frame.write_async(&mut writer)) => result,
+            };
+            writer_ids.lock().unwrap().remove(&response.frame.id);
+            if !matches!(result, Ok(Ok(()))) {
+                tracing::warn!(request_id = response.frame.id, method = ?response.method, error = ?result, "IPC reply write failed");
+                break;
+            }
+        }
+        writer_failed.send_replace(true);
+    });
+    let mut tasks = FuturesUnordered::new();
+    'requests: loop {
+        let limited_frame = async {
+            // Limit in-flight requests and queued replies before allocating a frame.
+            let local = limiter.clone().acquire_owned().await.unwrap();
+            let frame = Frame::read_async(&mut reader).await;
+            (local, frame)
+        };
+        // Keep the same read future across completions: cancelling a partial
+        // frame read would lose its header or body and corrupt the stream.
+        let (local, frame) = {
+            tokio::pin!(limited_frame);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = async { let _ = stopped.wait_for(|value| *value).await; } => break 'requests,
+                    _ = async { let _ = failure.wait_for(|value| *value).await; } => break 'requests,
+                    _ = tasks.next(), if !tasks.is_empty() => {},
+                    frame = &mut limited_frame => break frame,
+                }
+            }
+        };
+        let frame = match frame {
             Ok(Some(frame)) => frame,
             Ok(None) => break,
             Err(error) => {
@@ -474,106 +510,138 @@ fn serve(
             break;
         }
         let method = Method::try_from(request.method).unwrap_or(Method::Invalid);
+        let global = {
+            let reservation =
+                shared
+                    .buffers
+                    .reserve(method, data_buffers.clone(), control_buffers.clone());
+            // Poll completions while waiting for buffers, retaining this request's
+            // position in the semaphore waiters across each completion.
+            tokio::pin!(reservation);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = async { let _ = stopped.wait_for(|value| *value).await; } => break 'requests,
+                    _ = async { let _ = failure.wait_for(|value| *value).await; } => break 'requests,
+                    _ = tasks.next(), if !tasks.is_empty() => {},
+                    permit = &mut reservation => break permit,
+                }
+            }
+        };
         let data_valid = if method == Method::Write {
             frame.data.len() == request.length as usize
         } else {
             frame.data.is_empty()
         };
         if !data_valid || request.length as usize > MAX_DATA {
-            let _ = send(
+            if send(
                 &replies,
                 frame.id,
                 method,
                 Err(errno(libc::EINVAL)),
                 local,
-                None,
-            );
+                global,
+            )
+            .is_err()
+            {
+                break;
+            }
             continue;
         }
-        let async_method = matches!(
+        if matches!(
             method,
             Method::Read | Method::Write | Method::Sync | Method::Getattr | Method::Setattr
-        );
-        if async_method {
-            let handle = { session.lock().unwrap().handle(request.handle) };
-            let handle = match handle {
+        ) {
+            let current = session.as_ref().unwrap();
+            let handle = match current.handle(request.handle) {
                 Ok(handle) => handle,
                 Err(error) => {
-                    let _ = send(&replies, frame.id, method, Err(error), local, None);
+                    if send(&replies, frame.id, method, Err(error), local, global).is_err() {
+                        break;
+                    }
                     continue;
                 }
             };
-            let engine = session.lock().unwrap().engine.clone();
-            let global = workers.acquire(MAX_REQUESTS);
+            let engine = current.engine.clone();
             let replies = replies.clone();
-            pool.submit(handle.node.clone(), move || {
-                let result = execute_file(&engine, &handle, request, frame.data);
-                // CLOSE's barrier must not finish while a worker retains the handle.
-                drop(handle);
-                let _ = send(&replies, frame.id, method, result, local, Some(global));
+            let operation =
+                shared
+                    .file_order
+                    .spawn(handle.node.clone(), shared.workers.clone(), move || {
+                        let result = execute_file(&engine, &handle, request, frame.data);
+                        // FileHandle destruction and its core locks stay on this thread.
+                        drop(handle);
+                        send(&replies, frame.id, method, result, local, global)
+                    });
+            let failed = failed.clone();
+            tasks.push(async move {
+                let result = operation
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result);
+                if let Err(error) = result {
+                    failed.send_replace(true);
+                    tracing::error!(%error, "IPC storage operation failed");
+                }
             });
         } else {
-            drop(local);
-            pending.wait_empty();
-            let result = execute(&mut session.lock().unwrap(), request, instance);
-            let local = pending.acquire(MAX_INFLIGHT);
-            if send(&replies, frame.id, method, result, local, None).is_err() {
+            // Namespace changes and CLOSE are session barriers, independent of
+            // whether the client has consumed replies from earlier operations.
+            while tasks.next().await.is_some() {}
+            let mut current = session.take().unwrap();
+            let instance = shared.instance.clone();
+            let permit = shared.workers.clone().acquire_owned().await.unwrap();
+            let replies = replies.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let result = execute(&mut current, request, &instance);
+                (
+                    current,
+                    send(&replies, frame.id, method, result, local, global),
+                )
+            })
+            .await;
+            let result = match result {
+                Ok((current, result)) => {
+                    session = Some(current);
+                    result
+                }
+                Err(error) => {
+                    tracing::error!(%error, "IPC session operation failed");
+                    break;
+                }
+            };
+            if result.is_err() {
                 break;
             }
         }
     }
-    pending.wait_empty();
+    // Never abort admitted work: a timed-out/disconnected client does not cancel
+    // a disk write, release its execution permit, or race handle destruction.
+    while tasks.next().await.is_some() {}
     drop(replies);
-    let _ = reply_writer.join();
-    // Dropping FileHandles releases writers after every admitted operation.
+    let _ = reply_writer.await;
+    if let Err(error) = tokio::task::spawn_blocking(move || drop(session)).await {
+        tracing::error!(%error, "IPC session cleanup failed");
+    }
 }
 
 type Reply = Result<(Response, Vec<u8>)>;
 struct Outbound {
     frame: Frame,
     method: Method,
-    _local: Permit,
-    _global: Option<Permit>,
-}
-
-/// Slow readers consume their admission budget, never a storage worker. Every
-/// queued reply retains a local permit, so the bounded queue cannot fill while
-/// a sender still owns another permit. Enqueue must never wait for socket I/O.
-struct Replies {
-    queue: SyncSender<Outbound>,
-    control: UnixStream,
-}
-impl Replies {
-    fn start(
-        mut writer: UnixStream,
-        ids: Arc<Mutex<HashSet<u64>>>,
-    ) -> io::Result<(Self, JoinHandle<()>)> {
-        let control = writer.try_clone()?;
-        let (queue, responses) = mpsc::sync_channel::<Outbound>(MAX_INFLIGHT);
-        let thread = thread::spawn(move || {
-            while let Ok(response) = responses.recv() {
-                let result = response.frame.write(&mut writer);
-                ids.lock().unwrap().remove(&response.frame.id);
-                if let Err(error) = result {
-                    // Wake the reader before dropping queued replies and their permits.
-                    let _ = writer.shutdown(Shutdown::Both);
-                    tracing::warn!(request_id = response.frame.id, method = ?response.method, %error, "IPC reply write failed");
-                    break;
-                }
-            }
-        });
-        Ok((Self { queue, control }, thread))
-    }
+    _local: OwnedSemaphorePermit,
+    _global: BufferPermit,
 }
 
 fn send(
-    replies: &Replies,
+    replies: &mpsc::Sender<Outbound>,
     id: u64,
     method: Method,
     result: Reply,
-    local: Permit,
-    global: Option<Permit>,
-) -> io::Result<()> {
+    local: OwnedSemaphorePermit,
+    global: BufferPermit,
+) -> Result<()> {
     let (response, data) = match result {
         Ok(result) => result,
         Err(error) => {
@@ -600,21 +668,20 @@ fn send(
             )
         }
     };
-    let response = Outbound {
-        frame: Frame {
-            id,
-            message: response.encode_to_vec(),
-            data,
-        },
-        method,
-        _local: local,
-        _global: global,
-    };
-    if let Err(error) = replies.queue.try_send(response) {
-        let _ = replies.control.shutdown(Shutdown::Both);
-        return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()));
-    }
-    Ok(())
+    // Each sender owns one of the same in-flight permits as queued replies,
+    // so enqueue never waits for network I/O or holds an execution permit.
+    replies
+        .try_send(Outbound {
+            frame: Frame {
+                id,
+                message: response.encode_to_vec(),
+                data,
+            },
+            method,
+            _local: local,
+            _global: global,
+        })
+        .map_err(|error| anyhow!("IPC reply queue closed: {error}"))
 }
 
 fn ok(response: Response) -> Reply {
@@ -647,7 +714,7 @@ fn execute(session: &mut Session, request: Request, instance: &str) -> Reply {
             response.protocol_version = u32::from(VERSION);
             response.max_message = MAX_MESSAGE as u32;
             response.max_data = MAX_DATA as u32;
-            response.max_inflight = MAX_INFLIGHT as u32;
+            response.max_inflight = session.options.max_inflight_per_connection as u32;
         }
         Method::Attach => {
             if session.attached {
@@ -747,7 +814,9 @@ fn execute(session: &mut Session, request: Request, instance: &str) -> Reply {
             }
         }
         Method::Opendir => {
-            if session.handles.len() + session.cursors.len() >= MAX_HANDLES {
+            if session.handles.len() + session.cursors.len()
+                >= session.options.max_handles_per_connection
+            {
                 return Err(errno(libc::EMFILE));
             }
             let node = session
@@ -758,9 +827,13 @@ fn execute(session: &mut Session, request: Request, instance: &str) -> Reply {
             }
             let budget = CursorBudget::reserve(
                 session.cursor_budget.clone(),
-                CURSOR_MEMORY_BYTES.min(MAX_CURSOR_BYTES.saturating_sub(session.cursor_bytes)),
+                (session.options.per_cursor_memory_kib * 1024).min(
+                    (session.options.connection_cursor_memory_mib * 1024 * 1024)
+                        .saturating_sub(session.cursor_bytes),
+                ),
+                session.options.global_cursor_memory_mib * 1024 * 1024,
             )?;
-            let mut cursor = Cursor::new(budget);
+            let mut cursor = Cursor::new(budget, session.options.cursor_buffer_kib * 1024);
             session.engine.visit_children(&node.id, |name, node| {
                 cursor.append(Entry {
                     name,
@@ -966,11 +1039,114 @@ fn attr(node: &Node) -> Attr {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn full_data_budget_does_not_block_metadata() {
+        let options = IpcOptions::default();
+        let buffers = Buffers::new(&options);
+        let global_slots = options.data_buffer_mib / BUFFER_MIB_PER_SLOT;
+        let local_slots = options.connection_data_buffer_mib / BUFFER_MIB_PER_SLOT;
+        let data = buffers
+            .data
+            .clone()
+            .acquire_many_owned(global_slots as u32)
+            .await
+            .unwrap();
+        let session = Arc::new(Semaphore::new(local_slots));
+        let control_slots = options.connection_control_buffer_mib / BUFFER_MIB_PER_SLOT;
+        let control = Arc::new(Semaphore::new(control_slots));
+        let metadata = tokio::time::timeout(
+            Duration::from_secs(1),
+            buffers.reserve(Method::Getattr, session.clone(), control.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(buffers.control.available_permits(), global_slots - 1);
+        assert_eq!(control.available_permits(), control_slots - 1);
+        assert_eq!(session.available_permits(), local_slots);
+        for method in [Method::Read, Method::Write, Method::Readdir] {
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(10),
+                    buffers.reserve(method, session.clone(), control.clone())
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert_eq!(session.available_permits(), local_slots);
+        drop(data);
+        drop(metadata);
+        assert_eq!(control.available_permits(), control_slots);
+        let read = buffers
+            .reserve(Method::Read, session.clone(), control.clone())
+            .await;
+        assert_eq!(session.available_permits(), local_slots - 1);
+        assert_eq!(buffers.control.available_permits(), global_slots);
+        drop(read);
+        assert_eq!(session.available_permits(), local_slots);
+    }
+
+    #[tokio::test]
+    async fn saturated_connection_preserves_control_budget_for_other_connections() {
+        let options = IpcOptions::default();
+        let buffers = Buffers::new(&options);
+        let global_slots = options.control_buffer_mib / BUFFER_MIB_PER_SLOT;
+        let local_slots = options.connection_control_buffer_mib / BUFFER_MIB_PER_SLOT;
+        let data = Arc::new(Semaphore::new(
+            options.connection_data_buffer_mib / BUFFER_MIB_PER_SLOT,
+        ));
+        let busy = Arc::new(Semaphore::new(local_slots));
+        let other = Arc::new(Semaphore::new(local_slots));
+        let mut retained = Vec::new();
+        for _ in 0..local_slots {
+            retained.push(
+                buffers
+                    .reserve(Method::Getattr, data.clone(), busy.clone())
+                    .await,
+            );
+        }
+        assert_eq!(busy.available_permits(), 0);
+        assert_eq!(
+            buffers.control.available_permits(),
+            global_slots - local_slots
+        );
+        let blocked = buffers.reserve(Method::Getattr, data.clone(), busy.clone());
+        tokio::pin!(blocked);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut blocked)
+                .await
+                .is_err()
+        );
+        let progress = tokio::time::timeout(
+            Duration::from_secs(1),
+            buffers.reserve(Method::Getattr, data, other.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            buffers.control.available_permits(),
+            global_slots - local_slots - 1
+        );
+        drop(progress);
+        retained.pop();
+        let resumed = tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .unwrap();
+        drop(resumed);
+        drop(retained);
+        assert_eq!(buffers.control.available_permits(), global_slots);
+        assert_eq!(busy.available_permits(), local_slots);
+        assert_eq!(other.available_permits(), local_slots);
+    }
+
     #[test]
     fn spooled_cursor_preserves_order_pending_and_memory_budget() -> Result<()> {
-        for available in [0, 32, 4096, CURSOR_MEMORY_BYTES] {
+        for available in [0, 32, 4096, 256 * 1024] {
             let used = Arc::new(Mutex::new(0));
-            let mut cursor = Cursor::new(CursorBudget::reserve(used.clone(), available)?);
+            let mut cursor = Cursor::new(
+                CursorBudget::reserve(used.clone(), available, 128 * 1024 * 1024)?,
+                64 * 1024,
+            );
             for index in 0..1000 {
                 cursor.append(Entry {
                     name: format!("entry-{index:04}"),
@@ -979,7 +1155,7 @@ mod tests {
             }
             cursor.finish()?;
             assert!(matches!(cursor.source, CursorSource::Disk(_)));
-            assert_eq!(cursor.budget.bytes, available.min(CURSOR_BUFFER_BYTES));
+            assert_eq!(cursor.budget.bytes, available.min(64 * 1024));
             assert_eq!(*used.lock().unwrap(), cursor.budget.bytes);
             let first = cursor.next()?.unwrap();
             cursor.pending = Some(first);
@@ -999,7 +1175,10 @@ mod tests {
         let temporary = tempfile::NamedTempFile::new()?;
         let readonly = fs::File::open(temporary.path())?;
         let used = Arc::new(Mutex::new(0));
-        let mut cursor = Cursor::new(CursorBudget::reserve(used, 4096)?);
+        let mut cursor = Cursor::new(
+            CursorBudget::reserve(used, 4096, 128 * 1024 * 1024)?,
+            64 * 1024,
+        );
         cursor.source = CursorSource::Spooling(BufWriter::with_capacity(4096, readonly));
         cursor.append(Entry {
             name: "buffered".into(),
@@ -1012,7 +1191,10 @@ mod tests {
     #[test]
     fn spooled_cursor_rejects_truncated_record() -> Result<()> {
         let used = Arc::new(Mutex::new(0));
-        let mut cursor = Cursor::new(CursorBudget::reserve(used, 32)?);
+        let mut cursor = Cursor::new(
+            CursorBudget::reserve(used, 32, 128 * 1024 * 1024)?,
+            64 * 1024,
+        );
         cursor.append(Entry {
             name: "truncated".into(),
             attr: None,
