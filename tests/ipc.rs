@@ -657,6 +657,73 @@ fn attach_rejects_an_unsupported_subdirectory_instead_of_exporting_root() -> Res
 }
 
 #[test]
+fn error_replies_do_not_stall_an_incomplete_response_on_the_same_connection() -> Result<()> {
+    let (temp, engine, _server) = fixture_with_threads(1)?;
+    let contents = vec![0x5a; MAX_DATA];
+    engine.put("/file", &contents)?;
+    let mut client = Client::connect(&temp.path().join("tier.sock"))?;
+    let handle = client.open("file", Access::ReadOnly, Disposition::Existing)?;
+    let read = client.submit(
+        Request {
+            method: Method::Read as i32,
+            handle,
+            length: MAX_DATA as u32,
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    // Leave the large reply incomplete so its future owns the write mutex while
+    // the reader accepts requests that produce immediate protocol errors.
+    let mut header = [0; 24];
+    client.stream.read_exact(&mut header)?;
+    let message_len = u32::from_be_bytes(header[16..20].try_into()?) as usize;
+    let data_len = u32::from_be_bytes(header[20..24].try_into()?) as usize;
+    assert_eq!(data_len, MAX_DATA);
+    let invalid_body = client.submit(
+        Request {
+            method: Method::Write as i32,
+            handle,
+            length: 1,
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    let invalid_handle = client.submit(
+        Request {
+            method: Method::Getattr as i32,
+            handle: u64::MAX,
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    let close = client.submit(
+        Request {
+            method: Method::Close as i32,
+            handle,
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    let mut bytes = header.to_vec();
+    bytes.resize(24 + message_len + data_len, 0);
+    client.stream.read_exact(&mut bytes[24..])?;
+    let response = Frame::read(&mut Cursor::new(bytes))?.context("missing read reply")?;
+    assert_eq!(response.id, read);
+    assert_eq!(Response::decode(response.message.as_slice())?.error, 0);
+    assert_eq!(response.data, contents);
+    let mut responses = HashMap::new();
+    for _ in 0..3 {
+        let (id, response, data) = client.receive()?;
+        assert!(data.is_empty());
+        responses.insert(id, response.error);
+    }
+    assert_eq!(responses[&invalid_body], libc::EINVAL);
+    assert_eq!(responses[&invalid_handle], libc::EBADF);
+    assert_eq!(responses[&close], 0);
+    Ok(())
+}
+
+#[test]
 fn stalled_read_replies_do_not_starve_other_sessions() -> Result<()> {
     let (temp, engine, mut server) = fixture_with_threads(1)?;
     let path = temp.path().join("tier.sock");

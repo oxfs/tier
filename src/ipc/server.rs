@@ -2,7 +2,7 @@ use super::scheduler::FileOrder;
 use super::{BUFFER_MIB_PER_SLOT, Frame, IpcOptions, MAX_DATA, MAX_MESSAGE, VERSION, protocol::*};
 use crate::core::{Engine, FileHandle, Node};
 use anyhow::{Result, anyhow};
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use futures_util::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use prost::Message;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -17,8 +17,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    net::{UnixListener, UnixStream},
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
+    io::AsyncWriteExt,
+    net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
     task::JoinSet,
 };
 
@@ -417,7 +418,7 @@ fn trusted_peer(stream: &UnixStream) -> bool {
 }
 
 async fn serve(stream: UnixStream, shared: Arc<Shared>, mut stopped: watch::Receiver<bool>) {
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, writer) = stream.into_split();
     let mut session = Some(Session {
         options: shared.options.clone(),
         engine: shared.engine.clone(),
@@ -436,37 +437,13 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>, mut stopped: watch::Rece
     let control_buffers = Arc::new(Semaphore::new(
         shared.options.connection_control_buffer_mib / BUFFER_MIB_PER_SLOT,
     ));
-    // This lock protects only an in-memory set; it never crosses await or I/O.
-    let ids = Arc::new(Mutex::new(HashSet::new()));
-    let (replies, mut responses) =
-        mpsc::channel::<Outbound>(shared.options.max_inflight_per_connection);
     let (failed, mut failure) = watch::channel(false);
-    let writer_ids = ids.clone();
-    let mut writer_failure = failure.clone();
-    let writer_failed = failed.clone();
-    let mut writer_stop = stopped.clone();
-    let reply_timeout = Duration::from_secs(shared.options.reply_timeout_secs);
-    let reply_writer = tokio::spawn(async move {
-        loop {
-            let response = tokio::select! {
-                biased;
-                _ = async { let _ = writer_stop.wait_for(|value| *value).await; } => break,
-                _ = async { let _ = writer_failure.wait_for(|value| *value).await; } => break,
-                response = responses.recv() => match response { Some(response) => response, None => break },
-            };
-            let result = tokio::select! {
-                biased;
-                _ = async { let _ = writer_stop.wait_for(|value| *value).await; } => break,
-                _ = async { let _ = writer_failure.wait_for(|value| *value).await; } => break,
-                result = tokio::time::timeout(reply_timeout, response.frame.write_async(&mut writer)) => result,
-            };
-            writer_ids.lock().unwrap().remove(&response.frame.id);
-            if !matches!(result, Ok(Ok(()))) {
-                tracing::warn!(request_id = response.frame.id, method = ?response.method, error = ?result, "IPC reply write failed");
-                break;
-            }
-        }
-        writer_failed.send_replace(true);
+    let replies = Arc::new(ReplyWriter {
+        socket: tokio::sync::Mutex::new(writer),
+        ids: Mutex::new(HashSet::new()),
+        failed,
+        stopped: stopped.clone(),
+        timeout: Duration::from_secs(shared.options.reply_timeout_secs),
     });
     let mut tasks = FuturesUnordered::new();
     'requests: loop {
@@ -505,7 +482,7 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>, mut stopped: watch::Rece
                 break;
             }
         };
-        if !ids.lock().unwrap().insert(frame.id) {
+        if !replies.ids.lock().unwrap().insert(frame.id) {
             tracing::warn!(request_id = frame.id, "duplicate in-flight IPC request");
             break;
         }
@@ -534,18 +511,8 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>, mut stopped: watch::Rece
             frame.data.is_empty()
         };
         if !data_valid || request.length as usize > MAX_DATA {
-            if send(
-                &replies,
-                frame.id,
-                method,
-                Err(errno(libc::EINVAL)),
-                local,
-                global,
-            )
-            .is_err()
-            {
-                break;
-            }
+            let response = outbound(frame.id, method, Err(errno(libc::EINVAL)), local, global);
+            tasks.push(replies.send(std::future::ready(Ok(response))));
             continue;
         }
         if matches!(
@@ -556,14 +523,12 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>, mut stopped: watch::Rece
             let handle = match current.handle(request.handle) {
                 Ok(handle) => handle,
                 Err(error) => {
-                    if send(&replies, frame.id, method, Err(error), local, global).is_err() {
-                        break;
-                    }
+                    let response = outbound(frame.id, method, Err(error), local, global);
+                    tasks.push(replies.send(std::future::ready(Ok(response))));
                     continue;
                 }
             };
             let engine = current.engine.clone();
-            let replies = replies.clone();
             let operation =
                 shared
                     .file_order
@@ -571,56 +536,39 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>, mut stopped: watch::Rece
                         let result = execute_file(&engine, &handle, request, frame.data);
                         // FileHandle destruction and its core locks stay on this thread.
                         drop(handle);
-                        send(&replies, frame.id, method, result, local, global)
+                        Ok(outbound(frame.id, method, result, local, global))
                     });
-            let failed = failed.clone();
-            tasks.push(async move {
-                let result = operation
-                    .await
-                    .map_err(anyhow::Error::from)
-                    .and_then(|result| result);
-                if let Err(error) = result {
-                    failed.send_replace(true);
-                    tracing::error!(%error, "IPC storage operation failed");
-                }
-            });
+            tasks.push(replies.send(async move { operation.await? }));
         } else {
-            // Namespace changes and CLOSE are session barriers, independent of
-            // whether the client has consumed replies from earlier operations.
+            // Namespace changes and CLOSE follow all earlier operations and
+            // replies in this session. Slow replies wait only on this coroutine.
             while tasks.next().await.is_some() {}
             let mut current = session.take().unwrap();
             let instance = shared.instance.clone();
             let permit = shared.workers.clone().acquire_owned().await.unwrap();
-            let replies = replies.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let result = execute(&mut current, request, &instance);
-                (
-                    current,
-                    send(&replies, frame.id, method, result, local, global),
-                )
+                (current, outbound(frame.id, method, result, local, global))
             })
             .await;
-            let result = match result {
-                Ok((current, result)) => {
+            let response = match result {
+                Ok((current, response)) => {
                     session = Some(current);
-                    result
+                    response
                 }
                 Err(error) => {
                     tracing::error!(%error, "IPC session operation failed");
                     break;
                 }
             };
-            if result.is_err() {
-                break;
-            }
+            tasks.push(replies.send(std::future::ready(Ok(response))));
         }
     }
     // Never abort admitted work: a timed-out/disconnected client does not cancel
     // a disk write, release its execution permit, or race handle destruction.
     while tasks.next().await.is_some() {}
     drop(replies);
-    let _ = reply_writer.await;
     if let Err(error) = tokio::task::spawn_blocking(move || drop(session)).await {
         tracing::error!(%error, "IPC session cleanup failed");
     }
@@ -634,14 +582,13 @@ struct Outbound {
     _global: BufferPermit,
 }
 
-fn send(
-    replies: &mpsc::Sender<Outbound>,
+fn outbound(
     id: u64,
     method: Method,
     result: Reply,
     local: OwnedSemaphorePermit,
     global: BufferPermit,
-) -> Result<()> {
+) -> Outbound {
     let (response, data) = match result {
         Ok(result) => result,
         Err(error) => {
@@ -668,20 +615,70 @@ fn send(
             )
         }
     };
-    // Each sender owns one of the same in-flight permits as queued replies,
-    // so enqueue never waits for network I/O or holds an execution permit.
-    replies
-        .try_send(Outbound {
-            frame: Frame {
-                id,
-                message: response.encode_to_vec(),
-                data,
-            },
-            method,
-            _local: local,
-            _global: global,
+    Outbound {
+        frame: Frame {
+            id,
+            message: response.encode_to_vec(),
+            data,
+        },
+        method,
+        _local: local,
+        _global: global,
+    }
+}
+
+/// Reply futures run in the session, without a writer task or a channel hop.
+/// Only network writes hold the async mutex; storage work has already finished.
+struct ReplyWriter {
+    socket: tokio::sync::Mutex<OwnedWriteHalf>,
+    // This lock protects only an in-memory set; it never crosses await or I/O.
+    ids: Mutex<HashSet<u64>>,
+    failed: watch::Sender<bool>,
+    stopped: watch::Receiver<bool>,
+    timeout: Duration,
+}
+impl ReplyWriter {
+    fn send(
+        self: &Arc<Self>,
+        operation: impl Future<Output = Result<Outbound>> + Send + 'static,
+    ) -> BoxFuture<'static, ()> {
+        let writer = self.clone();
+        let mut failure = self.failed.subscribe();
+        let mut stopped = self.stopped.clone();
+        Box::pin(async move {
+            // A disconnected client cannot cancel a disk operation or release
+            // its file turn/execution permit before it actually finishes.
+            let response = match operation.await {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::error!(%error, "IPC storage operation failed");
+                    writer.fail().await;
+                    return;
+                }
+            };
+            let send = async {
+                let mut socket = writer.socket.lock().await;
+                response.frame.write_async(&mut *socket).await
+            };
+            let result = tokio::select! {
+                biased;
+                _ = async { let _ = stopped.wait_for(|value| *value).await; } => return,
+                _ = async { let _ = failure.wait_for(|value| *value).await; } => return,
+                result = tokio::time::timeout(writer.timeout, send) => result,
+            };
+            writer.ids.lock().unwrap().remove(&response.frame.id);
+            if !matches!(result, Ok(Ok(()))) {
+                tracing::warn!(request_id = response.frame.id, method = ?response.method, error = ?result, "IPC reply write failed");
+                writer.fail().await;
+            }
         })
-        .map_err(|error| anyhow!("IPC reply queue closed: {error}"))
+    }
+    async fn fail(&self) {
+        self.failed.send_replace(true);
+        // Other reply futures observe failure and release the write lock. Close
+        // the write side even when unrelated disk operations are still draining.
+        let _ = self.socket.lock().await.shutdown().await;
+    }
 }
 
 fn ok(response: Response) -> Reply {
