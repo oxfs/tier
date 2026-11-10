@@ -58,6 +58,8 @@ cache directory = $tmp/cache
 pid directory = $tmp/run
 ncalrpc dir = $tmp/run/ncalrpc
 log file = $tmp/smb.log
+log level = ${SMB_TEST_LOG_LEVEL:-1}
+max log size = 0
 [tier]
 path = /
 vfs objects = tier

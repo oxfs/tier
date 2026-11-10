@@ -90,6 +90,9 @@ class ProtocolTests(unittest.TestCase):
             [
                 "smbclient",
                 "//127.0.0.1/fault",
+                # Allow Tier's 60-second deadline to fire before the client.
+                "-t",
+                "70",
                 "-p",
                 os.environ["SMB_TEST_PORT"],
                 "-U",

@@ -65,4 +65,4 @@ rust-analyzer diagnostics . --severity error
 make build
 ```
 
-Samba 插件在 Debian 13 中构建。启用 `deb-src`，安装 `samba`、`protobuf-c-compiler`、`libprotobuf-c-dev` 和 `apt build-dep samba` 所需依赖，然后运行 `samba/build.sh /tmp/tier-module`。CI 会打包并在干净 Debian 环境中验证安装、真实 SMB 操作与故障恢复。
+Samba 插件在 Debian 13 中构建。启用 `deb-src`，安装 `samba`、`samba-dev`、`protobuf-c-compiler`、`libprotobuf-c-dev` 和 `apt build-dep samba` 所需依赖，然后运行 `samba/build.sh /tmp/tier-module`。CI 会打包并在干净 Debian 环境中验证安装、真实 SMB 操作与故障恢复。
