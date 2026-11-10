@@ -933,8 +933,8 @@ static struct vfs_fn_pointers tier_fns = {
     .create_dfs_pathat_fn = vfs_not_implemented_create_dfs_pathat,
     .read_dfs_pathat_fn = vfs_not_implemented_read_dfs_pathat,
 };
-NTSTATUS samba_init_module(TALLOC_CTX *ctx);
-NTSTATUS samba_init_module(TALLOC_CTX *ctx)
+_PUBLIC_ NTSTATUS samba_init_module(TALLOC_CTX *ctx);
+_PUBLIC_ NTSTATUS samba_init_module(TALLOC_CTX *ctx)
 {
 	return smb_register_vfs(SMB_VFS_INTERFACE_VERSION, "tier", &tier_fns);
 }
