@@ -17,7 +17,6 @@ use std::{
     os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::{Condvar, LazyLock, Mutex},
-    thread,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -165,18 +164,8 @@ impl Engine {
     pub fn backup_tick(&self, kind: Kind) -> Result<()> {
         self.dispatch_backups(kind, true)
     }
-    pub(crate) fn schedule_backup(&self, kind: Kind) -> Result<()> {
+    pub fn schedule_backup(&self, kind: Kind) -> Result<()> {
         self.dispatch_backups(kind, false)
-    }
-    pub fn schedule_backups(&self) -> Result<()> {
-        let mut errors = Vec::new();
-        for kind in [Kind::Export, Kind::Metadata] {
-            if let Err(error) = self.schedule_backup(kind) {
-                errors.push(format!("{}: {error:#}", kind.as_str()));
-            }
-        }
-        ensure!(errors.is_empty(), "{}", errors.join("; "));
-        Ok(())
     }
     fn dispatch_backups(&self, kind: Kind, force: bool) -> Result<()> {
         let Some(schedule) = self.kv_get::<Schedule>(kind.key())? else {
@@ -218,77 +207,68 @@ impl Engine {
         } else {
             None
         };
-        thread::scope(|scope| -> Result<()> {
-            let mut tasks = Vec::new();
-            for (path, key) in jobs {
-                let rows = &rows;
-                let system = &system;
-                let schedule = &schedule;
-                tasks.push(scope.spawn(move || -> Result<()> {
-                    let Some(_ticket) =
-                        BackupTicket::acquire((system.clone(), kind, path.clone()), force)
-                    else {
-                        return Ok(());
-                    };
-                    let previous = self.kv_get::<Status>(&key)?;
-                    let time = crate::core::now()?;
-                    let delay = if previous.as_ref().is_some_and(|s| s.error.is_some()) {
-                        schedule.seconds.min(60)
-                    } else {
-                        schedule.seconds
-                    };
-                    if !force
-                        && previous
-                            .as_ref()
-                            .is_some_and(|s| time.saturating_sub(s.attempted_at) < delay)
-                    {
-                        return Ok(());
-                    }
-                    let result = match rows {
-                        Some(Ok(rows)) => publish_export(&path, system, rows, schedule.keep),
-                        Some(Err(error)) => Err(anyhow::anyhow!(error.clone())),
-                        None => self.publish_metadata(&path, system, schedule.keep),
-                    };
-                    let status = Status {
-                        kind,
-                        path,
-                        attempted_at: time,
-                        time: if result.is_ok() {
-                            time
-                        } else {
-                            previous.as_ref().map_or(0, |s| s.time)
-                        },
-                        latest: result
-                            .as_ref()
-                            .ok()
-                            .map(|p| p.latest.clone())
-                            .or_else(|| previous.and_then(|s| s.latest)),
-                        error: match &result {
-                            Ok(p) => p.cleanup_error.clone(),
-                            Err(e) => Some(format!("{e:#}")),
-                        },
-                    };
-                    self.put_record(&key, &status, false)?;
-                    ensure!(
-                        status.error.is_none(),
-                        "{}",
-                        status.error.unwrap_or_default()
-                    );
-                    Ok(())
-                }));
-            }
-            let mut errors = Vec::new();
-            for task in tasks {
-                match task.join() {
-                    Ok(Ok(())) => (),
-                    Ok(Err(e)) => errors.push(format!("{e:#}")),
-                    Err(_) => errors.push("backup worker panicked".into()),
+        let mut errors = Vec::new();
+        for (path, key) in jobs {
+            let result = (|| -> Result<()> {
+                let Some(_ticket) =
+                    BackupTicket::acquire((system.clone(), kind, path.clone()), force)
+                else {
+                    return Ok(());
+                };
+                let previous = self.kv_get::<Status>(&key)?;
+                let time = crate::core::now()?;
+                let delay = if previous.as_ref().is_some_and(|s| s.error.is_some()) {
+                    schedule.seconds.min(60)
+                } else {
+                    schedule.seconds
+                };
+                if !force
+                    && previous
+                        .as_ref()
+                        .is_some_and(|s| time.saturating_sub(s.attempted_at) < delay)
+                {
+                    return Ok(());
                 }
+                let result = match &rows {
+                    Some(Ok(rows)) => publish_export(&path, &system, rows, schedule.keep),
+                    Some(Err(error)) => Err(anyhow::anyhow!(error.clone())),
+                    None => self.publish_metadata(&path, &system, schedule.keep),
+                };
+                let status = Status {
+                    kind,
+                    path,
+                    attempted_at: time,
+                    time: if result.is_ok() {
+                        time
+                    } else {
+                        previous.as_ref().map_or(0, |s| s.time)
+                    },
+                    latest: result
+                        .as_ref()
+                        .ok()
+                        .map(|p| p.latest.clone())
+                        .or_else(|| previous.and_then(|s| s.latest)),
+                    error: match &result {
+                        Ok(p) => p.cleanup_error.clone(),
+                        Err(e) => Some(format!("{e:#}")),
+                    },
+                };
+                self.put_record(&key, &status, false)?;
+                ensure!(
+                    status.error.is_none(),
+                    "{}",
+                    status.error.unwrap_or_default()
+                );
+                Ok(())
+            })();
+            if let Err(error) = result {
+                errors.push(format!("{error:#}"));
             }
-            ensure!(errors.is_empty(), "{}", errors.join("; "));
-            Ok(())
-        })
+        }
+        ensure!(errors.is_empty(), "{}", errors.join("; "));
+        Ok(())
     }
+
     fn publish_metadata(&self, path: &Path, system: &str, keep: usize) -> Result<Publication> {
         let pinned = fs::File::open(path)?;
         let path = PathBuf::from(format!("/proc/self/fd/{}", pinned.as_raw_fd()));

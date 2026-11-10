@@ -1,6 +1,6 @@
 [package]
 name = "tier"
-version = "0.4.4"
+version = "0.5.0"
 edition = "2024"
 description = "Policy-driven storage for home Samba shares"
 
@@ -10,6 +10,7 @@ anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 csv = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 libc = "0.2"
 rocksdb = { version = "0.24", default-features = false, features = ["lz4"] }
 parking_lot = "0.12"
@@ -19,7 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
-tokio = { version = "1", features = ["rt", "net", "signal", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros", "sync", "io-util", "time"] }
 uuid = { version = "1", features = ["v4"] }
 ureq = "2.12"
 url = "2"

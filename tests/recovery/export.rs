@@ -93,7 +93,9 @@ fn independent_export_schedule_records_failures_without_disabling_metadata_backu
             },
         )?;
     }
-    engine.schedule_backups()?;
+    for kind in [Kind::Export, Kind::Metadata] {
+        engine.schedule_backup(kind)?;
+    }
     assert!(
         engine.state()?["backup_status"]
             .as_array()

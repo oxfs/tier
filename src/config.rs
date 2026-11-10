@@ -6,7 +6,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
 };
-use tier::core::RocksDbOptions;
+use tier::{core::RocksDbOptions, ipc::IpcOptions, service::RuntimeOptions};
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,6 +16,10 @@ pub struct Settings {
     pub admin: Option<SocketAddr>,
     #[serde(default)]
     pub rocksdb: RocksDbOptions,
+    #[serde(default)]
+    pub runtime: RuntimeOptions,
+    #[serde(default)]
+    pub ipc: IpcOptions,
 }
 
 fn user_dir(variable: &str, fallback: &str) -> Result<PathBuf> {
@@ -46,6 +50,8 @@ impl Settings {
         let settings: Self =
             toml::from_str(&contents).with_context(|| format!("parse {}", path.display()))?;
         settings.rocksdb.validate()?;
+        settings.runtime.validate()?;
+        settings.ipc.validate()?;
         for path in settings.db.iter().chain(&settings.socket) {
             ensure!(
                 path.is_absolute(),
@@ -89,6 +95,98 @@ mod tests {
             fs::write(&path, invalid).unwrap();
             assert!(Settings::load(Some(&path)).is_err());
         }
+    }
+
+    #[test]
+    fn runtime_defaults_overrides_and_invalid_limits() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("tier.toml");
+        for limit in [1, 2] {
+            fs::write(&path, format!("[runtime]\nmax_blocking_threads={limit}"))?;
+            assert_eq!(
+                Settings::load(Some(&path))?.runtime.max_blocking_threads,
+                limit
+            );
+        }
+        for invalid in [
+            "max_blocking_threads=0",
+            "max_blocking_threads=-1",
+            "max_blocking_threads=9223372036854775807",
+            "worker_threads=0",
+            "worker_threads=9223372036854775807",
+            "admin_request_limit=0",
+            "admin_request_limit=4294967296",
+            "background_task_limit=0",
+            "background_task_limit=9223372036854775807",
+            "workers=4",
+        ] {
+            fs::write(&path, format!("[runtime]\n{invalid}"))?;
+            assert!(Settings::load(Some(&path)).is_err(), "accepted {invalid}");
+        }
+        fs::write(
+            &path,
+            "[runtime]\nworker_threads=1\nadmin_request_limit=3\nbackground_task_limit=2",
+        )?;
+        let settings = Settings::load(Some(&path))?;
+        assert_eq!(settings.runtime.worker_threads, Some(1));
+        assert_eq!(settings.runtime.admin_request_limit, 3);
+        assert_eq!(settings.runtime.background_task_limit, 2);
+        let defaults: Settings = toml::from_str(include_str!("../deploy/tier.toml"))?;
+        defaults.runtime.validate()?;
+        assert_eq!(defaults.runtime.worker_threads, None);
+        assert_eq!(
+            defaults.runtime.admin_request_limit,
+            RuntimeOptions::default().admin_request_limit
+        );
+        assert_eq!(
+            defaults.runtime.background_task_limit,
+            RuntimeOptions::default().background_task_limit
+        );
+        assert_eq!(
+            defaults.runtime.max_blocking_threads,
+            RuntimeOptions::default().max_blocking_threads
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ipc_defaults_overrides_and_invalid_limits() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("tier.toml");
+        fs::write(
+            &path,
+            "[ipc]\nmax_connections=2\nmax_inflight_per_connection=1\nreply_timeout_secs=5",
+        )?;
+        let settings = Settings::load(Some(&path))?;
+        assert_eq!(settings.ipc.max_connections, 2);
+        assert_eq!(settings.ipc.max_inflight_per_connection, 1);
+        assert_eq!(settings.ipc.reply_timeout_secs, 5);
+        assert_eq!(settings.ipc.connection_control_buffer_mib, 16);
+        for invalid in [
+            "max_connections=0",
+            "data_buffer_mib=1",
+            "data_buffer_mib=9223372036854775807",
+            "reply_timeout_secs=0",
+            "connection_data_buffer_mib=256",
+            "connection_control_buffer_mib=0",
+            "connection_control_buffer_mib=6",
+            "control_buffer_mib=4\nconnection_control_buffer_mib=8",
+            "max_requests=10",
+        ] {
+            fs::write(&path, format!("[ipc]\n{invalid}"))?;
+            assert!(Settings::load(Some(&path)).is_err(), "accepted {invalid}");
+        }
+        let defaults: Settings = toml::from_str(include_str!("../deploy/tier.toml"))?;
+        defaults.ipc.validate()?;
+        assert_eq!(
+            defaults.ipc.max_connections,
+            IpcOptions::default().max_connections
+        );
+        assert_eq!(
+            defaults.ipc.max_inflight_per_connection,
+            IpcOptions::default().max_inflight_per_connection
+        );
+        Ok(())
     }
 
     #[test]

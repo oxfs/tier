@@ -14,6 +14,8 @@ fn unicode_case_aliases_share_one_identity_and_policy_override_can_be_removed() 
     }
     let policy = |target: &str| Policy {
         write_cache: vec![target.into()],
+        low_water: 99,
+        high_water: 100,
         ..Policy::default()
     };
     engine.set_policy("/", &policy("a"))?;

@@ -14,7 +14,7 @@ Tier 将 NAS 上的多个存储目录组织成一个 SMB 共享，通过 Web 控
 
 ```sh
 sudo apt update
-sudo apt install samba libprotobuf-c1
+sudo apt install samba libprotobuf-c1 libjemalloc2
 sha256sum --check SHA256SUMS
 tar -xzf tier-debian13-amd64.tar.gz
 cd tier-debian13-amd64

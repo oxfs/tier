@@ -15,7 +15,12 @@ fi
     echo 'Samba package version does not match tier.so; install a matching Tier package.' >&2
     exit 1
 }
-dpkg-query -W libprotobuf-c1 >/dev/null
+for dependency in libprotobuf-c1 libjemalloc2; do
+    [ "$(dpkg-query -W -f='${Status}' "$dependency" 2>/dev/null)" = 'install ok installed' ] || {
+        echo "Tier requires $dependency; install it with apt install $dependency." >&2
+        exit 1
+    }
+done
 getent group tier >/dev/null || groupadd --system tier
 module_dir=$(smbd -b | awk '$1 == "MODULESDIR:" {print $2}')
 [ -n "$module_dir" ] || {
