@@ -17,6 +17,7 @@ struct tier_fh {
 	uint64_t handle;
 	int flags;
 	off_t offset;
+	bool metadata;
 };
 struct tier_dir {
 	struct tier_config *config;
@@ -258,6 +259,7 @@ static int tier_openat(struct vfs_handle_struct *h, const struct files_struct *d
 	}
 	f->handle = out->handle;
 	f->flags = how->flags;
+	f->metadata = r.access == TIER__IPC__ACCESS__METADATA;
 	fsp->fsp_flags.have_proc_fds = false;
 	ret = descriptor;
 done: {
@@ -270,12 +272,16 @@ done: {
 static int tier_close(struct vfs_handle_struct *h, struct files_struct *fsp)
 {
 	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
+	struct tier_fh *f = VFS_FETCH_FSP_EXTENSION(h, fsp);
 	int ret;
 	r.method = TIER__IPC__METHOD__CLOSE;
 	r.handle = fh(h, fsp);
 	if (!r.handle)
 		return -1;
-	ret = rpc_status(h, &r);
+	/* Metadata handles own no file or durability work; only their daemon
+	 * bookkeeping may outlive this fsp. Data-file CLOSE remains synchronous. */
+	ret = f->metadata ? tier_defer_close(config(h)->client, r.handle)
+			  : rpc_status(h, &r);
 	VFS_REMOVE_FSP_EXTENSION(h, fsp);
 	return ret;
 }
@@ -684,7 +690,7 @@ static DIR *tier_fdopendir(struct vfs_handle_struct *h, struct files_struct *fsp
 	d->config = config(h);
 	d->handle = fh(h, fsp);
 	d->fsp = fsp;
-	if (!d->handle || dir_open_cursor(d)) {
+	if (!d->handle) {
 		int saved = errno;
 		TALLOC_FREE(d);
 		errno = saved;
@@ -702,6 +708,9 @@ static struct dirent *tier_readdir(struct vfs_handle_struct *h, struct files_str
 		errno = d->error;
 		return NULL;
 	}
+	/* Snapshot on the first read, after Samba's initial rewind. */
+	if (!d->cursor && dir_open_cursor(d))
+		return NULL;
 	if (!d->page || d->index == d->page->n_entries) {
 		if (d->eof) {
 			errno = 0;
@@ -746,7 +755,12 @@ static void tier_rewinddir(struct vfs_handle_struct *h, DIR *dir)
 {
 	struct tier_dir *d = (struct tier_dir *)dir;
 	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
-	TALLOC_CTX *tmp = talloc_new(d);
+	TALLOC_CTX *tmp;
+	if (!d->cursor) {
+		d->error = 0;
+		return;
+	}
+	tmp = talloc_new(d);
 	r.method = TIER__IPC__METHOD__CLOSEDIR;
 	r.handle = d->cursor;
 	if (!tier_rpc(tmp, d->config->client, &r)) {
@@ -755,10 +769,12 @@ static void tier_rewinddir(struct vfs_handle_struct *h, DIR *dir)
 		return;
 	}
 	TALLOC_FREE(tmp);
+	d->cursor = 0;
 	TALLOC_FREE(d->page_ctx);
 	d->page = NULL;
 	d->index = 0;
-	dir_open_cursor(d);
+	d->eof = false;
+	d->error = 0;
 }
 static int tier_closedir(struct vfs_handle_struct *h, DIR *dir)
 {
@@ -767,7 +783,7 @@ static int tier_closedir(struct vfs_handle_struct *h, DIR *dir)
 	int ret;
 	r.method = TIER__IPC__METHOD__CLOSEDIR;
 	r.handle = d->cursor;
-	ret = rpc_status(h, &r);
+	ret = d->cursor ? rpc_status(h, &r) : 0;
 	{
 		int saved = errno;
 		int closed = tier_close(h, d->fsp);

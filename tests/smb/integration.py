@@ -13,7 +13,19 @@ from pathlib import Path
 
 import smbclient
 from smbclient._os import _set_basic_information
-from smbprotocol.exceptions import SMBResponseException
+from smbclient._pool import get_smb_tree
+from smbprotocol.exceptions import NoMoreFiles, NoSuchFile, SMBResponseException
+from smbprotocol.open import (
+    CreateDisposition,
+    CreateOptions,
+    FileAttributes,
+    FileInformationClass,
+    FilePipePrinterAccessMask,
+    ImpersonationLevel,
+    Open,
+    QueryDirectoryFlags,
+    ShareAccess,
+)
 from support import Environment
 
 
@@ -75,7 +87,7 @@ class SMBTests(ConnectedTest):
             f.flush()
         assert self.env.read("partial") == b"abXYe"
 
-        # Cross-session stat and read observe writes; no mutable attribute TTL cache.
+        # Separate handles observe writes before the writer closes.
         with smbclient.open_file(
             self.env.path("visible"), "wb", buffering=0, share_access="rwd", **self.env.config
         ) as f:
@@ -100,6 +112,32 @@ class SMBTests(ConnectedTest):
             self.env.path("attributes-directory"), file_attributes=0x10, **self.env.config
         )
         assert self.env.read("partial") == b"abXYe"
+
+    def test_metadata_updates_are_visible_across_connections(self):
+        writer = dict(self.env.config, connection_cache={})
+        self.addCleanup(
+            smbclient.reset_connection_cache, connection_cache=writer["connection_cache"]
+        )
+        original = self.env.path("cross-connection-before")
+        renamed = self.env.path("cross-connection-after")
+        self.env.write("cross-connection-before", b"old", writer)
+        # Read through A before B mutates the same file identity.
+        self.assertEqual(smbclient.stat(original, **self.env.config).st_size, 3)
+        self.env.write("cross-connection-before", b"updated contents", writer)
+        self.assertEqual(smbclient.stat(original, **self.env.config).st_size, 16)
+        stamp = 1_704_164_645_123_456_700
+        smbclient.utime(original, ns=(stamp, stamp), **writer)
+        self.assertEqual(smbclient.stat(original, **self.env.config).st_mtime_ns, stamp)
+        smbclient.rename(original, renamed, **writer)
+        with self.assertRaises(OSError) as missing:
+            smbclient.stat(original, **self.env.config)
+        self.assertEqual(missing.exception.errno, errno.ENOENT)
+        current = smbclient.stat(renamed, **self.env.config)
+        self.assertEqual((current.st_size, current.st_mtime_ns), (16, stamp))
+        smbclient.remove(renamed, **writer)
+        with self.assertRaises(OSError) as missing:
+            smbclient.stat(renamed, **self.env.config)
+        self.assertEqual(missing.exception.errno, errno.ENOENT)
 
     def test_namespace(self):
         self.env.write("namespace-file", b"abXYe")
@@ -135,6 +173,69 @@ class SMBTests(ConnectedTest):
             assert error.errno == errno.ENOENT, error
         else:
             raise AssertionError("old rename path remains visible")
+
+    def test_directory_restart_observes_namespace_changes(self):
+        directory = "restart-directory"
+        smbclient.mkdir(self.env.path(directory), **self.env.config)
+        tree, name = get_smb_tree(self.env.path(directory), **self.env.config)
+        handle = Open(tree, name)
+        handle.create(
+            ImpersonationLevel.Impersonation,
+            FilePipePrinterAccessMask.GENERIC_READ,
+            FileAttributes.FILE_ATTRIBUTE_DIRECTORY,
+            ShareAccess.FILE_SHARE_READ
+            | ShareAccess.FILE_SHARE_WRITE
+            | ShareAccess.FILE_SHARE_DELETE,
+            CreateDisposition.FILE_OPEN,
+            CreateOptions.FILE_DIRECTORY_FILE,
+        )
+        self.addCleanup(handle.close)
+        writer_options = dict(self.env.config, connection_cache={})
+        self.addCleanup(
+            smbclient.reset_connection_cache, connection_cache=writer_options["connection_cache"]
+        )
+
+        def page(restart=False):
+            flags = QueryDirectoryFlags.SMB2_RESTART_SCANS if restart else 0
+            entries = handle.query_directory(
+                "*", FileInformationClass.FILE_NAMES_INFORMATION, flags=flags, max_output=256
+            )
+            return [entry["file_name"].get_value().decode("utf-16-le") for entry in entries]
+
+        def restart_and_list():
+            names = []
+            restart = True
+            while True:
+                try:
+                    names.extend(page(restart))
+                except (NoMoreFiles, NoSuchFile):
+                    break
+                restart = False
+            return [name for name in names if name not in (".", "..")]
+
+        # Changes after opening the directory must appear in its first query.
+        expected = {f"entry-{index:03}" for index in range(32)}
+        for name in sorted(expected):
+            self.env.write(f"{directory}/{name}", b"x", writer_options)
+        partial = set(page(True)) - {".", ".."}
+        self.assertTrue(partial)
+        self.assertLess(len(partial), len(expected))
+
+        # Restart discards a partially consumed snapshot and sees new membership.
+        removed = min(partial)
+        smbclient.remove(self.env.path(f"{directory}/{removed}"), **writer_options)
+        expected.remove(removed)
+        self.env.write(f"{directory}/added", b"new", writer_options)
+        expected.add("added")
+        self.assertCountEqual(restart_and_list(), expected)
+        self.assertCountEqual(restart_and_list(), expected)
+
+        # Empty-directory EOF must not suppress a subsequent refreshed snapshot.
+        for name in sorted(expected):
+            smbclient.remove(self.env.path(f"{directory}/{name}"), **writer_options)
+        self.assertEqual(restart_and_list(), [])
+        self.env.write(f"{directory}/after-empty", b"visible", writer_options)
+        self.assertEqual(restart_and_list(), ["after-empty"])
 
     def test_concurrent_io(self):
         # Distinct-file I/O can proceed concurrently across SMB sessions/processes.

@@ -78,7 +78,7 @@ impl Engine {
             }
             let id: String = Self::decode(&v)?;
             let bytes = snapshot
-                .get(schema::node(&id))?
+                .get_pinned(schema::node(&id))?
                 .ok_or_else(|| failure(libc::ENOENT))?;
             let r: Record = Self::decode(&bytes)?;
             visitor(r.name, r.node)?;

@@ -6,7 +6,7 @@ use prost::Message;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
-    io::{self, Read, Seek, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, Write},
     net::Shutdown,
     os::{
         fd::AsRawFd,
@@ -31,6 +31,7 @@ const MAX_REQUESTS: usize = 128;
 const MAX_CURSOR_BYTES: usize = 64 * 1024 * 1024;
 const GLOBAL_CURSOR_BYTES: usize = 128 * 1024 * 1024;
 const CURSOR_MEMORY_BYTES: usize = 256 * 1024;
+const CURSOR_BUFFER_BYTES: usize = 64 * 1024;
 
 fn errno(code: i32) -> anyhow::Error {
     io::Error::from_raw_os_error(code).into()
@@ -96,7 +97,8 @@ impl Drop for CursorBudget {
 }
 enum CursorSource {
     Memory(VecDeque<Entry>),
-    Disk(fs::File),
+    Spooling(BufWriter<fs::File>),
+    Disk(BufReader<fs::File>),
 }
 struct Cursor {
     source: CursorSource,
@@ -128,31 +130,44 @@ impl Cursor {
                     Self::write_entry(&mut file, &entry)?;
                 }
             }
-            self.source = CursorSource::Disk(file);
-            self.budget.shrink(0);
+            // Release the in-memory entries before allocating the spool buffer.
+            // A fully exhausted global/session budget keeps unbuffered I/O.
+            self.source = CursorSource::Memory(VecDeque::new());
+            self.budget
+                .shrink(self.budget.bytes.min(CURSOR_BUFFER_BYTES));
+            self.source = CursorSource::Spooling(BufWriter::with_capacity(self.budget.bytes, file));
         }
         match &mut self.source {
             CursorSource::Memory(entries) => {
                 entries.push_back(entry);
                 self.memory_bytes += bytes;
             }
-            CursorSource::Disk(file) => Self::write_entry(file, &entry)?,
+            CursorSource::Spooling(file) => Self::write_entry(file, &entry)?,
+            CursorSource::Disk(_) => return Err(errno(libc::EINVAL)),
         }
         self.remaining += 1;
         Ok(())
     }
-    fn write_entry(file: &mut fs::File, entry: &Entry) -> Result<()> {
+    fn write_entry(file: &mut impl Write, entry: &Entry) -> Result<()> {
         let bytes = entry.encode_to_vec();
         file.write_all(&(bytes.len() as u32).to_be_bytes())?;
         file.write_all(&bytes)?;
         Ok(())
     }
     fn finish(&mut self) -> Result<()> {
-        match &mut self.source {
-            CursorSource::Memory(_) => self.budget.shrink(self.memory_bytes),
-            CursorSource::Disk(file) => {
-                file.rewind()?;
-            }
+        // BufWriter::drop ignores write failures: flush before publishing a cursor.
+        if let CursorSource::Spooling(writer) = &mut self.source {
+            writer.flush()?;
+            let CursorSource::Spooling(writer) =
+                std::mem::replace(&mut self.source, CursorSource::Memory(VecDeque::new()))
+            else {
+                unreachable!();
+            };
+            let mut file = writer.into_inner().map_err(|error| error.into_error())?;
+            file.rewind()?;
+            self.source = CursorSource::Disk(BufReader::with_capacity(self.budget.bytes, file));
+        } else if matches!(self.source, CursorSource::Memory(_)) {
+            self.budget.shrink(self.memory_bytes);
         }
         Ok(())
     }
@@ -165,6 +180,7 @@ impl Cursor {
         }
         let entry = match &mut self.source {
             CursorSource::Memory(entries) => entries.pop_front().unwrap(),
+            CursorSource::Spooling(_) => return Err(errno(libc::EINVAL)),
             CursorSource::Disk(file) => {
                 let mut length = [0; 4];
                 file.read_exact(&mut length)?;
@@ -943,5 +959,70 @@ fn attr(node: &Node) -> Attr {
         ctime: Some(timestamp(node.ctime)),
         btime: Some(timestamp(node.btime)),
         version: node.version,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spooled_cursor_preserves_order_pending_and_memory_budget() -> Result<()> {
+        for available in [0, 32, 4096, CURSOR_MEMORY_BYTES] {
+            let used = Arc::new(Mutex::new(0));
+            let mut cursor = Cursor::new(CursorBudget::reserve(used.clone(), available)?);
+            for index in 0..1000 {
+                cursor.append(Entry {
+                    name: format!("entry-{index:04}"),
+                    attr: None,
+                })?;
+            }
+            cursor.finish()?;
+            assert!(matches!(cursor.source, CursorSource::Disk(_)));
+            assert_eq!(cursor.budget.bytes, available.min(CURSOR_BUFFER_BYTES));
+            assert_eq!(*used.lock().unwrap(), cursor.budget.bytes);
+            let first = cursor.next()?.unwrap();
+            cursor.pending = Some(first);
+            for index in 0..1000 {
+                assert_eq!(cursor.next()?.unwrap().name, format!("entry-{index:04}"));
+            }
+            assert!(cursor.eof());
+            assert!(cursor.next()?.is_none());
+            drop(cursor);
+            assert_eq!(*used.lock().unwrap(), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_finish_propagates_buffered_write_failure() -> Result<()> {
+        let temporary = tempfile::NamedTempFile::new()?;
+        let readonly = fs::File::open(temporary.path())?;
+        let used = Arc::new(Mutex::new(0));
+        let mut cursor = Cursor::new(CursorBudget::reserve(used, 4096)?);
+        cursor.source = CursorSource::Spooling(BufWriter::with_capacity(4096, readonly));
+        cursor.append(Entry {
+            name: "buffered".into(),
+            attr: None,
+        })?;
+        assert!(cursor.finish().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn spooled_cursor_rejects_truncated_record() -> Result<()> {
+        let used = Arc::new(Mutex::new(0));
+        let mut cursor = Cursor::new(CursorBudget::reserve(used, 32)?);
+        cursor.append(Entry {
+            name: "truncated".into(),
+            attr: None,
+        })?;
+        cursor.finish()?;
+        let CursorSource::Disk(reader) = &mut cursor.source else {
+            panic!("expected spool")
+        };
+        reader.get_mut().set_len(3)?;
+        assert!(cursor.next().is_err());
+        Ok(())
     }
 }

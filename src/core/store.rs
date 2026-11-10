@@ -101,7 +101,7 @@ impl MetadataStore {
     }
     pub(crate) fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         self.db
-            .get(key)?
+            .get_pinned(key)?
             .map(|bytes| {
                 schema::decode(&bytes).with_context(|| format!("invalid metadata value at {key}"))
             })

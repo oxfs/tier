@@ -102,7 +102,9 @@ impl Engine {
         view: &rocksdb::Snapshot<'_>,
         key: &str,
     ) -> Result<Option<T>> {
-        view.get(key)?.map(|bytes| Self::decode(&bytes)).transpose()
+        view.get_pinned(key)?
+            .map(|bytes| Self::decode(&bytes))
+            .transpose()
     }
     pub(crate) fn live(&self, id: &str) -> Result<bool> {
         Ok(self.path_for(id)?.is_some())
@@ -127,16 +129,37 @@ impl Engine {
     }
     pub(crate) fn policy(&self, id: &str) -> Result<Policy> {
         let view = self.inner.db.snapshot();
+        Self::policy_in_view(&view, id, None)
+    }
+    /// Caller holds the file lock, keeping this record stable through the write.
+    /// Policy ancestry and the record come from the same snapshot; no cross-request cache.
+    pub(crate) fn record_with_policy(&self, id: &str) -> Result<(Record, Policy)> {
+        let view = self.inner.db.snapshot();
+        let record: Record =
+            Self::view_get(&view, &schema::node(id))?.ok_or_else(|| failure(libc::ENOENT))?;
+        let policy = Self::policy_in_view(&view, id, Some(&record))?;
+        Ok((record, policy))
+    }
+    fn policy_in_view(
+        view: &rocksdb::Snapshot<'_>,
+        id: &str,
+        mut first: Option<&Record>,
+    ) -> Result<Policy> {
         let mut id = id.to_owned();
         let mut seen = HashSet::new();
         loop {
             ensure!(seen.insert(id.clone()), "namespace cycle");
-            if let Some(policy) = Self::view_get(&view, &schema::policy(&id))? {
+            if let Some(policy) = Self::view_get(view, &schema::policy(&id))? {
                 return Ok(policy);
             }
-            let node: Record =
-                Self::view_get(&view, &schema::node(&id))?.ok_or_else(|| failure(libc::ENOENT))?;
-            if let Some(parent) = node.parent {
+            let parent = if let Some(record) = first.take() {
+                record.parent.clone()
+            } else {
+                Self::view_get::<Record>(view, &schema::node(&id))?
+                    .ok_or_else(|| failure(libc::ENOENT))?
+                    .parent
+            };
+            if let Some(parent) = parent {
                 id = parent;
             } else {
                 for item in view.iterator(IteratorMode::From(
