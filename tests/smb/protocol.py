@@ -157,6 +157,71 @@ class ProtocolTests(unittest.TestCase):
         self.assertLess(elapsed, 75)
         self.assertIn("tier IPC timeout:", (self.root / "smb.log").read_text())
 
+    def test_metadata_close_does_not_wait_and_errors_fail_connection(self):
+        for inject_error, single_slot in ((False, False), (True, False), (False, True)):
+            with self.subTest(inject_error=inject_error, single_slot=single_slot):
+                advanced = threading.Event()
+                intercepted = threading.Event()
+
+                def proxy(
+                    front,
+                    stop,
+                    advanced=advanced,
+                    intercepted=intercepted,
+                    single_slot=single_slot,
+                    inject_error=inject_error,
+                ):
+                    close_id = None
+                    hello_id = None
+                    held = None
+                    with socket.socket(socket.AF_UNIX) as back:
+                        back.connect(str(self.root / "tier.sock"))
+                        back.settimeout(5)
+                        while not stop.is_set():
+                            for source in select.select([front, back], [], [], 0.1)[0]:
+                                request_id, message, data = receive_frame(source)
+                                if source is front:
+                                    if message[:2] == b"\x08\x01":
+                                        hello_id = request_id
+                                    if close_id is not None:
+                                        advanced.set()
+                                        if held is not None:
+                                            front.sendall(held)
+                                            held = None
+                                    elif message[:2] == b"\x08\x0e":
+                                        # Listing opens only metadata pathrefs.
+                                        close_id = request_id
+                                        intercepted.set()
+                                    back.sendall(frame(request_id, message, data))
+                                elif request_id == hello_id and single_slot:
+                                    # A final scalar occurrence overrides HELLO's
+                                    # max_inflight: the next call must drain CLOSE.
+                                    front.sendall(frame(request_id, message + b"\x78\x01", data))
+                                elif request_id == close_id:
+                                    if inject_error:
+                                        # The daemon released the handle; inject an
+                                        # error in the asynchronous acknowledgement.
+                                        message = b"\x08\x05"  # errno EIO
+                                    reply = frame(request_id, message, data)
+                                    if single_slot or advanced.is_set():
+                                        front.sendall(reply)
+                                    else:
+                                        held = reply
+                                else:
+                                    front.sendall(frame(request_id, message, data))
+
+                with backend(self.root, proxy):
+                    result = self.client("ls; ls")
+                self.assertTrue(intercepted.is_set(), result.stdout + result.stderr)
+                self.assertTrue(advanced.is_set(), "CLOSE blocked the next IPC request")
+                if inject_error:
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn(
+                        "tier deferred CLOSE failed:", (self.root / "smb.log").read_text()
+                    )
+                else:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

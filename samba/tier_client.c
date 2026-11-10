@@ -34,7 +34,7 @@ struct tier_call {
 	uint8_t *data;
 	size_t data_length;
 	int error;
-	bool done;
+	bool done, deferred;
 };
 struct tier_client {
 	int fd;
@@ -42,7 +42,7 @@ struct tier_client {
 	struct tevent_context *ev;
 	struct tier_call *calls;
 	uint64_t next_id;
-	unsigned count;
+	unsigned count, deferred;
 	int error;
 	uint32_t max_data;
 	uint32_t max_inflight;
@@ -82,6 +82,8 @@ static void finish(struct tier_call *p, int error)
 {
 	DLIST_REMOVE(p->client->calls, p);
 	p->client->count--;
+	if (p->deferred)
+		p->client->deferred--;
 	p->error = error;
 	p->done = true;
 	TALLOC_FREE(p->frame);
@@ -105,6 +107,8 @@ static void fail(struct tier_client *c, int error)
 			c->calls ? c->calls->method : 0);
 	}
 	c->error = error ? error : EIO;
+	if (c->fd >= 0)
+		shutdown(c->fd, SHUT_RDWR);
 	while (c->calls)
 		finish(c->calls, c->error);
 	interest(c);
@@ -244,6 +248,12 @@ receive:
 		}
 		TALLOC_FREE(c->body);
 		c->header_used = c->body_used = c->body_length = 0;
+		if (p->deferred && p->response->error) {
+			DBG_ERR("tier deferred CLOSE failed: request=%llu errno=%d\n",
+				(unsigned long long)p->id, p->response->error);
+			fail(c, p->response->error);
+			return;
+		}
 		finish(p, 0);
 	}
 	interest(c);
@@ -253,12 +263,50 @@ static void socket_event(struct tevent_context *ev, struct tevent_fd *fde, uint1
 {
 	pump(data, flags & TEVENT_FD_WRITE);
 }
+/* Poll only this IPC connection; entering tevent here would reenter Samba. */
+static int poll_client(struct tier_client *c)
+{
+	struct pollfd fd = {.fd = c->fd, .events = POLLIN};
+	struct tier_call *q;
+	struct timespec now;
+	int64_t remaining = INT64_MAX;
+	int ret;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+		fail(c, errno);
+		return -1;
+	}
+	for (q = c->calls; q; q = q->next) {
+		int64_t deadline = (q->deadline.tv_sec - now.tv_sec) * 1000 +
+				   (q->deadline.tv_nsec - now.tv_nsec) / 1000000;
+		remaining = MIN(remaining, deadline);
+		if (q->sent < q->length)
+			fd.events |= POLLOUT;
+	}
+	if (remaining <= 0) {
+		fail(c, ETIMEDOUT);
+		return -1;
+	}
+	ret = poll(&fd, 1, (int)MIN(remaining, INT_MAX));
+	if (ret < 0 && errno == EINTR)
+		return 0;
+	if (ret <= 0) {
+		fail(c, ret ? errno : ETIMEDOUT);
+		return -1;
+	}
+	pump(c, fd.revents & POLLOUT);
+	return c->error ? -1 : 0;
+}
 struct tier_call *tier_submit(TALLOC_CTX *ctx, struct tier_client *c,
 			      const Tier__Ipc__Request *request, const void *data,
 			      size_t length, struct tevent_req *async)
 {
 	struct tier_call *p;
 	size_t mlen = tier__ipc__request__get_packed_size(request);
+	/* Deferred cleanup must not turn a previously available slot into EBUSY. */
+	while (!c->error && c->count >= c->max_inflight && c->deferred) {
+		if (poll_client(c))
+			break;
+	}
 	if (c->error) {
 		errno = c->error;
 		return NULL;
@@ -334,35 +382,8 @@ struct tier_call *tier_submit(TALLOC_CTX *ctx, struct tier_client *c,
 int tier_wait(struct tier_call *p)
 {
 	while (!p->done) {
-		struct pollfd fd = {.fd = p->client->fd, .events = POLLIN};
-		struct tier_call *q;
-		struct timespec now;
-		int64_t remaining;
-		int ret;
-		for (q = p->client->calls; q; q = q->next) {
-			if (q->sent < q->length) {
-				fd.events |= POLLOUT;
-				break;
-			}
-		}
-		if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
-			fail(p->client, errno);
+		if (poll_client(p->client))
 			break;
-		}
-		remaining = (p->deadline.tv_sec - now.tv_sec) * 1000 +
-			    (p->deadline.tv_nsec - now.tv_nsec) / 1000000;
-		if (remaining <= 0) {
-			fail(p->client, ETIMEDOUT);
-			break;
-		}
-		ret = poll(&fd, 1, (int)remaining);
-		if (ret < 0 && errno == EINTR)
-			continue;
-		if (ret <= 0) {
-			fail(p->client, ret ? errno : ETIMEDOUT);
-			break;
-		}
-		pump(p->client, fd.revents & POLLOUT);
 	}
 	if (p->error) {
 		errno = p->error;
@@ -402,6 +423,22 @@ Tier__Ipc__Response *tier_rpc(TALLOC_CTX *ctx, struct tier_client *c,
 	if (!p || tier_wait(p))
 		return NULL;
 	return tier_result(p, NULL, NULL);
+}
+int tier_defer_close(struct tier_client *c, uint64_t handle)
+{
+	Tier__Ipc__Request request = TIER__IPC__REQUEST__INIT;
+	struct tier_call *p;
+	request.method = TIER__IPC__METHOD__CLOSE;
+	request.handle = handle;
+	p = tier_submit(c, c, &request, NULL, 0, NULL);
+	if (!p)
+		return -1;
+	p->deferred = true;
+	c->deferred++;
+	/* The connection retains the call and any unsent frame until its reply.
+	 * Never pass this ownerless call to tier_wait: finish frees it. */
+	TALLOC_FREE(p->owner);
+	return 0;
 }
 struct tier_client *tier_client_connect(TALLOC_CTX *ctx, struct tevent_context *ev,
 					const char *path)

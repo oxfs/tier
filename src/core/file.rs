@@ -24,11 +24,11 @@ impl FileHandle {
         }
         let mut state = self.state.lock();
         self.engine.ensure_body(&self.id, &mut state)?;
-        self.engine
-            .ensure_write_capacity(&self.id, &mut state, offset, data.len() as u64)?;
+        let mut r =
+            self.engine
+                .ensure_write_capacity(&self.id, &mut state, offset, data.len() as u64)?;
         let body = state.body.as_ref().unwrap();
         let n = body.file.write_at(data, offset)?;
-        let mut r = self.engine.record(&self.id)?;
         r.node.size = body.file.metadata()?.len();
         r.node.mtime = SystemTime::now();
         r.node.ctime = r.node.mtime;
@@ -311,13 +311,14 @@ impl Engine {
         state: &mut FileState,
         offset: u64,
         length: u64,
-    ) -> Result<()> {
+    ) -> Result<Record> {
         let body = state.body.as_ref().context("missing file body")?;
-        let p = self.policy(id)?;
+        let (mut r, p) = self.record_with_policy(id)?;
+        let size = body.file.metadata()?.len();
         let additional = offset
             .checked_add(length)
             .ok_or_else(|| failure(libc::EFBIG))?
-            .saturating_sub(body.file.metadata()?.len());
+            .saturating_sub(size);
         let stat = body.root.stat()?;
         let available = stat.f_bavail.saturating_mul(stat.f_frsize);
         let used = 100
@@ -328,15 +329,15 @@ impl Engine {
                 / stat.f_blocks.max(1);
         let cache = p.write_cache.contains(&body.copy.target);
         if available >= additional && (!cache || used < u64::from(p.high_water)) {
-            return Ok(());
+            return Ok(r);
         }
         if cache && self.relieve_cache(&body.copy.target, id, additional, p.high_water)? {
-            return Ok(());
+            return Ok(r);
         }
         if !cache || !p.direct_fallback {
             return Err(failure(libc::ENOSPC));
         }
-        let needed = body.file.metadata()?.len().saturating_add(additional);
+        let needed = size.saturating_add(additional);
         let mut targets = p.persistent_storage.clone();
         rank(&mut targets, id);
         for name in targets {
@@ -359,7 +360,6 @@ impl Engine {
                 return Err(e.into());
             }
             Self::sync_object(&root, &object, &file)?;
-            let mut r = self.record(id)?;
             let old = body.copy.clone();
             let copy = Copy {
                 node: id.into(),
@@ -379,7 +379,7 @@ impl Engine {
                 true,
             )?;
             state.body = Some(Body { file, root, copy });
-            return Ok(());
+            return Ok(r);
         }
         Err(failure(libc::ENOSPC))
     }

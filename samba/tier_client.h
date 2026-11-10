@@ -13,5 +13,6 @@ int tier_wait(struct tier_call *);
 Tier__Ipc__Response *tier_result(struct tier_call *, void **, size_t *);
 Tier__Ipc__Response *tier_rpc(TALLOC_CTX *, struct tier_client *,
 			      const Tier__Ipc__Request *);
+int tier_defer_close(struct tier_client *, uint64_t);
 uint32_t tier_max_data(struct tier_client *);
 #endif
