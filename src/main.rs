@@ -2,7 +2,16 @@ mod config;
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use std::{collections::BTreeMap, fs, net::SocketAddr, path::PathBuf};
-use tier::{archive, core::Engine, recovery, service};
+use tier::{
+    archive,
+    backup::{self, Kind},
+    core::Engine,
+    recovery, service,
+};
+
+fn backup_kind(value: &str) -> std::result::Result<Kind, String> {
+    serde_json::from_value(serde_json::json!(value)).map_err(|_| "use export or metadata".into())
+}
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -52,9 +61,20 @@ enum Action {
         #[arg(long)]
         archive: bool,
     },
-    /// Set the metadata snapshot schedule (JSON).
+    /// Configure a file export or metadata backup schedule (JSON).
     Schedule {
+        #[arg(value_parser = backup_kind)]
+        kind: Kind,
         json: String,
+    },
+    /// Run the configured export or metadata backup immediately.
+    Backup {
+        #[arg(value_parser = backup_kind)]
+        kind: Kind,
+    },
+    /// List the available metadata backups in a backup directory.
+    Backups {
+        directory: PathBuf,
     },
     /// Run the Samba IPC service, background workers and administration UI.
     Serve {
@@ -65,19 +85,24 @@ enum Action {
     },
     /// Run one manual repair and archive pass.
     Repair,
-    Snapshot {
+    /// Export logical-to-physical file mappings as a two-column CSV.
+    Export {
         output: PathBuf,
     },
-    /// Check or extract snapshot objects from the supplied read-only target roots.
+    /// Check or extract files using a metadata backup and read-only target roots.
     Inspect {
-        snapshot: PathBuf,
+        directory: PathBuf,
+        #[arg(long)]
+        backup_id: Option<u32>,
         targets: Vec<PathBuf>,
         #[arg(long)]
         extract: Option<PathBuf>,
     },
-    /// Load a snapshot into a new database. Map relocated targets with NAME=PATH.
-    Import {
-        snapshot: PathBuf,
+    /// Restore metadata into a new database. Map relocated targets with NAME=PATH.
+    Restore {
+        directory: PathBuf,
+        #[arg(long)]
+        backup_id: Option<u32>,
         #[arg(long = "target")]
         targets: Vec<String>,
         /// Accept the reported offline, damaged, missing or unclaimed data.
@@ -100,30 +125,33 @@ fn main() -> Result<()> {
         .with_env_filter(filter)
         .init();
     let cli = Cli::parse();
+    if let Action::Backups { directory } = &cli.action {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&backup::list(directory)?)?
+        );
+        return Ok(());
+    }
     if let Action::Inspect {
-        snapshot,
+        directory,
+        backup_id,
         targets,
         extract,
     } = &cli.action
     {
-        let data = tier::snapshot::load(snapshot)?;
-        let report = match extract {
-            Some(out) => {
-                ensure!(
-                    !targets.is_empty(),
-                    "extraction requires a local storage target"
-                );
-                recovery::inspect(&data, targets, Some(out))?
-            }
-            None => recovery::preflight(&data, targets)?,
-        };
+        ensure!(
+            extract.is_none() || !targets.is_empty(),
+            "extraction requires a local storage target"
+        );
+        let report = recovery::inspect_backup(directory, *backup_id, targets, extract.as_deref())?;
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
     let settings = config::Settings::load(cli.config.as_deref())?;
     let db = settings.database(cli.db)?;
-    if let Action::Import {
-        snapshot,
+    if let Action::Restore {
+        directory,
+        backup_id,
         targets,
         allow_degraded,
     } = &cli.action
@@ -133,8 +161,9 @@ fn main() -> Result<()> {
             let (name, path) = mapping.split_once('=').context("use NAME=PATH")?;
             map.insert(name.to_owned(), path.into());
         }
-        let report = recovery::import(
-            &tier::snapshot::load(snapshot)?,
+        let report = recovery::restore_backup(
+            directory,
+            *backup_id,
             &db,
             &map,
             *allow_degraded,
@@ -173,12 +202,12 @@ fn main() -> Result<()> {
             &serde_json::from_str::<archive::ArchivePolicy>(&json)?,
         ),
         Action::Inherit { path, archive } => engine.inherit_policy(&path, archive),
-        Action::Schedule { json } => engine.schedule(&serde_json::from_str(&json)?),
-        Action::Snapshot { output } => tier::snapshot::write(&engine, &output),
-        Action::Repair => {
-            service::repair(&engine)?;
-            engine.backup_tick()
+        Action::Schedule { kind, json } => {
+            engine.set_backup_schedule(kind, &serde_json::from_str(&json)?)
         }
+        Action::Backup { kind } => engine.backup_tick(kind),
+        Action::Export { output } => tier::export::write(&engine, &output),
+        Action::Repair => service::repair(&engine),
         Action::Status => {
             println!("{}", serde_json::to_string_pretty(&engine.state()?)?);
             Ok(())
@@ -193,6 +222,6 @@ fn main() -> Result<()> {
                 .or(settings.admin)
                 .unwrap_or_else(|| ([127, 0, 0, 1], 9480).into()),
         ),
-        Action::Import { .. } | Action::Inspect { .. } => unreachable!(),
+        Action::Restore { .. } | Action::Inspect { .. } | Action::Backups { .. } => unreachable!(),
     }
 }

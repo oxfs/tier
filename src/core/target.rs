@@ -165,7 +165,8 @@ impl Engine {
         Ok((total, free))
     }
     pub fn set_policy(&self, path: &str, p: &Policy) -> Result<()> {
-        let n = self.stat(path)?;
+        let _guard = self.inner.namespace.write();
+        let n = self.lookup_unlocked(path)?;
         ensure!(n.is_dir, "policy requires directory");
         ensure!(
             p.persistent_copies <= p.persistent_storage.len(),
@@ -192,13 +193,14 @@ impl Engine {
                 let _: Target = self.require(&schema::target(name))?;
             }
         }
-        let _guard = self.inner.namespace.write();
-        self.put_record(&schema::policy(&n.id), p, true)?;
-        for r in self.subtree(&n.id)? {
-            if !r.node.is_dir {
-                self.schedule_file(&r.node.id)?;
-            }
-        }
+        self.atomic(
+            vec![
+                Self::encoded(schema::policy(&n.id), p)?,
+                Self::rescan_record(&n.id)?,
+            ],
+            vec![],
+            true,
+        )?;
         Ok(())
     }
     pub(crate) fn create_object(

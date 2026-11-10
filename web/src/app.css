@@ -18,7 +18,8 @@ body {
   min-height: 100vh;
 }
 button,
-input {
+input,
+select {
   font: inherit;
 }
 button,
@@ -343,7 +344,8 @@ label {
   gap: 5px;
   min-width: 0;
 }
-.field input:not([type="checkbox"]) {
+.field input:not([type="checkbox"]),
+.field select {
   width: 100%;
 }
 .field .field-help {
@@ -375,7 +377,8 @@ label {
 .field.wide {
   grid-column: 1/-1;
 }
-input {
+input,
+select {
   min-width: 0;
   padding: 9px;
   border-radius: 6px;

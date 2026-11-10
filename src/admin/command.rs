@@ -1,5 +1,10 @@
 use super::Backend;
-use crate::{archive::ArchivePolicy, backup::Schedule, core::Policy, recovery};
+use crate::{
+    archive::ArchivePolicy,
+    backup::{Kind, Schedule},
+    core::Policy,
+    recovery,
+};
 use anyhow::{Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -45,12 +50,20 @@ pub(super) enum Command {
         #[serde(flatten)]
         policy: ArchivePolicy,
     },
-    BackupSchedule(Schedule),
+    BackupSchedule {
+        kind: Kind,
+        #[serde(flatten)]
+        schedule: Schedule,
+    },
+    Backup {
+        kind: Kind,
+    },
     Inspect {
         path: PathBuf,
+        backup_id: Option<u32>,
         roots: Vec<PathBuf>,
     },
-    Snapshot {
+    Export {
         path: PathBuf,
     },
 }
@@ -59,14 +72,17 @@ impl Command {
     pub(super) fn run(self, backend: &Backend) -> Result<Value> {
         let engine = &backend.engine;
         match self {
-            Self::Inspect { path, roots } => {
-                return recovery::preflight(&crate::snapshot::load(&path)?, &roots);
+            Self::Inspect {
+                path,
+                backup_id,
+                roots,
+            } => {
+                return recovery::inspect_backup(&path, backup_id, &roots, None);
             }
             Self::Repair {} => backend.maintenance.repair()?,
-            Self::Snapshot { path } => {
-                ensure!(path.is_absolute(), "use an absolute snapshot path");
-                let data = engine.snapshot()?;
-                crate::snapshot::publish(&data, &path)?;
+            Self::Export { path } => {
+                ensure!(path.is_absolute(), "use an absolute export path");
+                crate::export::write(engine, &path)?;
             }
             Self::Restore { id, path } => engine.restore(id, &path)?,
             Self::Purge { id } => engine.purge(id)?,
@@ -90,7 +106,10 @@ impl Command {
                 pass_env.as_deref().filter(|s| !s.is_empty()),
             )?,
             Self::ArchivePolicy { path, policy } => engine.set_archive_policy(&path, &policy)?,
-            Self::BackupSchedule(schedule) => engine.schedule(&schedule)?,
+            Self::BackupSchedule { kind, schedule } => {
+                engine.set_backup_schedule(kind, &schedule)?
+            }
+            Self::Backup { kind } => engine.backup_tick(kind)?,
         }
         Ok(json!({"ok":true}))
     }

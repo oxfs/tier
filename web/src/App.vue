@@ -116,7 +116,7 @@ const shortcuts: Record<Page, string[]> = {
   devices: ["target"],
   policies: ["policy", "inherit"],
   archives: ["archive", "archive_policy", "inherit"],
-  backups: ["snapshot", "backup_schedule", "inspect"],
+  backups: ["export", "backup_schedule", "backup", "inspect"],
   trash: [],
 };
 const icons = {

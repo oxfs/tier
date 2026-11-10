@@ -50,12 +50,15 @@ export interface Trash {
   target_bytes: Record<string, number | null>;
 }
 export interface Backup {
+  kind: BackupKind;
   path: string;
-  seq: number;
   time: number;
   error: string | null;
-  lag: number;
+  attempted_at: number;
+  latest: string | null;
 }
+export type BackupKind = "export" | "metadata";
+export const backupKinds = { export: "文件映射导出", metadata: "元数据备份" };
 export interface State {
   targets: Target[];
   health: Health[];
@@ -65,20 +68,17 @@ export interface State {
   archive_targets: Archive[];
 
   archive_errors: { node: string; path: string; error: string }[];
-  backup_schedule: {
+  backup_schedules: {
+    kind: BackupKind;
     config: {
+      enabled: boolean;
       seconds: number;
-      changes: number;
       keep: number;
-      retain_days?: number;
-      hourly?: number;
-      daily?: number;
       directories: string[];
     };
   }[];
   backup_status: Backup[];
   trash_count: number;
-  seq: number;
 }
 export const pages = {
   overview: "存储概览",
@@ -94,8 +94,9 @@ export const actions: Record<string, string> = {
   inspect: "恢复预检",
   archive: "添加归档目标",
   archive_policy: "配置归档策略",
-  backup_schedule: "设置快照计划",
-  snapshot: "导出快照",
+  backup_schedule: "配置计划",
+  backup: "立即执行计划",
+  export: "导出文件映射",
   restore: "恢复文件",
   purge: "永久删除",
   policy: "配置副本策略",

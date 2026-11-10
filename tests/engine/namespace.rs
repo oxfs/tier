@@ -27,15 +27,6 @@ fn unicode_case_aliases_share_one_identity_and_policy_override_can_be_removed() 
     engine.put("/été/σ", b"second")?;
     assert_eq!(engine.stat("/Été/Σ")?.id, id);
     assert_eq!(engine.list("/été")?, ["Σ"]);
-    let mut malformed = engine.snapshot()?;
-    let records = malformed["records"].as_array_mut().unwrap();
-    let duplicate = records
-        .iter()
-        .find(|r| r["key"] == format!("node/{id}"))
-        .unwrap()
-        .clone();
-    records.push(duplicate);
-    assert!(tier::recovery::inspect(&malformed, &[], None).is_err());
     assert!(engine.inherit_policy("/", false).is_err());
     fs::rename(root.path().join("b"), root.path().join("offline"))?;
     assert_eq!(engine.get("/été/Σ")?, b"second");

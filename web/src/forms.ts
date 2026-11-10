@@ -1,7 +1,8 @@
 export type Field = {
   key: string;
   label: string;
-  kind: "text" | "list" | "number" | "checkbox";
+  kind: "text" | "list" | "number" | "checkbox" | "select";
+  choices?: { value: string; label: string }[];
   hint?: string;
   section?: string;
   cacheOnly?: boolean;
@@ -18,6 +19,10 @@ export function initialValue(field: Field, current: unknown): Input {
     return Array.isArray(current) ? current.join(", ") : "";
   if (field.kind === "number")
     return typeof current === "number" ? current : (field.defaultValue ?? "");
+  if (field.kind === "select")
+    return typeof current === "string"
+      ? current
+      : (field.choices?.[0]?.value ?? "");
   return typeof current === "string" ? current : "";
 }
 export function serialize(field: Field, input: Input) {
@@ -32,6 +37,7 @@ export function serialize(field: Field, input: Input) {
     case "checkbox":
       return input === true;
     case "text":
+    case "select":
       return String(input);
   }
 }
@@ -54,14 +60,30 @@ export function policyInput(values: Record<string, Input>) {
     });
   return input;
 }
+const backupKind: Field = {
+  key: "kind",
+  label: "计划类型",
+  kind: "select",
+  choices: [
+    { value: "export", label: "文件映射导出" },
+    { value: "metadata", label: "元数据备份" },
+  ],
+};
 export const forms: Record<string, Field[]> = {
   repair: [],
   inspect: [
     {
       key: "path",
-      label: "快照文件",
-      placeholder: "/mnt/backup/tier.json",
+      label: "元数据备份目录",
+      placeholder: "/mnt/backup/metadata",
       kind: "text",
+    },
+    {
+      key: "backup_id",
+      label: "备份编号（留空使用最新备份）",
+      kind: "number",
+      min: 1,
+      optional: true,
     },
     {
       key: "roots",
@@ -137,68 +159,39 @@ export const forms: Record<string, Field[]> = {
     },
   ],
   backup_schedule: [
+    backupKind,
+    { key: "enabled", label: "启用自动执行", kind: "checkbox" },
     {
       key: "directories",
       hint: "填写已存在且可写的绝对路径，建议选择不同设备上的目录。",
-      label: "备份目录（逗号分隔）",
+      label: "保存目录（逗号分隔）",
       optional: true,
       placeholder: "/mnt/a/backup,/mnt/b/backup",
       kind: "list",
     },
     {
-      defaultValue: 30,
+      defaultValue: 3600,
       min: 1,
       key: "seconds",
-      hint: "有元数据变更时，等待达到此秒数或累计提交数即触发快照。",
-      label: "触发间隔（秒）",
-      kind: "number",
-    },
-    {
-      defaultValue: 100,
-      min: 1,
-      key: "changes",
-      hint: "从上次快照起累计的元数据事务数，达到阈值即可提前导出。",
-      label: "累计元数据提交数",
+      hint: "启用后按此间隔执行，每种计划独立设置。",
+      label: "执行间隔（秒）",
       kind: "number",
     },
     {
       defaultValue: 20,
       min: 1,
       key: "keep",
-      hint: "每个目的地保留最近多少份快照。",
+      hint: "每个保存目录保留最近多少份结果。",
       label: "最近保留份数",
       kind: "number",
     },
-    {
-      defaultValue: 0,
-      min: 0,
-      key: "retain_days",
-      hint: "保留最近几天的全部快照。0 表示关闭；最近份数和分时规则仍然生效。",
-      label: "全部保留天数",
-      kind: "number",
-    },
-    {
-      defaultValue: 0,
-      min: 0,
-      key: "hourly",
-      hint: "在此时间窗口内按小时保留快照，0 表示关闭。",
-      label: "按小时保留的窗口（小时）",
-      kind: "number",
-    },
-    {
-      defaultValue: 0,
-      min: 0,
-      key: "daily",
-      hint: "在此时间窗口内按天保留快照，0 表示关闭。",
-      label: "按天保留的窗口（天）",
-      kind: "number",
-    },
   ],
-  snapshot: [
+  backup: [backupKind],
+  export: [
     {
       key: "path",
-      label: "快照目的文件",
-      placeholder: "/mnt/backup/tier.json",
+      label: "CSV 目的文件",
+      placeholder: "/mnt/backup/files.csv",
       kind: "text",
     },
   ],

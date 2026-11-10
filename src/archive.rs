@@ -101,6 +101,7 @@ impl Engine {
             "supply both credential variables"
         );
         WebDav::new(url, None)?;
+        let _guard = self.inner.namespace.write();
         ensure!(
             self.kv_get::<ArchiveTarget>(&schema::archive_target(name))?
                 .is_none(),
@@ -118,7 +119,8 @@ impl Engine {
         )
     }
     pub fn set_archive_policy(&self, path: &str, p: &ArchivePolicy) -> Result<()> {
-        let node = self.stat(path)?;
+        let _guard = self.inner.namespace.write();
+        let node = self.lookup_unlocked(path)?;
         ensure!(
             node.is_dir
                 && p.copies <= p.targets.len()
@@ -128,13 +130,14 @@ impl Engine {
         for t in &p.targets {
             let _: ArchiveTarget = self.require(&schema::archive_target(t))?;
         }
-        let _guard = self.inner.namespace.write();
-        self.put_record(&schema::archive_policy(&node.id), p, true)?;
-        for r in self.subtree(&node.id)? {
-            if !r.node.is_dir {
-                self.schedule_file(&r.node.id)?;
-            }
-        }
+        self.atomic(
+            vec![
+                Self::encoded(schema::archive_policy(&node.id), p)?,
+                Self::rescan_record(&node.id)?,
+            ],
+            vec![],
+            true,
+        )?;
         Ok(())
     }
     pub(crate) fn archive_copies(&self, id: &str) -> Result<Vec<ArchiveCopy>> {
@@ -190,10 +193,11 @@ impl Engine {
         let Some(_maintenance) = self.inner.maintenance.try_lock() else {
             return Ok(());
         };
+        self.resume_rescans()?;
         let mut errors = vec![];
-        for id in self.due_work("archive", manual)? {
+        for id in self.due_work(schema::WorkKind::Archive, manual)? {
             if !self.record(&id).is_ok_and(|r| !r.node.is_dir) || !self.live(&id)? {
-                self.reschedule_work("archive", &id, false)?;
+                self.reschedule_work(schema::WorkKind::Archive, &id, false)?;
                 continue;
             }
             let result = self.archive_one(&id, manual);
@@ -204,7 +208,7 @@ impl Engine {
             } else {
                 self.delete_record(&schema::archive_error(&id))?;
             }
-            self.reschedule_work("archive", &id, failed)?;
+            self.reschedule_work(schema::WorkKind::Archive, &id, failed)?;
         }
         for (k, c) in self.scan::<ArchiveCopy>(schema::ARCHIVE_GC)? {
             if let Err(e) = self

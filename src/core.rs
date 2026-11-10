@@ -16,7 +16,7 @@ pub use store::{RocksDbCompression, RocksDbOptions};
 
 use anyhow::{Context, Result, bail, ensure};
 use parking_lot::{Mutex, RwLock};
-use rocksdb::{Direction, IteratorMode, TransactionDB};
+use rocksdb::{Direction, IteratorMode};
 use schema::entry;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -37,7 +37,7 @@ pub(crate) struct FileState {
     pub body: Option<file::Body>,
 }
 pub(crate) struct Inner {
-    pub db: TransactionDB,
+    pub db: store::MetadataStore,
     // Namespace operations are short; no body I/O or remote calls under this lock.
     pub namespace: RwLock<()>,
     pub files: Mutex<HashMap<String, Weak<Mutex<FileState>>>>,
@@ -99,7 +99,7 @@ impl Engine {
             .collect())
     }
     pub(crate) fn view_get<T: DeserializeOwned>(
-        view: &rocksdb::SnapshotWithThreadMode<'_, TransactionDB>,
+        view: &rocksdb::Snapshot<'_>,
         key: &str,
     ) -> Result<Option<T>> {
         view.get(key)?.map(|bytes| Self::decode(&bytes)).transpose()

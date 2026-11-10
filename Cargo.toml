@@ -9,6 +9,7 @@ toml = "0.8"
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+csv = "1"
 libc = "0.2"
 rocksdb = { version = "0.24", default-features = false, features = ["lz4"] }
 parking_lot = "0.12"

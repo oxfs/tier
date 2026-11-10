@@ -1,8 +1,13 @@
 use anyhow::Result;
 use serde_json::json;
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 use tempfile::tempdir;
 use tier::{
+    backup::{self, Kind, Schedule},
     core::{Engine, Policy},
     recovery,
 };
@@ -13,8 +18,20 @@ fn policy(write_cache: &str, persistent_storage: &[&str]) -> Result<Policy> {
     )?)
 }
 
+fn schedule(engine: &Engine, destinations: Vec<PathBuf>, seconds: u64, keep: usize) -> Result<()> {
+    engine.set_backup_schedule(
+        Kind::Metadata,
+        &Schedule {
+            enabled: true,
+            directories: destinations,
+            seconds,
+            keep,
+        },
+    )
+}
+
 #[test]
-fn restore_namespace_from_snapshot_with_a_single_surviving_disk() -> Result<()> {
+fn restore_namespace_from_metadata_backup_with_a_single_surviving_disk() -> Result<()> {
     let work = tempdir()?;
     let root = work.path();
     let db = root.join("source.db");
@@ -29,21 +46,24 @@ fn restore_namespace_from_snapshot_with_a_single_surviving_disk() -> Result<()> 
     engine.put("/photos/image", b"new")?;
     engine.automatic_reconcile()?;
     engine.rename("/photos", "/albums")?;
-    let snapshot = root.join("snapshot.json");
-    tier::snapshot::write(&engine, &snapshot)?;
+    let repository = root.join("backups");
+    fs::create_dir(&repository)?;
+    schedule(&engine, vec![repository.clone()], 3600, 2)?;
+    engine.backup_tick(Kind::Metadata)?;
     drop(engine);
     let moved = root.join("rehomed");
     fs::rename(root.join("disk-a"), &moved)?;
     fs::rename(root.join("hot"), root.join("offline-hot"))?;
     fs::rename(root.join("disk-b"), root.join("offline-b"))?;
-    let data = tier::snapshot::load(&snapshot)?;
     let out = root.join("extract");
-    let report = recovery::inspect(&data, std::slice::from_ref(&moved), Some(&out))?;
+    let report =
+        recovery::inspect_backup(&repository, None, std::slice::from_ref(&moved), Some(&out))?;
     assert_eq!(report["verified"], json!(["albums/image"]));
     assert_eq!(fs::read(out.join("albums/image"))?, b"new");
     let recovered = root.join("recovered.db");
-    recovery::import(
-        &data,
+    recovery::restore_backup(
+        &repository,
+        None,
         &recovered,
         &BTreeMap::from([("disk-a".into(), moved)]),
         true,
@@ -51,8 +71,9 @@ fn restore_namespace_from_snapshot_with_a_single_surviving_disk() -> Result<()> 
     )?;
     assert_eq!(Engine::open(&recovered)?.get("/albums/image")?, b"new");
     assert!(
-        recovery::import(
-            &data,
+        recovery::restore_backup(
+            &repository,
+            None,
             &recovered,
             &BTreeMap::new(),
             false,
@@ -64,47 +85,34 @@ fn restore_namespace_from_snapshot_with_a_single_surviving_disk() -> Result<()> 
 }
 
 #[test]
-fn snapshots_continue_when_one_destination_is_offline() -> Result<()> {
-    use tier::backup::Schedule;
+fn metadata_backups_continue_when_one_destination_is_offline() -> Result<()> {
     let work = tempdir()?;
     let engine = Engine::open(&work.path().join("tier.db"))?;
     let a = work.path().join("a");
     let b = work.path().join("b");
     fs::create_dir(&a)?;
     fs::create_dir(&b)?;
-    engine.schedule(&Schedule {
-        directories: vec![a.clone(), b.clone()],
-        seconds: 30,
-        changes: 1,
-        keep: 1,
-        retain_days: 0,
-        hourly: 0,
-        daily: 0,
-    })?;
-    engine.backup_tick()?;
-    let latest = |dir: &Path| -> Result<Vec<_>> {
-        Ok(fs::read_dir(dir)?
-            .collect::<std::io::Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-            .collect())
-    };
+    schedule(&engine, vec![a.clone(), b.clone()], 30, 1)?;
+    engine.backup_tick(Kind::Metadata)?;
+    let latest = |dir: &Path| backup::list(dir);
     assert_eq!(latest(&a)?.len(), 1);
     fs::rename(&a, work.path().join("offline"))?;
     fs::create_dir(&a)?;
     engine.mkdir("/documents")?;
-    assert!(engine.backup_tick().is_err());
-    assert!(latest(&a)?.is_empty());
+    assert!(engine.backup_tick(Kind::Metadata).is_err());
+    assert!(fs::read_dir(&a)?.next().is_none());
     let files = latest(&b)?;
     assert_eq!(files.len(), 1);
-    let id = engine.stat("/documents")?.id;
-    assert!(
-        tier::snapshot::load(&files[0].path())?["records"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| r["key"] == format!("node/{id}"))
-    );
+    let restored = work.path().join("restored");
+    recovery::restore_backup(
+        &b,
+        None,
+        &restored,
+        &BTreeMap::new(),
+        false,
+        &Default::default(),
+    )?;
+    assert!(Engine::open(&restored)?.stat("/documents")?.is_dir);
     Ok(())
 }
 
@@ -130,63 +138,39 @@ fn cloned_engine_exposes_concurrent_namespace_mutations() -> Result<()> {
 }
 
 #[test]
-fn backup_bookkeeping_does_not_trigger_new_snapshots_and_retention_is_applied() -> Result<()> {
+fn scheduled_backups_obey_interval_and_forced_backups_apply_retention() -> Result<()> {
     let work = tempdir()?;
     let engine = Engine::open(&work.path().join("metadata"))?;
     let destination = work.path().join("snapshots");
     fs::create_dir(&destination)?;
-    engine.schedule(&tier::backup::Schedule {
-        directories: vec![destination.clone()],
-        seconds: 3600,
-        changes: 1,
-        keep: 2,
-        retain_days: 0,
-        hourly: 0,
-        daily: 0,
-    })?;
+    schedule(&engine, vec![destination.clone()], 3600, 2)?;
     engine.schedule_backups()?;
-    let first = engine.snapshot()?["seq"].clone();
     for _ in 0..5 {
         engine.schedule_backups()?;
     }
-    assert_eq!(engine.snapshot()?["seq"], first);
-    let count = || -> Result<usize> {
-        Ok(fs::read_dir(&destination)?
-            .collect::<std::io::Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|file| file.path().extension().is_some_and(|e| e == "json"))
-            .count())
-    };
+    let count = || -> Result<usize> { Ok(backup::list(&destination)?.len()) };
     assert_eq!(count()?, 1);
     for i in 0..8 {
         engine.mkdir(&format!("/directory-{i}"))?;
-        engine.schedule_backups()?;
+        engine.backup_tick(Kind::Metadata)?;
     }
     assert_eq!(count()?, 2);
     Ok(())
 }
 
 #[test]
-fn offline_snapshot_destination_backs_off_without_delaying_healthy_targets() -> Result<()> {
+fn offline_backup_destination_backs_off_without_delaying_healthy_targets() -> Result<()> {
     let root = tempdir()?;
     let engine = Engine::open(&root.path().join("metadata"))?;
     let a = root.path().join("a");
     let b = root.path().join("b");
     fs::create_dir(&a)?;
     fs::create_dir(&b)?;
-    engine.schedule(&tier::backup::Schedule {
-        directories: vec![a.clone(), b.clone()],
-        seconds: 60,
-        changes: 1,
-        keep: 2,
-        retain_days: 0,
-        hourly: 0,
-        daily: 0,
-    })?;
+    schedule(&engine, vec![a.clone(), b.clone()], 60, 2)?;
     engine.schedule_backups()?;
     fs::rename(&a, root.path().join("offline"))?;
     engine.mkdir("/new")?;
-    assert!(engine.schedule_backups().is_err());
+    assert!(engine.backup_tick(Kind::Metadata).is_err());
     // Failed destinations back off; repeating a scheduler tick does not repeat I/O.
     engine.schedule_backups()?;
     let status = engine.state()?;
@@ -195,8 +179,10 @@ fn offline_snapshot_destination_backs_off_without_delaying_healthy_targets() -> 
             .as_array()
             .unwrap()
             .iter()
-            .any(|s| s["path"] == b.to_str().unwrap() && s["lag"] == 0)
+            .any(|s| s["path"] == b.to_str().unwrap()
+                && s["error"].is_null()
+                && s["time"].as_u64().is_some_and(|time| time > 0))
     );
-    assert!(engine.backup_tick().is_err());
+    assert!(engine.backup_tick(Kind::Metadata).is_err());
     Ok(())
 }

@@ -39,3 +39,15 @@ test("a new policy writes directly to persistent storage and can opt into cache"
   values.direct_fallback = true;
   assert.equal(policyInput(values).direct_fallback, false);
 });
+
+test("backup plans preserve their kind and disabled state, and inspection can use the latest backup", () => {
+  const fields = Object.fromEntries(
+    forms.backup_schedule.map((f) => [f.key, f]),
+  );
+  assert.equal(initialValue(fields.kind, "metadata"), "metadata");
+  assert.equal(serialize(fields.kind, "export"), "export");
+  assert.equal(serialize(fields.enabled, false), false);
+  const id = forms.inspect.find((f) => f.key === "backup_id");
+  assert.equal(serialize(id, initialValue(id, undefined)), null);
+  assert.equal(serialize(id, "7"), 7);
+});

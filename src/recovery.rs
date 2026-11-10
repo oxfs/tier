@@ -2,7 +2,6 @@ use crate::core::schema;
 use crate::{
     archive::{ArchiveCopy, ArchivePolicy, ArchiveTarget, configured_client},
     core::{Copy, Engine, Policy, Record, Target, Trash, safe_name},
-    snapshot::{self, Image},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -20,8 +19,18 @@ use std::{
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
+struct MetadataRecord {
+    key: String,
+    value: Vec<u8>,
+}
+impl MetadataRecord {
+    fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        schema::decode(&self.value)
+    }
+}
+
 struct Catalog {
-    image: Image,
+    records: Vec<MetadataRecord>,
     nodes: BTreeMap<String, Record>,
     targets: BTreeMap<String, Target>,
     copies: Vec<Copy>,
@@ -32,19 +41,23 @@ struct Catalog {
 }
 
 impl Catalog {
-    fn parse(value: &Value) -> Result<Self> {
-        let image = snapshot::decode(value)?;
-        let result = Self::from_image(image)?;
-        ensure!(
-            result.image.paths == result.paths()?,
-            "snapshot path mapping disagrees with metadata"
-        );
-        Ok(result)
-    }
-
-    fn from_image(image: Image) -> Result<Self> {
+    fn capture(engine: &Engine) -> Result<Self> {
+        let view = engine.inner.db.snapshot();
+        let mut options = rocksdb::ReadOptions::default();
+        options.fill_cache(false);
+        let mut records = Vec::new();
+        for entry in view.iterator_opt(rocksdb::IteratorMode::Start, options) {
+            let (key, value) = entry?;
+            let key = String::from_utf8(key.to_vec())?;
+            if !schema::ephemeral(&key) {
+                records.push(MetadataRecord {
+                    key,
+                    value: value.to_vec(),
+                });
+            }
+        }
         let mut result = Self {
-            image,
+            records,
             nodes: BTreeMap::new(),
             targets: BTreeMap::new(),
             copies: Vec::new(),
@@ -57,8 +70,8 @@ impl Catalog {
         let mut entries = BTreeMap::new();
         let mut policies = Vec::new();
         let mut archive_policies = Vec::new();
-        for row in &result.image.records {
-            ensure!(keys.insert(row.key.clone()), "duplicate snapshot key");
+        for row in &result.records {
+            ensure!(keys.insert(row.key.clone()), "duplicate metadata key");
             let key = row.key.as_str();
             if let Some(id) = key.strip_prefix(schema::NODES) {
                 let node: Record = row.decode()?;
@@ -167,40 +180,23 @@ impl Catalog {
                         row.decode::<String>()? == schema::FORMAT,
                         "unsupported metadata format"
                     ),
-                    schema::SYSTEM_ID => ensure!(
-                        row.decode::<String>()? == result.image.system_id,
-                        "system identity mismatch"
-                    ),
-                    schema::REVISION => ensure!(
-                        row.decode::<u64>()? == result.image.seq,
-                        "revision mismatch"
-                    ),
+                    schema::SYSTEM_ID => {
+                        Uuid::parse_str(&row.decode::<String>()?)?;
+                    }
                     schema::TRASH_SEQ => {
                         ensure!(row.decode::<i64>()? >= 0, "invalid trash sequence")
                     }
-                    schema::BACKUP_SCHEDULE => {
-                        let s: crate::backup::Schedule = row.decode()?;
-                        ensure!(
-                            s.seconds > 0
-                                && s.changes > 0
-                                && s.keep > 0
-                                && s.directories.iter().all(|p| p.is_absolute()),
-                            "invalid snapshot schedule"
-                        );
+                    schema::EXPORT_SCHEDULE | schema::METADATA_SCHEDULE => {
+                        row.decode::<crate::backup::Schedule>()?.validate()?;
                     }
-                    _ => bail!("unknown snapshot record: {key}"),
+                    _ => bail!("unknown metadata record: {key}"),
                 }
             }
         }
-        for required in [
-            schema::SYSTEM_FORMAT,
-            schema::SYSTEM_ID,
-            schema::REVISION,
-            schema::ROOT,
-        ] {
+        for required in [schema::SYSTEM_FORMAT, schema::SYSTEM_ID, schema::ROOT] {
             ensure!(
                 keys.contains(required),
-                "missing snapshot record {required}"
+                "missing metadata record {required}"
             );
         }
         let root = result.nodes.get("root").context("missing root")?;
@@ -238,7 +234,6 @@ impl Catalog {
             );
         }
         let trash_seq = result
-            .image
             .records
             .iter()
             .find(|row| row.key == schema::TRASH_SEQ)
@@ -308,68 +303,55 @@ impl Catalog {
         Ok(result)
     }
 
-    fn paths(&self) -> Result<Vec<Value>> {
-        let mut copies: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+    fn export_rows(&self) -> Result<Vec<(String, String)>> {
+        let mut locations: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         for copy in &self.copies {
-            let node = &self.nodes[&copy.node];
-            let target = &self.targets[&copy.target];
-            copies.entry(&copy.node).or_default().push(json!({
-                "kind": "local",
-                "target": copy.target,
-                "target_id": target.identity,
-                "target_root": target.path,
-                "relative_path": copy.object,
-                "physical_path": target.path.join(&copy.object),
-                "version": copy.version,
-                "hash": copy.hash,
-                "current": copy.version == node.node.version,
-                "primary": node.primary.as_ref() == Some(&copy.target),
-            }));
+            if copy.version == self.nodes[&copy.node].node.version {
+                locations.entry(&copy.node).or_default().push(
+                    self.targets[&copy.target]
+                        .path
+                        .join(&copy.object)
+                        .to_str()
+                        .context("physical path is not UTF-8")?
+                        .to_owned(),
+                );
+            }
         }
         for copy in &self.archived {
-            let node = &self.nodes[&copy.node];
-            let target = &self.archives[&copy.target];
-            copies.entry(&copy.node).or_default().push(json!({
-                "kind": "archive",
-                "target": copy.target,
-                "relative_path": copy.key,
-                "physical_path": crate::archive::webdav::object_url(&target.url, &copy.key)?,
-                "version": copy.version,
-                "hash": copy.hash,
-                "current": copy.version == node.node.version,
-            }));
+            if copy.version == self.nodes[&copy.node].node.version {
+                locations
+                    .entry(&copy.node)
+                    .or_default()
+                    .push(crate::archive::webdav::object_url(
+                        &self.archives[&copy.target].url,
+                        &copy.key,
+                    )?);
+            }
         }
-        for locations in copies.values_mut() {
-            locations.sort_by(|a, b| {
-                a["kind"]
-                    .as_str()
-                    .cmp(&b["kind"].as_str())
-                    .then(a["target"].as_str().cmp(&b["target"].as_str()))
-            });
-        }
-        let mut paths = Vec::with_capacity(self.nodes.len());
+        let mut rows = Vec::new();
         for (id, node) in &self.nodes {
-            let (path, trash_id) = self.path(id)?;
-            paths.push(json!({
-                "path": Path::new("/").join(path),
-                "node": id,
-                "kind": if node.node.is_dir { "directory" } else { "file" },
-                "namespace": if trash_id.is_some() { "trash" } else { "live" },
-                "trash_id": trash_id,
-                "size": node.node.size,
-                "version": node.node.version,
-                "hash": node.hash,
-                "dirty": node.dirty,
-                "copies": copies.remove(id.as_str()).unwrap_or_default(),
-            }));
+            let (path, trash) = self.path(id)?;
+            if trash.is_some() {
+                continue;
+            }
+            let mut logical = format!("/{}", path.to_str().context("logical path is not UTF-8")?);
+            if node.node.is_dir {
+                if !logical.ends_with('/') {
+                    logical.push('/');
+                }
+                rows.push((logical, String::new()));
+            } else {
+                let copies = locations.remove(id.as_str()).unwrap_or_default();
+                ensure!(!copies.is_empty(), "file has no current source: {logical}");
+                rows.extend(
+                    copies
+                        .into_iter()
+                        .map(|physical| (logical.clone(), physical)),
+                );
+            }
         }
-        paths.sort_by(|a, b| {
-            a["path"]
-                .as_str()
-                .cmp(&b["path"].as_str())
-                .then(a["trash_id"].as_i64().cmp(&b["trash_id"].as_i64()))
-        });
-        Ok(paths)
+        rows.sort();
+        Ok(rows)
     }
 
     fn path(&self, id: &str) -> Result<(PathBuf, Option<i64>)> {
@@ -400,10 +382,8 @@ impl Catalog {
     }
 }
 
-pub(crate) fn with_snapshot_paths(image: Image) -> Result<Image> {
-    let mut catalog = Catalog::from_image(image)?;
-    catalog.image.paths = catalog.paths()?;
-    Ok(catalog.image)
+pub(crate) fn export_rows(engine: &Engine) -> Result<Vec<(String, String)>> {
+    Catalog::capture(engine)?.export_rows()
 }
 
 fn validate_policy(policy: &Policy, targets: &BTreeMap<String, Target>) -> Result<()> {
@@ -856,23 +836,47 @@ fn inspect_catalog(
     Ok(live)
 }
 
-pub fn inspect(snapshot: &Value, roots: &[PathBuf], destination: Option<&Path>) -> Result<Value> {
-    inspect_catalog(&Catalog::parse(snapshot)?, roots, destination, false)
+pub fn inspect_backup(
+    backup_dir: &Path,
+    backup_id: Option<u32>,
+    roots: &[PathBuf],
+    destination: Option<&Path>,
+) -> Result<Value> {
+    let temp = tempfile::tempdir()?;
+    let database = temp.path().join("metadata");
+    let id = crate::backup::restore_staging(backup_dir, backup_id, &database)?;
+    let engine = Engine::open(&database)?;
+    let mut report = inspect_catalog(&Catalog::capture(&engine)?, roots, destination, true)?;
+    report["backup_id"] = id.into();
+    Ok(report)
 }
 
-pub fn preflight(snapshot: &Value, roots: &[PathBuf]) -> Result<Value> {
-    inspect_catalog(&Catalog::parse(snapshot)?, roots, None, true)
-}
-
-pub fn import(
-    snapshot: &Value,
+pub fn restore_backup(
+    backup_dir: &Path,
+    backup_id: Option<u32>,
     dest: &Path,
     targets: &BTreeMap<String, PathBuf>,
     allow_degraded: bool,
     options: &crate::core::RocksDbOptions,
 ) -> Result<Value> {
     options.validate()?;
-    let catalog = Catalog::parse(snapshot)?;
+    ensure!(!dest.exists(), "destination metadata already exists");
+    let source = fs::canonicalize(backup_dir)?;
+    let parent = fs::canonicalize(
+        dest.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )?;
+    ensure!(
+        !parent.starts_with(&source),
+        "restore outside the source backup repository"
+    );
+    let restored = tempfile::tempdir_in(&parent)?;
+    let restored_path = restored.path().join("source");
+    let id = crate::backup::restore_staging(backup_dir, backup_id, &restored_path)?;
+    let restored_engine = Engine::open_with_options(&restored_path, options)?;
+    let catalog = Catalog::capture(&restored_engine)?;
+    drop(restored_engine);
     ensure!(!dest.exists(), "destination metadata already exists");
     for (name, path) in targets {
         let target = catalog
@@ -896,7 +900,7 @@ pub fn import(
                 .map(|_| path.clone())
         })
         .collect::<Vec<_>>();
-    let report = inspect_catalog(&catalog, &roots, None, true)?;
+    let mut report = inspect_catalog(&catalog, &roots, None, true)?;
     let clean = [
         "missing",
         "damaged",
@@ -923,15 +927,7 @@ pub fn import(
     let temp = tempfile::tempdir_in(parent)?;
     let staging = temp.path().join("metadata");
     let engine = Engine::open_with_options(&staging, options)?;
-    let mut options = rocksdb::WriteOptions::default();
-    options.set_sync(true);
-    let transaction = engine
-        .inner
-        .db
-        .transaction_opt(&options, &rocksdb::TransactionOptions::default());
-    for entry in engine.inner.db.iterator(rocksdb::IteratorMode::Start) {
-        transaction.delete(entry?.0)?;
-    }
+    let mut puts = Vec::new();
     let verified = report["verified_copies"]
         .as_array()
         .context("invalid recovery report")?;
@@ -939,8 +935,8 @@ pub fn import(
         .as_array()
         .context("invalid archive recovery report")?;
     let resolved: Vec<Copy> = serde_json::from_value(report["resolved_copies"].clone())?;
-    for row in &catalog.image.records {
-        let mut bytes = row.bytes()?;
+    for row in &catalog.records {
+        let mut bytes = row.value.clone();
         if let Some(name) = row.key.strip_prefix(schema::TARGETS)
             && let Some(path) = targets.get(name)
         {
@@ -990,13 +986,17 @@ pub fn import(
                 .map(|c| c.target.clone());
             bytes = schema::encode(&node)?;
         }
-        transaction.put(&row.key, bytes)?;
+        if matches!(
+            row.key.as_str(),
+            schema::EXPORT_SCHEDULE | schema::METADATA_SCHEDULE
+        ) {
+            let mut schedule: crate::backup::Schedule = schema::decode(&bytes)?;
+            schedule.enabled = false;
+            bytes = schema::encode(&schedule)?;
+        }
+        puts.push((row.key.clone(), bytes));
     }
-    transaction.put(
-        schema::BACKUP_LINEAGE,
-        schema::encode(&Uuid::new_v4().to_string())?,
-    )?;
-    transaction.commit()?;
+    engine.inner.db.replace(puts)?;
     engine.rebuild_work_queue()?;
     engine.sync_metadata()?;
     drop(engine);
@@ -1017,5 +1017,7 @@ pub fn import(
         return Err(io::Error::last_os_error().into());
     }
     fs::File::open(parent)?.sync_all()?;
+    report["backup_id"] = id.into();
+    report["schedules_disabled"] = true.into();
     Ok(report)
 }
