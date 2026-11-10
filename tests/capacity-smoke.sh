@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Run as root in the project directory, passing the compiled capacity test as $1.
-mountpoint=$(mktemp -d)
-trap 'mountpoint -q "$mountpoint" && umount "$mountpoint"; rmdir "$mountpoint"' EXIT
-mount -t tmpfs -o size=8M tmpfs "$mountpoint"
-TIER_TEST_CACHE="$mountpoint" "$1" --ignored --exact full_cache_respects_the_configured_confirmation_policy
+cache=$(mktemp -d)
+privilege=()
+if ((EUID != 0)); then privilege=(sudo); fi
+cleanup() {
+    if mountpoint -q "$cache"; then "${privilege[@]}" umount "$cache"; fi
+    rmdir "$cache"
+}
+trap cleanup EXIT
+"${privilege[@]}" mount -t tmpfs -o "size=8M,uid=$(id -u),gid=$(id -g)" tmpfs "$cache"
+TIER_TEST_CACHE="$cache" cargo test --locked --test capacity -- --ignored --nocapture

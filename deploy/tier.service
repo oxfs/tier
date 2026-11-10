@@ -9,8 +9,11 @@ ExecStart=/usr/local/bin/tier --config /etc/tier/tier.toml serve
 Group=tier
 StateDirectory=tier
 StateDirectoryMode=0700
+RuntimeDirectory=tier
+RuntimeDirectoryMode=0750
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=180
 
 [Install]
 WantedBy=multi-user.target

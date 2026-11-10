@@ -1,28 +1,14 @@
-mod webdav;
+use crate::core::{objects, schema};
+pub(crate) mod webdav;
 use self::webdav::WebDav;
-use crate::core::Engine;
+use crate::core::{Engine, Record, fingerprint, now};
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     fs,
     io::{self, Seek},
-    time::{SystemTime, UNIX_EPOCH},
 };
-
-pub fn init(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS cloud_targets(name TEXT PRIMARY KEY,url TEXT NOT NULL,user_env TEXT,pass_env TEXT);
-        CREATE TABLE IF NOT EXISTS cloud_policy(node TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,settings TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS cloud_copies(node TEXT REFERENCES nodes(id) ON DELETE CASCADE,target TEXT REFERENCES cloud_targets(name),key TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(node,target));
-        CREATE TABLE IF NOT EXISTS cloud_gc(target TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(target,key));
-        CREATE TABLE IF NOT EXISTS archive_errors(node TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,error TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS archive_checks(key TEXT PRIMARY KEY,checked INTEGER NOT NULL,failed_since INTEGER,error TEXT);
-        CREATE INDEX IF NOT EXISTS cloud_object_keys ON cloud_copies(key);
-        CREATE TRIGGER IF NOT EXISTS gc_cloud_copy AFTER DELETE ON cloud_copies BEGIN INSERT OR IGNORE INTO cloud_gc VALUES(OLD.target,OLD.key); END;")?;
-    Ok(())
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ArchivePolicy {
     pub targets: Vec<String>,
@@ -30,31 +16,22 @@ pub struct ArchivePolicy {
     pub delay_secs: u64,
     pub retain_local: usize,
 }
-
-fn policy(db: &Connection, id: &str) -> Result<Option<ArchivePolicy>> {
-    let sql = "WITH RECURSIVE a(id, parent, depth) AS (
-        SELECT id, parent, 0
-        FROM nodes
-        WHERE id=?
-        UNION ALL
-        SELECT n.id, n.parent, a.depth+1
-        FROM nodes n
-        JOIN a ON n.id=a.parent)
-        SELECT settings
-        FROM cloud_policy
-        JOIN a ON a.id=node
-        ORDER BY depth LIMIT 1";
-    let settings: Option<String> = db.query_row(sql, [id], |r| r.get(0)).optional()?;
-    Ok(settings.map(|s| serde_json::from_str(&s)).transpose()?)
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ArchiveTarget {
+    pub name: String,
+    pub url: String,
+    pub user_env: Option<String>,
+    pub pass_env: Option<String>,
 }
-
-fn client(db: &Connection, target: &str) -> Result<WebDav> {
-    let (url, user, pass): (String, Option<String>, Option<String>) = db.query_row(
-        "SELECT url,user_env,pass_env FROM cloud_targets WHERE name=?",
-        [target],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
-    configured_client(&url, user.as_deref(), pass.as_deref())
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ArchiveCopy {
+    pub node: String,
+    pub target: String,
+    pub key: String,
+    pub hash: String,
+    pub version: u64,
+    pub checked: u64,
+    pub error: Option<String>,
 }
 pub(crate) fn configured_client(
     url: &str,
@@ -75,69 +52,42 @@ pub(crate) fn configured_client(
         credentials.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
     )
 }
-
-fn copies(db: &Connection, id: &str) -> Result<Vec<(String, String, String)>> {
-    let sql = "SELECT target, key, c.hash
-        FROM cloud_copies c
-        JOIN nodes n ON n.id=c.node AND n.hash=c.hash
-        WHERE node=?";
-    Ok(db
-        .prepare(sql)?
-        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-        .collect::<rusqlite::Result<_>>()?)
-}
-
-pub fn recall_to(db: &Connection, id: &str, out: &mut fs::File) -> Result<()> {
-    let mut errors = Vec::new();
-    for (target, key, hash) in copies(db, id)? {
-        out.set_len(0)?;
-        let size: i64 = db.query_row("SELECT size FROM nodes WHERE id=?", [id], |r| r.get(0))?;
-        ensure!(size >= 0, "invalid file size");
-        if size > 0 {
-            use std::os::fd::AsRawFd;
-            let error = unsafe { libc::posix_fallocate(out.as_raw_fd(), 0, size) };
-            if error != 0 {
-                return Err(std::io::Error::from_raw_os_error(error))
-                    .context("reserving space before archive recall");
+impl Engine {
+    pub(crate) fn archive_client(&self, target: &str) -> Result<WebDav> {
+        let t: ArchiveTarget = self.require(&schema::archive_target(target))?;
+        configured_client(&t.url, t.user_env.as_deref(), t.pass_env.as_deref())
+    }
+    pub(crate) fn archive_policy(&self, id: &str) -> Result<Option<ArchivePolicy>> {
+        let view = self.inner.db.snapshot();
+        let mut id = id.to_owned();
+        let mut seen = HashSet::new();
+        loop {
+            ensure!(seen.insert(id.clone()), "namespace cycle");
+            if let Some(policy) = Self::view_get(&view, &schema::archive_policy(&id))? {
+                return Ok(Some(policy));
             }
-        }
-        out.rewind()?;
-        match client(db, &target).and_then(|a| a.read_to(&key, &hash, size as u64, out)) {
-            Ok(()) => {
-                out.rewind()?;
-                return Ok(());
+            let node: Record =
+                Self::view_get(&view, &schema::node(&id))?.context("missing policy node")?;
+            if let Some(parent) = node.parent {
+                id = parent;
+            } else {
+                for item in view.iterator(rocksdb::IteratorMode::From(
+                    schema::TRASH.as_bytes(),
+                    rocksdb::Direction::Forward,
+                )) {
+                    let (key, value) = item?;
+                    if !key.starts_with(schema::TRASH.as_bytes()) {
+                        break;
+                    }
+                    let trash: crate::core::Trash = Self::decode(&value)?;
+                    if trash.node == id {
+                        return Ok(trash.archive_policy);
+                    }
+                }
+                return Ok(None);
             }
-            Err(error) => errors.push(format!("{target}: {error}")),
         }
     }
-    bail!("no readable current copy for {id}: {}", errors.join(", "))
-}
-
-pub fn retained(db: &Connection, id: &str, default: usize) -> Result<usize> {
-    let Some(p) = policy(db, id)? else {
-        return Ok(default);
-    };
-    let mut query = db.prepare(
-        "SELECT c.target FROM cloud_copies c
-        JOIN nodes n ON n.id=c.node AND n.hash=c.hash
-        LEFT JOIN archive_checks a ON a.key=c.key
-        WHERE c.node=? AND a.error IS NULL",
-    )?;
-    let healthy = query
-        .query_map([id], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let count = healthy
-        .iter()
-        .filter(|name| p.targets.contains(name))
-        .count();
-    Ok(if p.copies > 0 && count >= p.copies {
-        p.retain_local
-    } else {
-        default
-    })
-}
-
-impl Engine {
     pub fn add_archive(
         &self,
         name: &str,
@@ -145,34 +95,90 @@ impl Engine {
         user_env: Option<&str>,
         pass_env: Option<&str>,
     ) -> Result<()> {
+        ensure!(crate::core::safe_name(name), "invalid archive name");
         ensure!(
             user_env.is_some() == pass_env.is_some(),
-            "supply both credential variable names"
+            "supply both credential variables"
         );
         WebDav::new(url, None)?;
-        self.db.execute(
-            "INSERT INTO cloud_targets VALUES(?,?,?,?)",
-            params![name, url, user_env, pass_env],
-        )?;
-        Ok(())
-    }
-    pub fn set_cloud_policy(&self, path: &str, p: &ArchivePolicy) -> Result<()> {
-        let n = self.stat(path)?;
         ensure!(
-            n.is_dir
+            self.kv_get::<ArchiveTarget>(&schema::archive_target(name))?
+                .is_none(),
+            "archive already exists"
+        );
+        self.put_record(
+            &schema::archive_target(name),
+            &ArchiveTarget {
+                name: name.into(),
+                url: url.into(),
+                user_env: user_env.map(Into::into),
+                pass_env: pass_env.map(Into::into),
+            },
+            true,
+        )
+    }
+    pub fn set_archive_policy(&self, path: &str, p: &ArchivePolicy) -> Result<()> {
+        let node = self.stat(path)?;
+        ensure!(
+            node.is_dir
                 && p.copies <= p.targets.len()
                 && p.targets.iter().collect::<HashSet<_>>().len() == p.targets.len(),
             "invalid archive policy"
         );
         for t in &p.targets {
-            self.db
-                .query_row("SELECT 1 FROM cloud_targets WHERE name=?", [t], |_| Ok(()))?;
+            let _: ArchiveTarget = self.require(&schema::archive_target(t))?;
         }
-        self.db.execute(
-            "INSERT OR REPLACE INTO cloud_policy VALUES(?,?)",
-            params![n.id, serde_json::to_string(p)?],
-        )?;
+        let _guard = self.inner.namespace.write();
+        self.put_record(&schema::archive_policy(&node.id), p, true)?;
+        for r in self.subtree(&node.id)? {
+            if !r.node.is_dir {
+                self.schedule_file(&r.node.id)?;
+            }
+        }
         Ok(())
+    }
+    pub(crate) fn archive_copies(&self, id: &str) -> Result<Vec<ArchiveCopy>> {
+        let r = self.record(id)?;
+        Ok(self
+            .scan::<ArchiveCopy>(&schema::archive_copies(id))?
+            .into_iter()
+            .map(|(_, v)| v)
+            .filter(|v| v.version == r.node.version && r.hash.as_ref() == Some(&v.hash))
+            .collect())
+    }
+    pub(crate) fn recall_archive(&self, id: &str, out: &mut fs::File) -> Result<()> {
+        let r = self.record(id)?;
+        let mut errors = vec![];
+        for c in self.archive_copies(id)? {
+            out.set_len(0)?;
+            out.rewind()?;
+            match self
+                .archive_client(&c.target)
+                .and_then(|client| client.read_to(&c.key, &c.hash, r.node.size, out))
+            {
+                Ok(()) => {
+                    out.rewind()?;
+                    return Ok(());
+                }
+                Err(e) => errors.push(format!("{}: {e:#}", c.target)),
+            }
+        }
+        bail!("no readable current copy: {}", errors.join("; "))
+    }
+    pub(crate) fn archive_retained(&self, id: &str, default: usize) -> Result<usize> {
+        let Some(p) = self.archive_policy(id)? else {
+            return Ok(default);
+        };
+        let count = self
+            .archive_copies(id)?
+            .iter()
+            .filter(|c| p.targets.contains(&c.target) && c.error.is_none())
+            .count();
+        Ok(if p.copies > 0 && count >= p.copies {
+            p.retain_local
+        } else {
+            default
+        })
     }
     pub fn archive_tick(&self) -> Result<()> {
         self.run_archive(true)
@@ -181,294 +187,226 @@ impl Engine {
         self.run_archive(false)
     }
     fn run_archive(&self, manual: bool) -> Result<()> {
-        let work: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM cloud_policy UNION ALL SELECT 1 FROM cloud_copies
-             UNION ALL SELECT 1 FROM archive_errors UNION ALL SELECT 1 FROM archive_checks
-             UNION ALL SELECT 1 FROM cloud_gc)",
-            [],
-            |row| row.get(0),
-        )?;
-        if !work {
-            return Ok(());
-        }
-        let sql = "WITH RECURSIVE live(id) AS (VALUES('root')
-            UNION ALL
-            SELECT n.id
-            FROM nodes n
-            JOIN live ON n.parent=live.id)
-            SELECT id, hash, mtime
-            FROM nodes
-            JOIN live USING(id)
-            WHERE dir=0";
-        let rows = self
-            .db
-            .prepare(sql)?
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, u64>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        self.db.execute(
-            "DELETE FROM archive_checks WHERE NOT EXISTS(SELECT 1 FROM cloud_copies c WHERE c.key=archive_checks.key)",
-            [],
-        )?;
-        let mut errors = Vec::new();
-        for (id, h, mtime) in rows {
-            match self.archive_one(&id, &h, now.saturating_sub(mtime), manual, now) {
-                Ok(()) => {
-                    self.db
-                        .execute("DELETE FROM archive_errors WHERE node=?", [&id])?;
-                }
-                Err(error) => {
-                    self.db.execute(
-                        "INSERT OR REPLACE INTO archive_errors VALUES(?,?)",
-                        params![id, error.to_string()],
-                    )?;
-                    errors.push(format!("{id}: {error}"));
-                }
-            }
-        }
-        let garbage = self
-            .db
-            .prepare("SELECT target,key FROM cloud_gc")?
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (t, k) in garbage {
-            match client(&self.db, &t).and_then(|c| c.remove(&k)) {
-                Ok(()) => {
-                    self.db.execute(
-                        "DELETE FROM cloud_gc WHERE target=? AND key=?",
-                        params![t, k],
-                    )?;
-                }
-                Err(e) => errors.push(format!("{t}: {e}")),
-            }
-        }
-        ensure!(errors.is_empty(), "{}", errors.join(", "));
-        Ok(())
-    }
-
-    fn archive_one(&self, id: &str, h: &str, age: u64, manual: bool, now: u64) -> Result<()> {
-        let configured = policy(&self.db, id)?;
-        if configured.as_ref().is_none_or(|p| p.copies == 0) {
-            return self.release_archives(id, h, configured.as_ref());
-        }
-        let Some(p) = configured else {
+        let Some(_maintenance) = self.inner.maintenance.try_lock() else {
             return Ok(());
         };
-        let mut current = copies(&self.db, id)?;
-        let first = current.is_empty();
-        if !crate::core::current_file(&self.db, id, h)?
-            || (first
-                && (age < p.delay_secs || !crate::core::placement_confirmed(&self.db, id, h)?))
-        {
-            return Ok(());
-        }
-        let size: u64 = self
-            .db
-            .query_row("SELECT size FROM nodes WHERE id=?", [id], |r| r.get(0))?;
-        let mut damaged = HashSet::new();
-        for (target, key, hash) in &current {
-            if !p.targets.contains(target) {
+        let mut errors = vec![];
+        for id in self.due_work("archive", manual)? {
+            if !self.record(&id).is_ok_and(|r| !r.node.is_dir) || !self.live(&id)? {
+                self.reschedule_work("archive", &id, false)?;
                 continue;
             }
-            let last: Option<(u64, Option<u64>, Option<String>)> = self
-                .db
-                .query_row(
-                    "SELECT checked,failed_since,error FROM archive_checks WHERE key=?",
-                    [key],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?;
-            if !manual
-                && let Some((checked, _, error)) = &last
-                && now.saturating_sub(*checked) < if error.is_some() { 60 } else { 3600 }
+            let result = self.archive_one(&id, manual);
+            let failed = result.is_err();
+            if let Err(e) = result {
+                self.put_record(&schema::archive_error(&id), &format!("{e:#}"), false)?;
+                errors.push(format!("{id}: {e:#}"));
+            } else {
+                self.delete_record(&schema::archive_error(&id))?;
+            }
+            self.reschedule_work("archive", &id, failed)?;
+        }
+        for (k, c) in self.scan::<ArchiveCopy>(schema::ARCHIVE_GC)? {
+            if let Err(e) = self
+                .archive_client(&c.target)
+                .and_then(|client| client.remove(&c.key))
             {
-                if let Some(e) = error {
-                    bail!("{target}: {e}");
-                }
-                continue;
-            }
-            match client(&self.db, target).and_then(|c| c.read_to(key, hash, size, &mut io::sink()))
-            {
-                Ok(()) => {
-                    self.db.execute(
-                        "INSERT OR REPLACE INTO archive_checks VALUES(?,?,NULL,NULL)",
-                        params![key, now],
-                    )?;
-                }
-                Err(error) => {
-                    let first = last.and_then(|(_, first, _)| first).unwrap_or(now);
-                    self.db.execute(
-                        "INSERT OR REPLACE INTO archive_checks VALUES(?,?,?,?)",
-                        params![key, now, first, error.to_string()],
-                    )?;
-                    let local = self.policy(id)?;
-                    if !manual && local.manual_repair {
-                        return Err(error.context("archive requires manual repair"));
-                    }
-                    if !manual && now.saturating_sub(first) < local.repair_grace_secs {
-                        return Err(error.context("archive in repair grace period"));
-                    }
-                    damaged.insert(target.clone());
-                }
+                errors.push(format!("archive cleanup: {e:#}"));
+            } else {
+                self.delete_record(&k)?;
             }
         }
-        // Keep the registered object until a replacement has passed read-back verification.
-        current.retain(|(target, _, _)| !damaged.contains(target));
-        let mut count = current
-            .iter()
-            .filter(|(t, _, _)| p.targets.contains(t))
-            .count();
-        let mut failures = Vec::new();
-        for t in &p.targets {
-            if count >= p.copies {
-                break;
-            }
-            if current.iter().any(|(existing, _, _)| existing == t) {
-                continue;
-            }
-            let mut contents = tempfile::tempfile()?;
-            if self.stage_copy(id, &mut contents)? != h {
-                return Ok(());
-            }
-            let uploaded = client(&self.db, t)
-                .and_then(|client| Ok((client.upload(&mut contents, h)?, client)));
-            let (key, archive) = match uploaded {
-                Ok(pair) => pair,
-                Err(error) => {
-                    failures.push(format!("{t}: {error}"));
-                    continue;
-                }
-            };
-            let tx = self.db.unchecked_transaction()?;
-            let valid: String =
-                tx.query_row("SELECT hash FROM nodes WHERE id=?", [id], |r| r.get(0))?;
-            if valid != h
-                || !crate::core::current_file(&tx, id, h)?
-                || (first && !crate::core::placement_confirmed(&tx, id, h)?)
-                || policy(&tx, id)?.as_ref() != Some(&p)
-            {
-                drop(tx);
-                archive.remove(&key)?;
-                return Ok(());
-            }
-            let old: Option<String> = tx
-                .query_row(
-                    "SELECT key FROM cloud_copies WHERE node=? AND target=?",
-                    params![id, t],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            tx.execute(
-                "INSERT OR REPLACE INTO cloud_copies VALUES(?,?,?,?)",
-                params![id, t, key, h],
-            )?;
-            tx.execute(
-                "INSERT OR REPLACE INTO archive_checks VALUES(?,?,NULL,NULL)",
-                params![key, now],
-            )?;
-            if let Some(old) = old {
-                tx.execute(
-                    "INSERT OR IGNORE INTO cloud_gc VALUES(?,?)",
-                    params![t, old],
-                )?;
-            }
-            tx.commit()?;
-            current.push((t.clone(), key, h.into()));
-            count += 1;
-        }
-        ensure!(
-            count >= p.copies,
-            "archive placement incomplete: {}",
-            failures.join(", ")
-        );
-        let locals = self
-            .db
-            .prepare("SELECT target,object FROM copies WHERE node=? AND hash=? ORDER BY target")?
-            .query_map(params![id, h], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let local_policy = self.policy(id)?;
-        let mut readable: Vec<_> = locals
-            .into_iter()
-            .filter(|(t, k)| self.verified_copy(t, k, h))
-            .collect();
-        readable.sort_by_key(|(target, _)| !local_policy.persistent_storage.contains(target));
-        let selected: Vec<_> = current
-            .iter()
-            .filter(|(t, _, _)| p.targets.contains(t))
-            .take(p.copies)
-            .collect();
-        let registered = copies(&self.db, id)?;
-        let obsolete: Vec<_> = registered
-            .iter()
-            .filter(|c| !selected.contains(c))
-            .collect();
-        if readable.len() <= p.retain_local && obsolete.is_empty() {
-            return Ok(());
-        }
-        // Verify the currently selected remote objects immediately before eviction.
-        for (t, key, hash) in &selected {
-            client(&self.db, t)?.read_to(key, hash, size, &mut io::sink())?;
-        }
-        let tx = self.db.unchecked_transaction()?;
-        let latest: String =
-            tx.query_row("SELECT hash FROM nodes WHERE id=?", [id], |r| r.get(0))?;
-        if latest != h
-            || !crate::core::placement_confirmed(&tx, id, h)?
-            || policy(&tx, id)?.as_ref() != Some(&p)
-        {
-            return Ok(());
-        }
-        for (t, key, _) in obsolete {
-            tx.execute(
-                "DELETE FROM cloud_copies WHERE node=? AND target=? AND key=?",
-                params![id, t, key],
-            )?;
-        }
-        let evict: Vec<_> = readable.into_iter().skip(p.retain_local).collect();
-        for (t, key) in &evict {
-            if tx.execute(
-                "DELETE FROM copies WHERE node=? AND target=? AND hash=? AND object=?",
-                params![id, t, h, key],
-            )? == 1
-            {
-                tx.execute(
-                    "INSERT OR IGNORE INTO garbage(target,object) VALUES(?,?)",
-                    params![t, key],
-                )?;
-            }
-        }
-        tx.commit()?;
+        self.collect_garbage()?;
+        ensure!(errors.is_empty(), "{}", errors.join("; "));
         Ok(())
     }
-    fn release_archives(&self, id: &str, h: &str, expected: Option<&ArchivePolicy>) -> Result<()> {
-        if !self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM cloud_copies WHERE node=?)",
-            [id],
-            |r| r.get::<_, bool>(0),
-        )? {
+    fn archive_one(&self, id: &str, manual: bool) -> Result<()> {
+        let Some(r) = self.prepare_protected(id)? else {
+            return Ok(());
+        };
+        let configured = self.archive_policy(id)?;
+        let current = self.archive_copies(id)?;
+        let Some(p) = configured.filter(|p| p.copies > 0) else {
+            let current: Vec<_> = self
+                .scan::<ArchiveCopy>(&schema::archive_copies(id))?
+                .into_iter()
+                .map(|(_, c)| c)
+                .collect();
+            if !current.is_empty() {
+                let policy = self.policy(id)?;
+                let (targets, count) = policy.desired();
+                let n = self
+                    .copies(id)?
+                    .iter()
+                    .filter(|c| {
+                        c.version == r.node.version
+                            && targets.contains(&c.target)
+                            && r.hash
+                                .as_ref()
+                                .is_some_and(|h| self.matches_copy(&c.target, &c.object, h))
+                    })
+                    .count();
+                if n >= count {
+                    let lock = self.file_lock(id);
+                    let guard = lock.lock();
+                    let _namespace = self.inner.namespace.read();
+                    if !guard.writer && self.record(id)?.node.version == r.node.version {
+                        let mut puts = vec![];
+                        let mut dels = vec![];
+                        for c in current {
+                            puts.push(Self::encoded(schema::archive_gc(), &c)?);
+                            dels.push(schema::archive_copy(id, &c.target));
+                        }
+                        self.atomic(puts, dels, true)?;
+                    }
+                }
+            }
+            return Ok(());
+        };
+        if now()?.saturating_sub(r.closed_at) < p.delay_secs {
             return Ok(());
         }
-        let tx = self.db.unchecked_transaction()?;
-        if !crate::core::placement_confirmed(&tx, id, h)? || policy(&tx, id)?.as_ref() != expected {
+        let hash = r.hash.as_deref().context("missing hash")?;
+        let mut verified = vec![];
+        for mut c in current {
+            if !p.targets.contains(&c.target) {
+                continue;
+            }
+            let result = self
+                .archive_client(&c.target)
+                .and_then(|client| client.read_to(&c.key, hash, r.node.size, &mut io::sink()));
+            match result {
+                Ok(()) => {
+                    c.checked = now()?;
+                    c.error = None;
+                    // A renamed file keeps its old usable copy until the new
+                    // name is uploaded, verified and atomically published.
+                    if objects::matches_name(&c.key, &r.name) {
+                        verified.push(c);
+                    }
+                }
+                Err(e) => {
+                    if c.error.is_none() {
+                        c.checked = now()?;
+                    }
+                    c.error = Some(format!("{e:#}"));
+                    self.put_record(&schema::archive_copy(id, &c.target), &c, false)?;
+                    let policy = self.policy(id)?;
+                    if !manual
+                        && (policy.manual_repair
+                            || now()?.saturating_sub(c.checked) < policy.repair_grace_secs)
+                    {
+                        return Err(e.context("archive requires manual repair"));
+                    }
+                }
+            }
+        }
+        for name in &p.targets {
+            if verified.len() >= p.copies {
+                break;
+            }
+            if verified.iter().any(|c| &c.target == name) {
+                continue;
+            }
+            let mut source = tempfile::tempfile()?;
+            let local = self.copies(id)?.into_iter().find(|c| {
+                c.version == r.node.version && self.matches_copy(&c.target, &c.object, hash)
+            });
+            if let Some(c) = local {
+                io::copy(
+                    &mut self.target(&c.target)?.open_object(&c.object)?,
+                    &mut source,
+                )?;
+            } else {
+                self.recall_archive(id, &mut source)?;
+            }
+            ensure!(
+                fingerprint(&mut source)?.1 == hash,
+                "archive source changed"
+            );
+            source.rewind()?;
+            let client = self.archive_client(name)?;
+            let object = client.upload(&mut source, hash, &r.name)?;
+            let lock = self.file_lock(id);
+            let guard = lock.lock();
+            let _namespace = self.inner.namespace.read();
+            let latest = self.record(id)?;
+            if guard.writer
+                || latest.node.version != r.node.version
+                || latest.name != r.name
+                || self.archive_policy(id)?.as_ref() != Some(&p)
+            {
+                drop(guard);
+                client.remove(&object)?;
+                return Ok(());
+            }
+            let c = ArchiveCopy {
+                node: id.into(),
+                target: name.clone(),
+                key: object,
+                hash: hash.into(),
+                version: r.node.version,
+                checked: now()?,
+                error: None,
+            };
+            let mut puts = vec![Self::encoded(schema::archive_copy(id, name), &c)?];
+            if let Some(old) = self.kv_get::<ArchiveCopy>(&schema::archive_copy(id, name))? {
+                puts.push(Self::encoded(schema::archive_gc(), &old)?);
+            }
+            self.atomic(puts, vec![], true)?;
+            verified.push(c);
+        }
+        ensure!(verified.len() >= p.copies, "archive placement incomplete");
+        let verified_local: HashSet<String> = self
+            .copies(id)?
+            .into_iter()
+            .filter(|c| {
+                c.version == r.node.version && self.matches_copy(&c.target, &c.object, hash)
+            })
+            .map(|c| c.object)
+            .collect();
+        ensure!(
+            verified_local.len() >= p.retain_local,
+            "archive local retention is not satisfied"
+        );
+        // Each selected remote was read back immediately above, before local eviction.
+        let lock = self.file_lock(id);
+        let mut guard = lock.lock();
+        let _namespace = self.inner.namespace.read();
+        let mut latest = self.record(id)?;
+        if guard.writer
+            || latest.node.version != r.node.version
+            || latest.name != r.name
+            || self.archive_policy(id)?.as_ref() != Some(&p)
+        {
             return Ok(());
         }
-        let locals = tx
-            .prepare("SELECT target,object FROM copies WHERE node=? AND hash=?")?
-            .query_map(params![id, h], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if locals.iter().any(|(t, k)| self.matches_copy(t, k, h)) {
-            tx.execute("DELETE FROM cloud_copies WHERE node=?", [id])?;
-            tx.commit()?;
+        let policy = self.policy(id)?;
+        let mut locals = self.copies(id)?;
+        locals.sort_by_key(|c| !policy.persistent_storage.contains(&c.target));
+        let mut keep = vec![];
+        let mut puts = vec![];
+        let mut deletes = vec![];
+        for c in locals {
+            if c.version == r.node.version
+                && verified_local.contains(&c.object)
+                && keep.len() < p.retain_local
+            {
+                keep.push(c);
+                continue;
+            }
+            puts.push(Self::encoded(schema::garbage(&c.target), &c)?);
+            deletes.push(schema::copy(id, &c.target));
+        }
+        latest.primary = keep.first().map(|c| c.target.clone());
+        puts.push(Self::encoded(schema::node(id), &latest)?);
+        self.atomic(puts, deletes, true)?;
+        if guard.body.as_ref().is_some_and(|b| {
+            !keep
+                .iter()
+                .any(|c| c.object == b.copy.object && c.target == b.copy.target)
+        }) {
+            guard.body = None;
         }
         Ok(())
     }

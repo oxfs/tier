@@ -28,11 +28,13 @@ fn unicode_case_aliases_share_one_identity_and_policy_override_can_be_removed() 
     assert_eq!(engine.stat("/Été/Σ")?.id, id);
     assert_eq!(engine.list("/été")?, ["Σ"]);
     let mut malformed = engine.snapshot()?;
-    let files = malformed["nodes"].as_array_mut().unwrap();
-    let mut duplicate = files.iter().find(|n| n["id"] == id).unwrap().clone();
-    duplicate["id"] = uuid::Uuid::new_v4().to_string().into();
-    duplicate["name"] = "σ".into();
-    files.push(duplicate);
+    let records = malformed["records"].as_array_mut().unwrap();
+    let duplicate = records
+        .iter()
+        .find(|r| r["key"] == format!("node/{id}"))
+        .unwrap()
+        .clone();
+    records.push(duplicate);
     assert!(tier::recovery::inspect(&malformed, &[], None).is_err());
     assert!(engine.inherit_policy("/", false).is_err());
     fs::rename(root.path().join("b"), root.path().join("offline"))?;

@@ -1,215 +1,159 @@
 mod catalog;
 mod file;
+mod model;
+pub(crate) mod objects;
+mod queue;
 mod reconcile;
 mod report;
-mod xattr;
-pub(crate) use report::Writer;
+pub(crate) mod schema;
+mod store;
 mod target;
-use anyhow::{Context, Result, anyhow, bail, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Deserialize, Serialize};
+
+pub use file::FileHandle;
+pub(crate) use model::{Copy, Record, Target, Trash};
+pub use model::{Node, Policy};
+pub use store::{RocksDbCompression, RocksDbOptions};
+
+use anyhow::{Context, Result, bail, ensure};
+use parking_lot::{Mutex, RwLock};
+use rocksdb::{Direction, IteratorMode, TransactionDB};
+use schema::entry;
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, Read, Seek, Write},
-    path::{Path, PathBuf},
+    path::Path,
+    sync::{Arc, Weak},
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Policy {
-    #[serde(default, alias = "front")]
-    pub write_cache: Vec<String>,
-    #[serde(default, alias = "front_count")]
-    pub cache_copies: usize,
-    #[serde(default, alias = "long")]
-    pub persistent_storage: Vec<String>,
-    #[serde(default, alias = "long_count")]
-    pub persistent_copies: usize,
-    #[serde(default, alias = "delay_secs")]
-    pub persist_delay_secs: u64,
-    #[serde(default)]
-    pub direct_fallback: bool,
-    #[serde(default)]
-    pub fallback_count: Option<usize>,
-    #[serde(default)]
-    pub manual_repair: bool,
-    #[serde(default)]
-    pub repair_grace_secs: u64,
-    #[serde(default = "default_low")]
-    pub low_water: u8,
-    #[serde(default = "default_high")]
-    pub high_water: u8,
-    #[serde(default = "default_ttl")]
-    pub trash_ttl_secs: u64,
+#[derive(Default)]
+pub(crate) struct FileState {
+    pub writer: bool,
+    pub handles: usize,
+    pub body: Option<file::Body>,
 }
-impl Policy {
-    fn desired(&self) -> (&[String], usize) {
-        if self.persistent_copies == 0 {
-            (&self.write_cache, self.cache_copies)
-        } else {
-            (&self.persistent_storage, self.persistent_copies)
-        }
-    }
+pub(crate) struct Inner {
+    pub db: TransactionDB,
+    // Namespace operations are short; no body I/O or remote calls under this lock.
+    pub namespace: RwLock<()>,
+    pub files: Mutex<HashMap<String, Weak<Mutex<FileState>>>>,
+    pub maintenance: Mutex<()>,
 }
-impl Default for Policy {
-    fn default() -> Self {
-        Self {
-            write_cache: vec![],
-            cache_copies: 1,
-            persistent_storage: vec![],
-            persistent_copies: 0,
-            persist_delay_secs: 0,
-            direct_fallback: false,
-            fallback_count: None,
-            manual_repair: false,
-            repair_grace_secs: 0,
-            low_water: default_low(),
-            high_water: default_high(),
-            trash_ttl_secs: default_ttl(),
-        }
-    }
-}
-fn default_low() -> u8 {
-    70
-}
-fn default_high() -> u8 {
-    90
-}
-fn default_ttl() -> u64 {
-    604800
-}
-#[derive(Debug, Clone, Serialize)]
-pub struct Node {
-    pub id: String,
-    pub is_dir: bool,
-    pub size: u64,
-    pub mtime: SystemTime,
-    pub atime: SystemTime,
-}
+#[derive(Clone)]
 pub struct Engine {
-    pub(crate) db: Connection,
+    pub(crate) inner: Arc<Inner>,
 }
-fn now() -> Result<u64> {
+pub(crate) fn now() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
 pub(crate) fn safe_name(name: &str) -> bool {
-    !name.is_empty() && !name.contains(['/', '\\', '\0']) && name != "." && name != ".."
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.contains(['/', '\\', '\0'])
+        && name != "."
+        && name != ".."
 }
 fn split(path: &str) -> Result<(&str, &str)> {
     ensure!(path.starts_with('/') && path != "/", "invalid path");
     ensure!(path[1..].split('/').all(safe_name), "invalid path");
-    let (parent, name) = path.rsplit_once('/').unwrap();
-    Ok((if parent.is_empty() { "/" } else { parent }, name))
+    let (p, n) = path.rsplit_once('/').unwrap();
+    Ok((if p.is_empty() { "/" } else { p }, n))
 }
-fn fingerprint<R: Read + Seek>(reader: &mut R) -> Result<(u64, String)> {
-    reader.rewind()?;
-    let mut hash = Sha256::new();
-    let size = io::copy(reader, &mut hash)?;
-    Ok((size, format!("{:x}", hash.finalize())))
+pub(crate) fn fingerprint<R: Read + Seek>(r: &mut R) -> Result<(u64, String)> {
+    r.rewind()?;
+    let mut h = Sha256::new();
+    let n = io::copy(r, &mut h)?;
+    Ok((n, format!("{:x}", h.finalize())))
 }
 fn rank(names: &mut [String], id: &str) {
-    names.sort_by_cached_key(|name| Sha256::digest(format!("{id}/{name}")).to_vec());
+    names.sort_by_cached_key(|n| Sha256::digest(format!("{id}/{n}")).to_vec());
+}
+pub(crate) fn failure(errno: i32) -> anyhow::Error {
+    io::Error::from_raw_os_error(errno).into()
 }
 impl Engine {
-    // Reserve the writer before reading the catalog. A deferred WAL snapshot
-    // cannot be promoted after another connection commits, even with a timeout.
-    pub(crate) fn write_transaction(&self) -> Result<rusqlite::Transaction<'_>> {
-        Ok(rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?)
+    pub(crate) fn record(&self, id: &str) -> Result<Record> {
+        self.require(&schema::node(id))
     }
-
-    pub fn open(path: &Path) -> Result<Self> {
-        let db = Connection::open(path)?;
-        db.create_collation("tier_name", |a, b| {
-            unicase::UniCase::new(a).cmp(&unicase::UniCase::new(b))
-        })?;
-        crate::backup::configure(&db)?;
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA recursive_triggers=ON; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;
-      CREATE TABLE IF NOT EXISTS nodes(id TEXT PRIMARY KEY,parent TEXT REFERENCES nodes(id),name TEXT COLLATE NOCASE NOT NULL,dir INTEGER NOT NULL,size INTEGER NOT NULL DEFAULT 0,hash TEXT,mtime INTEGER NOT NULL DEFAULT 0,display_mtime INTEGER);
-      INSERT OR IGNORE INTO nodes(id,name,dir) VALUES('root','',1);
-      CREATE TABLE IF NOT EXISTS targets(name TEXT PRIMARY KEY,path TEXT UNIQUE NOT NULL,identity TEXT UNIQUE NOT NULL,domain TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS copies(node TEXT REFERENCES nodes(id),target TEXT REFERENCES targets(name),object TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(node,target));
-      CREATE TABLE IF NOT EXISTS garbage(target TEXT NOT NULL,object TEXT NOT NULL,PRIMARY KEY(target,object));
-      CREATE TRIGGER IF NOT EXISTS retire_deleted AFTER DELETE ON copies BEGIN INSERT OR IGNORE INTO garbage VALUES(old.target,old.object); END;
-      CREATE TRIGGER IF NOT EXISTS retire_updated AFTER UPDATE OF object ON copies WHEN old.object!=new.object BEGIN INSERT OR IGNORE INTO garbage VALUES(old.target,old.object); END;
-      CREATE INDEX IF NOT EXISTS copies_by_target ON copies(target,node);
-      CREATE TABLE IF NOT EXISTS policies(node TEXT PRIMARY KEY REFERENCES nodes(id),policy TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS system_identity(id INTEGER PRIMARY KEY CHECK(id=1),uuid TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS pending_writes(node TEXT PRIMARY KEY REFERENCES nodes(id));
-      CREATE TABLE IF NOT EXISTS protection(node TEXT PRIMARY KEY REFERENCES nodes(id),hash TEXT NOT NULL,incident INTEGER);
-      CREATE TABLE IF NOT EXISTS trash(id INTEGER PRIMARY KEY AUTOINCREMENT,node TEXT UNIQUE,original TEXT,deleted INTEGER,expires INTEGER NOT NULL);")?;
-        db.execute(
-            "INSERT OR IGNORE INTO system_identity VALUES(1,?)",
-            [Uuid::new_v4().to_string()],
-        )?;
-        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS namespace_names ON nodes(parent,name COLLATE tier_name)",[])
-            .context("creating Unicode name index; sibling names must be distinct after case folding")?;
-        crate::archive::init(&db)?;
-        let engine = Self { db };
-        xattr::init(&engine)?;
-        crate::backup::init(&engine)?;
-        Ok(engine)
+    pub(crate) fn file_lock(&self, id: &str) -> Arc<Mutex<FileState>> {
+        let mut locks = self.inner.files.lock();
+        if let Some(lock) = locks.get(id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        if locks.len() > 65536 {
+            locks.retain(|_, w| w.strong_count() > 0);
+        }
+        let lock = Arc::new(Mutex::new(FileState::default()));
+        locks.insert(id.into(), Arc::downgrade(&lock));
+        lock
     }
-}
-
-fn inherited_policy(db: &Connection, id: &str) -> Result<Policy> {
-    let sql = "WITH RECURSIVE ancestors(id, parent, d) AS (
-        SELECT id, parent, 0
-        FROM nodes
-        WHERE id=?
-        UNION ALL
-        SELECT n.id, n.parent, d+1
-        FROM nodes n
-        JOIN ancestors a ON n.id=a.parent)
-        SELECT p.policy
-        FROM ancestors a
-        JOIN policies p ON p.node=a.id
-        ORDER BY d LIMIT 1";
-    let raw: String = db
-        .query_row(sql, [id], |r| r.get(0))
-        .context("no applicable storage policy")?;
-    Ok(serde_json::from_str(&raw)?)
-}
-fn placement(policy: &Policy, id: &str, hash: &str) -> Result<(Vec<String>, usize, String)> {
-    let (targets, count) = policy.desired();
-    let mut targets = targets.to_vec();
-    rank(&mut targets, id);
-    let signature = serde_json::to_string(&(hash, count, &targets))?;
-    Ok((targets, count, signature))
-}
-pub(crate) fn current_file(db: &Connection, id: &str, hash: &str) -> Result<bool> {
-    let sql = "WITH RECURSIVE chain(id, parent) AS (
-        SELECT id, parent
-        FROM nodes
-        WHERE id=?1 AND hash=?2
-        UNION ALL
-        SELECT n.id, n.parent
-        FROM nodes n
-        JOIN chain c ON n.id=c.parent)
-        SELECT EXISTS(
-        SELECT 1
-        FROM chain
-        WHERE id='root')
-        AND NOT EXISTS(
-        SELECT 1
-        FROM pending_writes
-        WHERE node=?1)";
-    Ok(db.query_row(sql, params![id, hash], |r| r.get(0))?)
-}
-pub(crate) fn placement_confirmed(db: &Connection, id: &str, hash: &str) -> Result<bool> {
-    if !current_file(db, id, hash)? {
-        return Ok(false);
+    pub(crate) fn copies(&self, id: &str) -> Result<Vec<Copy>> {
+        Ok(self
+            .scan::<Copy>(&schema::copies(id))?
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect())
     }
-    let policy = inherited_policy(db, id)?;
-    let (_, _, signature) = placement(&policy, id, hash)?;
-    Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM protection WHERE node=? AND hash=? AND incident IS NULL)",
-        params![id, signature],
-        |r| r.get(0),
-    )?)
+    pub(crate) fn view_get<T: DeserializeOwned>(
+        view: &rocksdb::SnapshotWithThreadMode<'_, TransactionDB>,
+        key: &str,
+    ) -> Result<Option<T>> {
+        view.get(key)?.map(|bytes| Self::decode(&bytes)).transpose()
+    }
+    pub(crate) fn live(&self, id: &str) -> Result<bool> {
+        Ok(self.path_for(id)?.is_some())
+    }
+    pub(crate) fn path_for(&self, id: &str) -> Result<Option<String>> {
+        let view = self.inner.db.snapshot();
+        let mut id = id.to_owned();
+        let mut parts = Vec::new();
+        let mut seen = HashSet::new();
+        while id != "root" {
+            ensure!(seen.insert(id.clone()), "namespace cycle");
+            let node: Record =
+                Self::view_get(&view, &schema::node(&id))?.ok_or_else(|| failure(libc::ENOENT))?;
+            parts.push(node.name);
+            let Some(parent) = node.parent else {
+                return Ok(None);
+            };
+            id = parent;
+        }
+        parts.reverse();
+        Ok(Some(format!("/{}", parts.join("/"))))
+    }
+    pub(crate) fn policy(&self, id: &str) -> Result<Policy> {
+        let view = self.inner.db.snapshot();
+        let mut id = id.to_owned();
+        let mut seen = HashSet::new();
+        loop {
+            ensure!(seen.insert(id.clone()), "namespace cycle");
+            if let Some(policy) = Self::view_get(&view, &schema::policy(&id))? {
+                return Ok(policy);
+            }
+            let node: Record =
+                Self::view_get(&view, &schema::node(&id))?.ok_or_else(|| failure(libc::ENOENT))?;
+            if let Some(parent) = node.parent {
+                id = parent;
+            } else {
+                for item in view.iterator(IteratorMode::From(
+                    schema::TRASH.as_bytes(),
+                    Direction::Forward,
+                )) {
+                    let (key, value) = item?;
+                    if !key.starts_with(schema::TRASH.as_bytes()) {
+                        break;
+                    }
+                    let trash: Trash = Self::decode(&value)?;
+                    if trash.node == id {
+                        return Ok(trash.policy);
+                    }
+                }
+                bail!("no applicable storage policy");
+            }
+        }
+    }
 }

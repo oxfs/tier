@@ -1,4 +1,5 @@
 //! WebDAV object access for an existing collection, including OpenList.
+use crate::core::objects;
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
@@ -7,7 +8,34 @@ use std::{
     io::{self, Read, Seek, Write},
     time::Duration,
 };
-use uuid::Uuid;
+use url::Url;
+
+fn collection_url(collection: &str) -> Result<Url> {
+    let url = Url::parse(collection).context("invalid WebDAV collection URL")?;
+    ensure!(
+        matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
+        "WebDAV URL must use HTTP(S)"
+    );
+    ensure!(
+        url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "use a plain collection URL without embedded credentials"
+    );
+    Ok(url)
+}
+
+/// Append one opaque object name, escaping URL delimiters in the original name.
+pub(crate) fn object_url(collection: &str, key: &str) -> Result<String> {
+    ensure!(objects::valid_name(key), "invalid archive object name");
+    let mut url = collection_url(collection)?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("WebDAV collection cannot contain objects"))?
+        .pop_if_empty()
+        .push(key);
+    Ok(url.into())
+}
 
 pub struct WebDav {
     collection: String,
@@ -17,16 +45,8 @@ pub struct WebDav {
 
 impl WebDav {
     pub fn new(collection: &str, credentials: Option<(&str, &str)>) -> Result<Self> {
-        ensure!(
-            collection.starts_with("https://") || collection.starts_with("http://"),
-            "WebDAV URL must use HTTP(S)"
-        );
-        ensure!(
-            !collection.contains(['?', '#', '@']),
-            "use a plain collection URL without embedded credentials"
-        );
         Ok(Self {
-            collection: collection.trim_end_matches('/').to_owned(),
+            collection: collection_url(collection)?.into(),
             client: ureq::AgentBuilder::new()
                 .redirects(0)
                 .timeout_connect(Duration::from_secs(10))
@@ -39,18 +59,17 @@ impl WebDav {
     }
 
     fn request(&self, method: &str, key: &str) -> Result<ureq::Request> {
-        ensure!(Uuid::parse_str(key).is_ok(), "invalid archive object ID");
         let req = self
             .client
-            .request(method, &format!("{}/{key}", self.collection));
+            .request(method, &object_url(&self.collection, key)?);
         Ok(match &self.authorization {
             Some(header) => req.set("Authorization", header),
             None => req,
         })
     }
 
-    pub fn upload(&self, file: &mut File, digest: &str) -> Result<String> {
-        let key = Uuid::new_v4().to_string();
+    pub fn upload(&self, file: &mut File, digest: &str, name: &str) -> Result<String> {
+        let key = objects::name(name);
         file.rewind()?;
         let size = file.metadata()?.len();
         let response = self
@@ -117,5 +136,31 @@ impl WebDav {
             Err(ureq::Error::Status(404, _)) => Ok(()),
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_names_are_one_encoded_url_segment() -> Result<()> {
+        let key = objects::name("旅行 #?%.jpg");
+        let url = object_url("https://example.com/files%20here/", &key)?;
+        assert!(url.starts_with("https://example.com/files%20here/"));
+        assert!(url.ends_with("%E6%97%85%E8%A1%8C%20%23%3F%25.jpg"));
+        assert_eq!(Url::parse(&url)?.query(), None);
+        assert_eq!(Url::parse(&url)?.fragment(), None);
+        for key in ["../outside", "file/child", "plain-name"] {
+            assert!(object_url("https://example.com/dav", key).is_err());
+        }
+        for collection in [
+            "file:///tmp",
+            "https://user:secret@example.com/dav",
+            "https://example.com/dav?x=1",
+        ] {
+            assert!(object_url(collection, &key).is_err());
+        }
+        Ok(())
     }
 }

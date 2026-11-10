@@ -40,7 +40,6 @@ pub(super) enum Command {
         user_env: Option<String>,
         pass_env: Option<String>,
     },
-    #[serde(rename = "cloud_policy")]
     ArchivePolicy {
         path: String,
         #[serde(flatten)]
@@ -58,12 +57,7 @@ pub(super) enum Command {
 
 impl Command {
     pub(super) fn run(self, backend: &Backend) -> Result<Value> {
-        let engine = || {
-            backend
-                .engine
-                .lock()
-                .map_err(|_| anyhow::anyhow!("engine unavailable"))
-        };
+        let engine = &backend.engine;
         match self {
             Self::Inspect { path, roots } => {
                 return recovery::preflight(&crate::snapshot::load(&path)?, &roots);
@@ -71,32 +65,32 @@ impl Command {
             Self::Repair {} => backend.maintenance.repair()?,
             Self::Snapshot { path } => {
                 ensure!(path.is_absolute(), "use an absolute snapshot path");
-                let data = engine()?.snapshot()?;
+                let data = engine.snapshot()?;
                 crate::snapshot::publish(&data, &path)?;
             }
-            Self::Restore { id, path } => engine()?.restore(id, &path)?,
-            Self::Purge { id } => engine()?.purge(id)?,
+            Self::Restore { id, path } => engine.restore(id, &path)?,
+            Self::Purge { id } => engine.purge(id)?,
             Self::Target {
                 name,
                 path,
                 domain,
                 allow_same_domain,
-            } => engine()?.register_target(&name, &path, domain.as_deref(), allow_same_domain)?,
-            Self::Policy { path, policy } => engine()?.set_policy(&path, &policy)?,
-            Self::Inherit { path, archive } => engine()?.inherit_policy(&path, archive)?,
+            } => engine.register_target(&name, &path, domain.as_deref(), allow_same_domain)?,
+            Self::Policy { path, policy } => engine.set_policy(&path, &policy)?,
+            Self::Inherit { path, archive } => engine.inherit_policy(&path, archive)?,
             Self::Archive {
                 name,
                 url,
                 user_env,
                 pass_env,
-            } => engine()?.add_archive(
+            } => engine.add_archive(
                 &name,
                 &url,
                 user_env.as_deref().filter(|s| !s.is_empty()),
                 pass_env.as_deref().filter(|s| !s.is_empty()),
             )?,
-            Self::ArchivePolicy { path, policy } => engine()?.set_cloud_policy(&path, &policy)?,
-            Self::BackupSchedule(schedule) => engine()?.schedule(&schedule)?,
+            Self::ArchivePolicy { path, policy } => engine.set_archive_policy(&path, &policy)?,
+            Self::BackupSchedule(schedule) => engine.schedule(&schedule)?,
         }
         Ok(json!({"ok":true}))
     }

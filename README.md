@@ -1,64 +1,68 @@
 # Tier
 
-Tier 把家庭 NAS 上的多个存储目录组织成一个 SMB 共享。电脑和手机通过同一个路径访问文件，管理员在 Web 控制台按目录决定写入何时确认、保留几份副本，以及何时将冷文件归档到 OpenList 等 WebDAV 服务。
+Tier 将 NAS 上的多个存储目录组织成一个 SMB 共享，通过 Web 控制台按目录配置**缓存、持久化存储、归档**，子目录默认继承父级策略。
 
-| 使用方式 | 策略 | 写入何时确认 |
-| --- | --- | --- |
-| 两块 SSD 双写 | 写入缓存留空，两块 SSD 作为持久化存储，副本数设为 2 | 两份都写入后 |
-| 一块 SSD 加两块机械盘 | SSD 作为写入缓存，缓存份数为 1，两块机械盘作为持久化存储，副本数为 2 | SSD 写入后。持久化完成前可能只有一份 |
-| 冷文件归档 | 为目录选择 WebDAV 目标、归档延迟和本地保留份数 | 独立于写入确认。释放最后一份本地数据前会读回并校验远端文件 |
+前台写入一块盘：优先写缓存，否则写持久化存储。文件关闭后，后台按策略校验内容、补齐副本并归档。普通读写直接访问目标文件；客户端 FLUSH 或 write-through 同步当前文件及必要元数据。副本补齐前主盘损坏可能丢失最新内容，FLUSH 成功不表示副本已补齐。
 
-子目录默认继承最近一级策略。移动文件或修改策略后，Tier 在后台按新位置的策略调整副本。
+正文对象以 `UUID--文件名` 命名，逻辑重命名后由后台更新；过长的名称提示会截断，完整名称仍保存在元数据中。JSON 快照包含可读的逻辑路径与各副本物理路径映射，以及完整恢复所需的元数据。
 
 ## 安装
 
-准备一台使用 systemd 的 x86-64 Debian 或 Ubuntu 主机，确认 `/dev/fuse` 可用。将发布包 `tier-linux-x86_64.tar.gz` 和 `SHA256SUMS` 下载到同一个目录。包内已包含 Web 控制台。[下载发布包](https://github.com/RainMark/tier/releases/latest)
+### Debian 13
+
+使用 x86-64 和 Debian 官方源的 Samba。从 [Releases](https://github.com/RainMark/tier/releases) 下载 `tier-debian13-amd64.tar.gz` 与 `SHA256SUMS` 到同一目录；安装程序会检查架构和完整 Samba 包版本是否匹配。
 
 ```sh
 sudo apt update
-sudo apt install fuse3 samba
+sudo apt install samba libprotobuf-c1
 sha256sum --check SHA256SUMS
-tar -xzf tier-linux-x86_64.tar.gz
-cd tier-linux-x86_64
+tar -xzf tier-debian13-amd64.tar.gz
+cd tier-debian13-amd64
 sudo ./install.sh
 sudo systemctl enable --now tier
 ```
 
-在 NAS 上打开 `http://127.0.0.1:9480`。从另一台电脑管理时，运行 `ssh -L 9480:127.0.0.1:9480 用户名@NAS地址`，保持 SSH 连接，再在电脑上打开同一地址。
+在 NAS 上打开 `http://127.0.0.1:9480`；远程管理可先运行 `ssh -L 9480:127.0.0.1:9480 用户名@NAS地址`。
 
-## 建立共享
+在控制台登记各数据盘上的专用目录，配置根目录 `/` 的副本策略，并将元数据快照保存到不同设备。正文对象目录由 Tier 管理，不应直接修改。
 
-1. 将每块数据盘挂载到固定路径，在盘内创建专供 Tier 使用的目录。在 **存储设备** 中登记实际目录，给设备取名，例如 `ssd`、`disk1`、`disk2`。
-2. 在 **副本策略** 配置共享根目录 `/`。按上表选择写入缓存和持久化存储。如果希望文件最后一次修改 5 分钟后再复制到机械盘，将持久化延迟设为 300 秒。使用缓存时还可设置淘汰水位，以及缓存满时拒写或直写持久化存储。
-3. 在 **元数据** 选择不同设备上的快照目录。配置最近份数、保留全部快照的天数，或每小时、每日各保留一份。每次成功发布后按规则清理该目的地的过期快照。
-4. 将发布包内 `samba-share.conf` 的 `[tier]` 段加入 `/etc/samba/smb.conf`。为已有 Linux 用户启用 SMB 登录，然后检查并加载配置。
+将包内 `samba-share.conf` 的全局设置和共享配置合并到 `/etc/samba/smb.conf`。其中 `path = /` 表示 Tier 虚拟根目录。为已有 Linux 用户设置 SMB 密码并启动共享：
 
 ```sh
 sudo smbpasswd -a 用户名
 sudo testparm -s
-sudo systemctl enable --now smbd
-sudo systemctl reload smbd
+sudo systemctl enable smbd
+sudo systemctl restart smbd
 ```
 
-Windows 资源管理器打开 `\\NAS地址\tier`，使用上述账号登录。共享支持 Windows 文件属性和小型命名流，例如照片附带的 Apple 元数据。单个命名流连同 Samba 编码须在 64 KiB 以内。
+Windows 通过 `\\NAS地址\tier` 访问。升级 Samba 后，安装匹配的 Tier 发布包并重启两个服务。
 
 ## 配置与恢复
 
-| 内容 | systemd 安装 | 个人运行 |
-| --- | --- | --- |
-| 启动配置 | `/etc/tier/tier.toml` | `~/.config/tier/tier.toml` |
-| SQLite 元数据库 | `/var/lib/tier/tier.sqlite` | `~/.local/state/tier/tier.sqlite` |
-| 共享挂载点 | `/srv/tier/share` | 由配置或 `serve` 参数指定 |
+启动配置为 `/etc/tier/tier.toml`，元数据默认存放在 `/var/lib/tier/metadata`。设备、策略和快照计划通过控制台管理。后端日志用 `journalctl -u tier -f` 查看，插件日志位于 Samba 配置的日志目录。
 
-TOML 定义 `db`、`mountpoint` 和 `admin`，修改后重启 Tier。设备、目录策略和快照计划通过控制台修改，即时写入 SQLite。个人运行遵循 `XDG_CONFIG_HOME` 与 `XDG_STATE_HOME`。日志用 `journalctl -u tier -f` 查看。
+TOML 的 `[rocksdb]` 可调整元数据缓存、写缓冲、后台任务数和压缩方式，默认值见包内 `tier.toml`，修改后重启 Tier 生效。
 
-误删文件可以先在 **回收站** 中恢复。若元数据库丢失，使用 JSON 快照及对应的数据盘或归档目标恢复。快照包含目录、副本清单和 SMB 命名流，文件正文仍位于存储目标上。以下示例将快照中的设备 `disk1` 映射到重新挂载的目录，并导入一个新数据库。
+误删文件可从回收站恢复。元数据快照不包含正文；元数据丢失时，使用快照和存活设备检查、恢复到新的目录：
 
 ```sh
 sudo tier inspect snapshot.json /mnt/surviving-disk
-sudo tier --db /var/lib/tier/recovered.sqlite import snapshot.json --target disk1=/mnt/surviving-disk
+sudo tier --db /var/lib/tier/recovered import snapshot.json --target disk1=/mnt/surviving-disk
 ```
 
-检查无误后，停服，将 TOML 中的 `db` 指向新库，再启动服务。更新版本时重新运行发布包中的 `install.sh`，已有 TOML 会保留。同步 Samba 共享配置并重启 Tier。
+确认检查报告后，停服并将 TOML 的 `db` 指向恢复目录，再重启服务。只有明确接受不完整恢复时才使用 `--allow-degraded`。Tier 重启后，SMB 客户端需要重新连接。
 
-从源码构建需要稳定版 Rust、C 编译器、GNU Make、Node.js 22.12+ 和 npm。运行 `make build` 即可生成含控制台的 `target/release/tier`。
+## 开发
+
+在 Ubuntu 中构建和测试。需要稳定版 Rust（rustfmt、Clippy、rust-analyzer）、C/C++ 编译器、Clang/libclang、clang-format、CMake、Make、ShellCheck、shfmt、Python 3.12+ 和 Node.js 22.12+。
+
+```sh
+python3 -m venv /tmp/tier-dev
+. /tmp/tier-dev/bin/activate
+pip install -r tests/requirements-dev.txt
+make check
+rust-analyzer diagnostics . --severity error
+make build
+```
+
+Samba 插件在 Debian 13 中构建。启用 `deb-src`，安装 `samba`、`samba-dev`、`protobuf-c-compiler`、`libprotobuf-c-dev` 和 `apt build-dep samba` 所需依赖，然后运行 `samba/build.sh /tmp/tier-module`。CI 会打包并在干净 Debian 环境中验证安装、真实 SMB 操作与故障恢复。

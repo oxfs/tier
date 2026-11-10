@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
-import { date, statuses, needsAttention, type Health } from "../model";
+import { statuses, needsAttention, type Health } from "../model";
 const props = defineProps<{ items: Health[] }>();
 defineEmits<{ repair: [] }>();
 const filter = ref("attention");
@@ -43,9 +43,7 @@ const filtered = computed(() =>
             <span class="badge" :class="{ warn: needsAttention(f.status) }">
               {{ statuses[f.status] ?? f.status }}
             </span>
-            <small v-if="f.last_copy_cancelled" class="detail">
-              复制取消于 {{ date(f.last_copy_cancelled) }}
-            </small>
+            <small v-if="f.error" class="detail">{{ f.error }}</small>
           </td>
           <td>{{ f.current }} / {{ f.required }}</td>
           <td>

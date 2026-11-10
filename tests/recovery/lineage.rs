@@ -4,7 +4,7 @@ use tempfile::tempdir;
 use tier::{backup::Schedule, core::Engine, recovery};
 
 #[test]
-fn restore_into_the_original_backup_directory_preserves_both_histories() -> Result<()> {
+fn restored_catalog_uses_a_distinct_backup_lineage() -> Result<()> {
     let temp = tempdir()?;
     let dir = temp.path().join("snapshots");
     fs::create_dir(&dir)?;
@@ -20,30 +20,35 @@ fn restore_into_the_original_backup_directory_preserves_both_histories() -> Resu
     })?;
     let baseline = source.snapshot()?;
     source.mkdir("/original")?;
+    let original = source.stat("/original")?.id;
     source.backup_tick()?;
     let restored = temp.path().join("restored");
-    recovery::import(&baseline, &restored, &BTreeMap::new(), false)?;
+    recovery::import(
+        &baseline,
+        &restored,
+        &BTreeMap::new(),
+        false,
+        &Default::default(),
+    )?;
     let engine = Engine::open(&restored)?;
     engine.mkdir("/replacement")?;
-    assert_eq!(source.snapshot()?["seq"], engine.snapshot()?["seq"]);
+    let replacement = engine.stat("/replacement")?.id;
     engine.backup_tick()?;
-    let mut names = Vec::new();
+    let mut keys = Vec::new();
     for file in fs::read_dir(dir)? {
         let path = file?.path();
         if path.extension().is_some_and(|s| s == "json") {
             let data = tier::snapshot::load(&path)?;
-            names.extend(
-                data["nodes"]
+            keys.extend(
+                data["records"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .map(|n| n["name"].as_str().unwrap().to_owned()),
+                    .map(|r| r["key"].as_str().unwrap().to_owned()),
             );
         }
     }
-    assert!(
-        names.iter().any(|name| name == "original")
-            && names.iter().any(|name| name == "replacement")
-    );
+    assert!(keys.contains(&format!("node/{original}")));
+    assert!(keys.contains(&format!("node/{replacement}")));
     Ok(())
 }

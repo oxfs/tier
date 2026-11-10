@@ -50,12 +50,8 @@ export function policyInput(values: Record<string, Input>) {
   if (!hasCache(values))
     Object.assign(input, {
       write_cache: [],
-      cache_copies: 0,
-      persist_delay_secs: 0,
       direct_fallback: false,
-      fallback_count: null,
     });
-  if (!values.direct_fallback) input.fallback_count = null;
   return input;
 }
 export const forms: Record<string, Field[]> = {
@@ -76,7 +72,7 @@ export const forms: Record<string, Field[]> = {
     },
   ],
   archive: [
-    { key: "name", label: "归档名称", placeholder: "cloud1", kind: "text" },
+    { key: "name", label: "归档名称", placeholder: "archive1", kind: "text" },
     {
       key: "url",
       hint: "填写已有的可读写 WebDAV 集合地址。",
@@ -99,7 +95,7 @@ export const forms: Record<string, Field[]> = {
       kind: "text",
     },
   ],
-  cloud_policy: [
+  archive_policy: [
     {
       key: "path",
       label: "共享内目录",
@@ -112,7 +108,7 @@ export const forms: Record<string, Field[]> = {
       hint: "填写已登记的 WebDAV 归档名称。",
       label: "归档目标（逗号分隔）",
       optional: true,
-      placeholder: "cloud1",
+      placeholder: "archive1",
       kind: "list",
     },
     {
@@ -244,7 +240,7 @@ export const forms: Record<string, Field[]> = {
       label: "持久化目标",
       placeholder: "disk1,disk2",
       kind: "list",
-      hint: "选择最终保存文件的设备。没有写入缓存时，写入直接在这些设备上确认。",
+      hint: "选择长期保存数据的设备。没有缓存时，前台先写其中一块，后台补齐其余副本。",
     },
     {
       key: "persistent_copies",
@@ -252,11 +248,11 @@ export const forms: Record<string, Field[]> = {
       kind: "number",
       min: 1,
       defaultValue: 1,
-      hint: "双盘同步写入时，选择两块持久化设备并设为 2。",
+      hint: "后台需要达到的副本数。写入和 FLUSH 不等待这些副本补齐。",
     },
     {
       key: "write_cache",
-      section: "写入缓存（可选）",
+      section: "缓存（可选）",
       label: "缓存目标",
       placeholder: "可留空",
       optional: true,
@@ -264,22 +260,12 @@ export const forms: Record<string, Field[]> = {
       hint: "留空时直接写入持久化存储。启用后，先写入所选缓存，再后台复制到持久化存储。",
     },
     {
-      key: "cache_copies",
-      label: "缓存确认份数",
-      kind: "number",
-      min: 1,
-      defaultValue: 1,
-      cacheOnly: true,
-      hint: "缓存模式下，此份数写入完成后向客户端确认。",
-    },
-    {
       key: "persist_delay_secs",
       label: "持久化延迟（秒）",
       kind: "number",
       min: 0,
       defaultValue: 1800,
-      cacheOnly: true,
-      hint: "文件停止修改后再等待指定秒数，开始创建持久化副本。",
+      hint: "最后一个写句柄关闭后等待指定秒数，再校验并补齐持久化副本。",
     },
     {
       key: "low_water",
@@ -308,15 +294,6 @@ export const forms: Record<string, Field[]> = {
       kind: "checkbox",
       cacheOnly: true,
       hint: "关闭时，缓存空间不足会导致此次写入失败。",
-    },
-    {
-      key: "fallback_count",
-      label: "直写确认份数",
-      kind: "number",
-      min: 1,
-      optional: true,
-      cacheOnly: true,
-      hint: "留空时使用持久化副本数。",
     },
     {
       section: "删除与修复",
