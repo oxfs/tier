@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use prost::Message;
 use std::{
     collections::HashMap,
@@ -497,4 +497,80 @@ fn attach_rejects_an_unsupported_subdirectory_instead_of_exporting_root() -> Res
         0
     );
     Ok(())
+}
+
+#[test]
+fn stalled_read_replies_do_not_starve_other_sessions() -> Result<()> {
+    let (temp, engine, server) = fixture()?;
+    let path = temp.path().join("tier.sock");
+    let workers = std::thread::available_parallelism()
+        .map_or(4, usize::from)
+        .clamp(4, 32);
+    let mut stalled = Vec::new();
+    let mut handles = Vec::new();
+    for index in 0..workers {
+        let name = format!("slow-reader-{index}");
+        engine.put(&format!("/{name}"), &vec![0x5a; MAX_DATA])?;
+        let mut client = Client::connect(&path)?;
+        handles.push(client.open(&name, Access::ReadOnly, Disposition::Existing)?);
+        stalled.push(client);
+    }
+    let mut active = Client::connect(&path)?;
+    let handle = active.open("progress", Access::Metadata, Disposition::CreateNew)?;
+    active
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(2)))?;
+    let progress = (|| -> Result<()> {
+        for (client, handle) in stalled.iter_mut().zip(handles) {
+            client.submit(
+                Request {
+                    method: Method::Read as i32,
+                    handle,
+                    length: MAX_DATA as u32,
+                    ..Default::default()
+                },
+                vec![],
+            )?;
+            // Wait for the response to start, then deliberately stop consuming
+            // its large body. Each request uses a distinct file and session.
+            let mut header = [0; 24];
+            client.stream.read_exact(&mut header)?;
+            anyhow::ensure!(
+                u32::from_be_bytes(header[20..24].try_into()?) == MAX_DATA as u32,
+                "expected a full read response"
+            );
+        }
+        let (response, _) = active
+            .call(
+                Request {
+                    method: Method::Setattr as i32,
+                    handle,
+                    changes: Some(Changes {
+                        mtime: Some(Timestamp {
+                            seconds: 42,
+                            nanos: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .context("SETATTR blocked behind other sessions' unread replies")?;
+        anyhow::ensure!(
+            response.attr.unwrap().mtime.unwrap().seconds == 42,
+            "unrelated metadata request did not complete"
+        );
+        Ok(())
+    })();
+    // Shutdown must interrupt pending response writes even while peers remain
+    // connected. In the failing implementation this also prevents a slow test
+    // teardown from waiting for every socket's write timeout.
+    let started = std::time::Instant::now();
+    server.shutdown();
+    anyhow::ensure!(
+        started.elapsed() < Duration::from_secs(2),
+        "blocked IPC shutdown"
+    );
+    progress
 }

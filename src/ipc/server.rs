@@ -19,6 +19,7 @@ use std::{
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, SyncSender},
     },
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -418,7 +419,6 @@ fn serve(
     let Ok(writer) = stream.try_clone() else {
         return;
     };
-    let writer = Arc::new(Mutex::new(writer));
     let session = Arc::new(Mutex::new(Session {
         engine,
         handles: HashMap::new(),
@@ -431,6 +431,10 @@ fn serve(
     }));
     let pending = Arc::new(Counter::default());
     let ids = Arc::new(Mutex::new(HashSet::new()));
+    let Ok((replies, reply_writer)) = Replies::start(writer, ids.clone()) else {
+        return;
+    };
+    let replies = Arc::new(replies);
     loop {
         // Backpressure before allocating the next frame, including its body.
         let local = pending.acquire(MAX_INFLIGHT);
@@ -460,8 +464,14 @@ fn serve(
             frame.data.is_empty()
         };
         if !data_valid || request.length as usize > MAX_DATA {
-            let _ = send(&writer, frame.id, method, Err(errno(libc::EINVAL)));
-            ids.lock().unwrap().remove(&frame.id);
+            let _ = send(
+                &replies,
+                frame.id,
+                method,
+                Err(errno(libc::EINVAL)),
+                local,
+                None,
+            );
             continue;
         }
         let async_method = matches!(
@@ -473,38 +483,81 @@ fn serve(
             let handle = match handle {
                 Ok(handle) => handle,
                 Err(error) => {
-                    let _ = send(&writer, frame.id, method, Err(error));
-                    ids.lock().unwrap().remove(&frame.id);
+                    let _ = send(&replies, frame.id, method, Err(error), local, None);
                     continue;
                 }
             };
             let engine = session.lock().unwrap().engine.clone();
             let global = workers.acquire(MAX_REQUESTS);
-            let writer = writer.clone();
-            let ids = ids.clone();
+            let replies = replies.clone();
             pool.submit(handle.node.clone(), move || {
-                let _local = local;
-                let _global = global;
                 let result = execute_file(&engine, &handle, request, frame.data);
-                let _ = send(&writer, frame.id, method, result);
-                ids.lock().unwrap().remove(&frame.id);
+                // CLOSE's barrier must not finish while a worker retains the handle.
+                drop(handle);
+                let _ = send(&replies, frame.id, method, result, local, Some(global));
             });
         } else {
             drop(local);
             pending.wait_empty();
             let result = execute(&mut session.lock().unwrap(), request, instance);
-            if send(&writer, frame.id, method, result).is_err() {
+            let local = pending.acquire(MAX_INFLIGHT);
+            if send(&replies, frame.id, method, result, local, None).is_err() {
                 break;
             }
-            ids.lock().unwrap().remove(&frame.id);
         }
     }
     pending.wait_empty();
+    drop(replies);
+    let _ = reply_writer.join();
     // Dropping FileHandles releases writers after every admitted operation.
 }
 
 type Reply = Result<(Response, Vec<u8>)>;
-fn send(writer: &Mutex<UnixStream>, id: u64, method: Method, result: Reply) -> io::Result<()> {
+struct Outbound {
+    frame: Frame,
+    method: Method,
+    _local: Permit,
+    _global: Option<Permit>,
+}
+
+/// Slow readers consume their admission budget, never a storage worker. Every
+/// queued reply retains a local permit, so the bounded queue cannot fill while
+/// a sender still owns another permit. Enqueue must never wait for socket I/O.
+struct Replies {
+    queue: SyncSender<Outbound>,
+    control: UnixStream,
+}
+impl Replies {
+    fn start(
+        mut writer: UnixStream,
+        ids: Arc<Mutex<HashSet<u64>>>,
+    ) -> io::Result<(Self, JoinHandle<()>)> {
+        let control = writer.try_clone()?;
+        let (queue, responses) = mpsc::sync_channel::<Outbound>(MAX_INFLIGHT);
+        let thread = thread::spawn(move || {
+            while let Ok(response) = responses.recv() {
+                let result = response.frame.write(&mut writer);
+                ids.lock().unwrap().remove(&response.frame.id);
+                if let Err(error) = result {
+                    // Wake the reader before dropping queued replies and their permits.
+                    let _ = writer.shutdown(Shutdown::Both);
+                    tracing::warn!(request_id = response.frame.id, method = ?response.method, %error, "IPC reply write failed");
+                    break;
+                }
+            }
+        });
+        Ok((Self { queue, control }, thread))
+    }
+}
+
+fn send(
+    replies: &Replies,
+    id: u64,
+    method: Method,
+    result: Reply,
+    local: Permit,
+    global: Option<Permit>,
+) -> io::Result<()> {
     let (response, data) = match result {
         Ok(result) => result,
         Err(error) => {
@@ -531,18 +584,23 @@ fn send(writer: &Mutex<UnixStream>, id: u64, method: Method, result: Reply) -> i
             )
         }
     };
-    let mut writer = writer.lock().unwrap();
-    let result = Frame {
-        id,
-        message: response.encode_to_vec(),
-        data,
+    let response = Outbound {
+        frame: Frame {
+            id,
+            message: response.encode_to_vec(),
+            data,
+        },
+        method,
+        _local: local,
+        _global: global,
+    };
+    if let Err(error) = replies.queue.try_send(response) {
+        let _ = replies.control.shutdown(Shutdown::Both);
+        return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()));
     }
-    .write(&mut *writer);
-    if result.is_err() {
-        let _ = writer.shutdown(Shutdown::Both);
-    }
-    result
+    Ok(())
 }
+
 fn ok(response: Response) -> Reply {
     Ok((response, vec![]))
 }
