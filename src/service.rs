@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, watch};
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeOptions {
     pub max_blocking_threads: usize,
-    pub worker_threads: Option<usize>,
+    pub worker_threads: usize,
     pub admin_request_limit: u32,
     pub background_task_limit: usize,
 }
@@ -20,8 +20,8 @@ pub struct RuntimeOptions {
 impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
-            max_blocking_threads: 32,
-            worker_threads: None,
+            max_blocking_threads: 8,
+            worker_threads: 1,
             admin_request_limit: 2,
             background_task_limit: 1,
         }
@@ -34,13 +34,13 @@ impl RuntimeOptions {
             self.max_blocking_threads > 0,
             "runtime.max_blocking_threads must be positive"
         );
-        let workers = self
-            .worker_threads
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
-        ensure!(workers > 0, "runtime.worker_threads must be positive");
+        ensure!(
+            self.worker_threads > 0,
+            "runtime.worker_threads must be positive"
+        );
         ensure!(
             self.max_blocking_threads
-                .checked_add(workers)
+                .checked_add(self.worker_threads)
                 .is_some_and(|total| total <= isize::MAX as usize),
             "runtime thread limits exceed the supported range"
         );
@@ -108,11 +108,8 @@ pub fn serve(
 ) -> Result<()> {
     options.validate()?;
     ipc_options.validate()?;
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    if let Some(workers) = options.worker_threads {
-        builder.worker_threads(workers);
-    }
-    let runtime = builder
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(options.worker_threads)
         .enable_all()
         .max_blocking_threads(options.max_blocking_threads)
         .thread_name("tier-runtime")

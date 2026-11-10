@@ -101,6 +101,10 @@ mod tests {
     fn runtime_defaults_overrides_and_invalid_limits() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("tier.toml");
+        fs::write(&path, "")?;
+        let defaults = Settings::load(Some(&path))?;
+        assert_eq!(defaults.runtime.worker_threads, 1);
+        assert_eq!(defaults.runtime.max_blocking_threads, 8);
         for limit in [1, 2] {
             fs::write(&path, format!("[runtime]\nmax_blocking_threads={limit}"))?;
             assert_eq!(
@@ -125,15 +129,16 @@ mod tests {
         }
         fs::write(
             &path,
-            "[runtime]\nworker_threads=1\nadmin_request_limit=3\nbackground_task_limit=2",
+            "[runtime]\nworker_threads=2\nadmin_request_limit=3\nbackground_task_limit=2",
         )?;
         let settings = Settings::load(Some(&path))?;
-        assert_eq!(settings.runtime.worker_threads, Some(1));
+        assert_eq!(settings.runtime.worker_threads, 2);
         assert_eq!(settings.runtime.admin_request_limit, 3);
         assert_eq!(settings.runtime.background_task_limit, 2);
         let defaults: Settings = toml::from_str(include_str!("../deploy/tier.toml"))?;
         defaults.runtime.validate()?;
-        assert_eq!(defaults.runtime.worker_threads, None);
+        assert_eq!(defaults.runtime.worker_threads, 1);
+        assert_eq!(defaults.runtime.max_blocking_threads, 8);
         assert_eq!(
             defaults.runtime.admin_request_limit,
             RuntimeOptions::default().admin_request_limit
