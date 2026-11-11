@@ -24,7 +24,7 @@ struct tier_dir {
 	struct files_struct *fsp;
 	uint64_t handle, cursor;
 	TALLOC_CTX *page_ctx;
-	Tier__Ipc__Response *page;
+	TierResponse *page;
 	size_t index;
 	bool eof;
 	int error;
@@ -49,7 +49,7 @@ static uint64_t parent(struct vfs_handle_struct *h, const struct files_struct *f
 		return config(h)->cwd;
 	return fh(h, fsp);
 }
-static struct timespec timestamp(Tier__Ipc__Timestamp *t)
+static struct timespec timestamp(TierTimestamp *t)
 {
 	struct timespec ts = {0};
 	if (t) {
@@ -58,7 +58,7 @@ static struct timespec timestamp(Tier__Ipc__Timestamp *t)
 	}
 	return ts;
 }
-static int attributes(Tier__Ipc__Attr *a, SMB_STRUCT_STAT *s)
+static int attributes(TierAttr *a, SMB_STRUCT_STAT *s)
 {
 	if (!a || a->inode == 0) {
 		errno = EPROTO;
@@ -82,7 +82,7 @@ static int attributes(Tier__Ipc__Attr *a, SMB_STRUCT_STAT *s)
 	    a->directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
 	return 0;
 }
-static int rpc_status(struct vfs_handle_struct *h, Tier__Ipc__Request *r)
+static int rpc_status(struct vfs_handle_struct *h, TierRequest *r)
 {
 	TALLOC_CTX *tmp = talloc_new(h);
 	int ret = tier_rpc(tmp, config(h)->client, r) ? 0 : -1;
@@ -103,8 +103,8 @@ static int tier_connect(struct vfs_handle_struct *h, const char *service,
 			const char *user)
 {
 	struct tier_config *c;
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
-	Tier__Ipc__Response *out;
+	TierRequest r = {0};
+	TierResponse *out;
 	TALLOC_CTX *tmp;
 	const char *path =
 	    lp_parm_const_string(SNUM(h->conn), "tier", "socket", "/run/tier/tier.sock");
@@ -132,7 +132,7 @@ static int tier_connect(struct vfs_handle_struct *h, const char *service,
 	if (!c->client)
 		return -1;
 	tmp = talloc_new(c);
-	r.method = TIER__IPC__METHOD__ATTACH;
+	r.method = TIER_METHOD_ATTACH;
 	r.name = h->conn->connectpath;
 	out = tier_rpc(tmp, c->client, &r);
 	if (!out) {
@@ -148,10 +148,10 @@ static int tier_fstat(struct vfs_handle_struct *h, struct files_struct *fsp,
 		      SMB_STRUCT_STAT *s)
 {
 	TALLOC_CTX *tmp = talloc_new(h);
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
-	Tier__Ipc__Response *out;
+	TierRequest r = {0};
+	TierResponse *out;
 	int ret = -1;
-	r.method = TIER__IPC__METHOD__GETATTR;
+	r.method = TIER_METHOD_GETATTR;
 	r.handle = fh(h, fsp);
 	if (r.handle && (out = tier_rpc(tmp, config(h)->client, &r)))
 		ret = attributes(out->attr, s);
@@ -166,8 +166,8 @@ static int tier_fstatat(struct vfs_handle_struct *h, const struct files_struct *
 			const struct smb_filename *name, SMB_STRUCT_STAT *s, int flags)
 {
 	TALLOC_CTX *tmp = talloc_new(h);
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
-	Tier__Ipc__Response *out;
+	TierRequest r = {0};
+	TierResponse *out;
 	int ret = -1;
 	if (!no_stream(name))
 		goto done;
@@ -175,9 +175,9 @@ static int tier_fstatat(struct vfs_handle_struct *h, const struct files_struct *
 		errno = ENOTSUP;
 		goto done;
 	}
-	r.method = TIER__IPC__METHOD__STAT_AT;
+	r.method = TIER_METHOD_STAT_AT;
 	r.parent = parent(h, dir);
-	r.name = discard_const_p(char, name->base_name);
+	r.name = name->base_name;
 	if (r.parent && (out = tier_rpc(tmp, config(h)->client, &r)))
 		ret = attributes(out->attr, s);
 done: {
@@ -197,8 +197,8 @@ static int tier_openat(struct vfs_handle_struct *h, const struct files_struct *d
 {
 	struct tier_config *c = config(h);
 	TALLOC_CTX *tmp = talloc_new(h);
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
-	Tier__Ipc__Response *out;
+	TierRequest r = {0};
+	TierResponse *out;
 	struct tier_fh *f;
 	int ret = -1;
 	int descriptor;
@@ -214,9 +214,9 @@ static int tier_openat(struct vfs_handle_struct *h, const struct files_struct *d
 		errno = ENOTSUP;
 		goto done;
 	}
-	r.method = TIER__IPC__METHOD__OPEN;
+	r.method = TIER_METHOD_OPEN;
 	r.parent = parent(h, dir);
-	r.name = discard_const_p(char, name->base_name);
+	r.name = name->base_name;
 	if (!r.parent)
 		goto done;
 	if (fsp->fsp_flags.is_pathref || (how->flags & O_PATH) ||
@@ -224,17 +224,17 @@ static int tier_openat(struct vfs_handle_struct *h, const struct files_struct *d
 	     !(fsp->access_mask &
 	       (SEC_FILE_READ_DATA | SEC_FILE_WRITE_DATA | SEC_FILE_APPEND_DATA)) &&
 	     !(how->flags & O_TRUNC)))
-		r.access = TIER__IPC__ACCESS__METADATA;
+		r.access = TIER_ACCESS_METADATA;
 	else
 		switch (how->flags & O_ACCMODE) {
 		case O_RDONLY:
-			r.access = TIER__IPC__ACCESS__READ_ONLY;
+			r.access = TIER_ACCESS_READ_ONLY;
 			break;
 		case O_WRONLY:
-			r.access = TIER__IPC__ACCESS__WRITE_ONLY;
+			r.access = TIER_ACCESS_WRITE_ONLY;
 			break;
 		case O_RDWR:
-			r.access = TIER__IPC__ACCESS__READ_WRITE;
+			r.access = TIER_ACCESS_READ_WRITE;
 			break;
 		default:
 			errno = EINVAL;
@@ -243,15 +243,14 @@ static int tier_openat(struct vfs_handle_struct *h, const struct files_struct *d
 	r.directory = (how->flags & O_DIRECTORY) != 0;
 	r.truncate = (how->flags & O_TRUNC) != 0;
 	if (how->flags & O_CREAT)
-		r.disposition = (how->flags & O_EXCL)
-				    ? TIER__IPC__DISPOSITION__CREATE_NEW
-				    : TIER__IPC__DISPOSITION__OPEN_OR_CREATE;
+		r.disposition = (how->flags & O_EXCL) ? TIER_DISPOSITION_CREATE_NEW
+						      : TIER_DISPOSITION_OPEN_OR_CREATE;
 	out = tier_rpc(tmp, c->client, &r);
 	if (!out)
 		goto done;
 	f = VFS_ADD_FSP_EXTENSION(h, fsp, struct tier_fh, NULL);
 	if (!f) {
-		r.method = TIER__IPC__METHOD__CLOSE;
+		r.method = TIER_METHOD_CLOSE;
 		r.handle = out->handle;
 		rpc_status(h, &r);
 		errno = ENOMEM;
@@ -259,7 +258,7 @@ static int tier_openat(struct vfs_handle_struct *h, const struct files_struct *d
 	}
 	f->handle = out->handle;
 	f->flags = how->flags;
-	f->metadata = r.access == TIER__IPC__ACCESS__METADATA;
+	f->metadata = r.access == TIER_ACCESS_METADATA;
 	fsp->fsp_flags.have_proc_fds = false;
 	ret = descriptor;
 done: {
@@ -271,10 +270,10 @@ done: {
 }
 static int tier_close(struct vfs_handle_struct *h, struct files_struct *fsp)
 {
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
+	TierRequest r = {0};
 	struct tier_fh *f = VFS_FETCH_FSP_EXTENSION(h, fsp);
 	int ret;
-	r.method = TIER__IPC__METHOD__CLOSE;
+	r.method = TIER_METHOD_CLOSE;
 	r.handle = fh(h, fsp);
 	if (!r.handle)
 		return -1;
@@ -288,27 +287,27 @@ static int tier_close(struct vfs_handle_struct *h, struct files_struct *fsp)
 static int tier_mkdirat(struct vfs_handle_struct *h, struct files_struct *dir,
 			const struct smb_filename *name, mode_t mode)
 {
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
+	TierRequest r = {0};
 	if (!no_stream(name))
 		return -1;
-	r.method = TIER__IPC__METHOD__MKDIR;
+	r.method = TIER_METHOD_MKDIR;
 	r.parent = parent(h, dir);
-	r.name = discard_const_p(char, name->base_name);
+	r.name = name->base_name;
 	return r.parent ? rpc_status(h, &r) : -1;
 }
 static int tier_unlinkat(struct vfs_handle_struct *h, struct files_struct *dir,
 			 const struct smb_filename *name, int flags)
 {
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
+	TierRequest r = {0};
 	if (!no_stream(name))
 		return -1;
 	if (flags & ~AT_REMOVEDIR) {
 		errno = EINVAL;
 		return -1;
 	}
-	r.method = TIER__IPC__METHOD__UNLINK;
+	r.method = TIER_METHOD_UNLINK;
 	r.parent = parent(h, dir);
-	r.name = discard_const_p(char, name->base_name);
+	r.name = name->base_name;
 	r.directory = (flags & AT_REMOVEDIR) != 0;
 	return r.parent ? rpc_status(h, &r) : -1;
 }
@@ -316,26 +315,26 @@ static int tier_renameat(struct vfs_handle_struct *h, struct files_struct *srcdi
 			 const struct smb_filename *src, struct files_struct *dstdir,
 			 const struct smb_filename *dst, const struct vfs_rename_how *how)
 {
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
+	TierRequest r = {0};
 	if (!no_stream(src) || !no_stream(dst))
 		return -1;
 	if (how->flags & ~VFS_RENAME_HOW_NO_REPLACE) {
 		errno = ENOTSUP;
 		return -1;
 	}
-	r.method = TIER__IPC__METHOD__RENAME;
+	r.method = TIER_METHOD_RENAME;
 	r.parent = parent(h, srcdir);
 	r.target_parent = parent(h, dstdir);
-	r.name = discard_const_p(char, src->base_name);
-	r.target_name = discard_const_p(char, dst->base_name);
+	r.name = src->base_name;
+	r.target_name = dst->base_name;
 	r.replace = !(how->flags & VFS_RENAME_HOW_NO_REPLACE);
 	return r.parent && r.target_parent ? rpc_status(h, &r) : -1;
 }
 static int tier_setattr(struct vfs_handle_struct *h, struct files_struct *fsp,
-			Tier__Ipc__Changes *changes)
+			TierChanges *changes)
 {
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
-	r.method = TIER__IPC__METHOD__SETATTR;
+	TierRequest r = {0};
+	r.method = TIER_METHOD_SETATTR;
 	r.handle = fh(h, fsp);
 	r.changes = changes;
 	return r.handle ? rpc_status(h, &r) : -1;
@@ -343,7 +342,7 @@ static int tier_setattr(struct vfs_handle_struct *h, struct files_struct *fsp,
 static int tier_ftruncate(struct vfs_handle_struct *h, struct files_struct *fsp,
 			  off_t size)
 {
-	Tier__Ipc__Changes changes = TIER__IPC__CHANGES__INIT;
+	TierChanges changes = {0};
 	if (size < 0) {
 		errno = EINVAL;
 		return -1;
@@ -354,7 +353,7 @@ static int tier_ftruncate(struct vfs_handle_struct *h, struct files_struct *fsp,
 }
 static int tier_fchmod(struct vfs_handle_struct *h, struct files_struct *fsp, mode_t mode)
 {
-	Tier__Ipc__Changes changes = TIER__IPC__CHANGES__INIT;
+	TierChanges changes = {0};
 	changes.has_mode = true;
 	changes.mode = mode;
 	return tier_setattr(h, fsp, &changes);
@@ -362,10 +361,9 @@ static int tier_fchmod(struct vfs_handle_struct *h, struct files_struct *fsp, mo
 static int tier_fntimes(struct vfs_handle_struct *h, struct files_struct *fsp,
 			struct smb_file_time *ft)
 {
-	Tier__Ipc__Changes c = TIER__IPC__CHANGES__INIT;
-	Tier__Ipc__Timestamp at = TIER__IPC__TIMESTAMP__INIT,
-			     mt = TIER__IPC__TIMESTAMP__INIT;
-	Tier__Ipc__Timestamp bt = TIER__IPC__TIMESTAMP__INIT;
+	TierChanges c = {0};
+	TierTimestamp at = {0}, mt = {0};
+	TierTimestamp bt = {0};
 	if (!is_omit_timespec(&ft->atime)) {
 		at.seconds = ft->atime.tv_sec;
 		at.nanos = ft->atime.tv_nsec;
@@ -393,11 +391,11 @@ struct tier_io {
 static struct tevent_req *tier_io_send(struct vfs_handle_struct *h, TALLOC_CTX *ctx,
 				       struct tevent_context *ev,
 				       struct files_struct *fsp, void *data, size_t n,
-				       off_t offset, Tier__Ipc__Method method)
+				       off_t offset, TierMethod method)
 {
 	struct tier_io *state;
 	struct tevent_req *req = tevent_req_create(ctx, &state, struct tier_io);
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
+	TierRequest r = {0};
 	if (!req)
 		return NULL;
 	if (offset < 0 || n > tier_max_data(config(h)->client)) {
@@ -416,13 +414,13 @@ static struct tevent_req *tier_io_send(struct vfs_handle_struct *h, TALLOC_CTX *
 		tevent_req_error(req, errno);
 		return tevent_req_post(req, ev);
 	}
-	state->read = method == TIER__IPC__METHOD__READ;
-	state->sync = method == TIER__IPC__METHOD__SYNC;
+	state->read = method == TIER_METHOD_READ;
+	state->sync = method == TIER_METHOD_SYNC;
 	state->read_buffer = data;
 	state->length = n;
 	state->call = tier_submit(state, config(h)->client, &r,
-				  method == TIER__IPC__METHOD__WRITE ? data : NULL,
-				  method == TIER__IPC__METHOD__WRITE ? n : 0, req);
+				  method == TIER_METHOD_WRITE ? data : NULL,
+				  method == TIER_METHOD_WRITE ? n : 0, req);
 	if (!state->call) {
 		tevent_req_error(req, errno);
 		return tevent_req_post(req, ev);
@@ -432,7 +430,7 @@ static struct tevent_req *tier_io_send(struct vfs_handle_struct *h, TALLOC_CTX *
 static ssize_t tier_io_recv(struct tevent_req *req, struct vfs_aio_state *aio)
 {
 	struct tier_io *state = tevent_req_data(req, struct tier_io);
-	Tier__Ipc__Response *out;
+	TierResponse *out;
 	void *data;
 	size_t length;
 	ZERO_STRUCTP(aio);
@@ -457,7 +455,7 @@ static struct tevent_req *tier_pread_send(struct vfs_handle_struct *h, TALLOC_CT
 					  struct files_struct *fsp, void *data, size_t n,
 					  off_t offset)
 {
-	return tier_io_send(h, ctx, ev, fsp, data, n, offset, TIER__IPC__METHOD__READ);
+	return tier_io_send(h, ctx, ev, fsp, data, n, offset, TIER_METHOD_READ);
 }
 static struct tevent_req *tier_pwrite_send(struct vfs_handle_struct *h, TALLOC_CTX *ctx,
 					   struct tevent_context *ev,
@@ -465,13 +463,13 @@ static struct tevent_req *tier_pwrite_send(struct vfs_handle_struct *h, TALLOC_C
 					   size_t n, off_t offset)
 {
 	return tier_io_send(h, ctx, ev, fsp, discard_const_p(void, data), n, offset,
-			    TIER__IPC__METHOD__WRITE);
+			    TIER_METHOD_WRITE);
 }
 static struct tevent_req *tier_fsync_send(struct vfs_handle_struct *h, TALLOC_CTX *ctx,
 					  struct tevent_context *ev,
 					  struct files_struct *fsp)
 {
-	return tier_io_send(h, ctx, ev, fsp, NULL, 0, 0, TIER__IPC__METHOD__SYNC);
+	return tier_io_send(h, ctx, ev, fsp, NULL, 0, 0, TIER_METHOD_SYNC);
 }
 static int tier_fsync_recv(struct tevent_req *req, struct vfs_aio_state *aio)
 {
@@ -481,8 +479,8 @@ static ssize_t tier_io_sync(struct vfs_handle_struct *h, struct files_struct *fs
 			    void *data, size_t n, off_t offset, bool write)
 {
 	TALLOC_CTX *tmp = talloc_new(h);
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
-	Tier__Ipc__Response *out;
+	TierRequest r = {0};
+	TierResponse *out;
 	struct tier_call *call;
 	void *bytes;
 	size_t length;
@@ -492,7 +490,7 @@ static ssize_t tier_io_sync(struct vfs_handle_struct *h, struct files_struct *fs
 		goto done;
 	}
 	n = MIN(n, tier_max_data(config(h)->client));
-	r.method = write ? TIER__IPC__METHOD__WRITE : TIER__IPC__METHOD__READ;
+	r.method = write ? TIER_METHOD_WRITE : TIER_METHOD_READ;
 	r.handle = fh(h, fsp);
 	r.offset = offset;
 	r.length = n;
@@ -593,13 +591,13 @@ static int tier_chdir(struct vfs_handle_struct *h, const struct smb_filename *na
 {
 	struct tier_config *c = config(h);
 	TALLOC_CTX *tmp = talloc_new(h);
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
-	Tier__Ipc__Response *out;
+	TierRequest r = {0};
+	TierResponse *out;
 	uint64_t old;
 	int ret = -1;
 	if (!no_stream(name))
 		goto done;
-	r.method = TIER__IPC__METHOD__OPEN;
+	r.method = TIER_METHOD_OPEN;
 	r.parent = c->cwd;
 	r.name = name->base_name;
 	r.directory = true;
@@ -619,7 +617,7 @@ static int tier_chdir(struct vfs_handle_struct *h, const struct smb_filename *na
 		}
 	}
 	if (old != c->root) {
-		r.method = TIER__IPC__METHOD__CLOSE;
+		r.method = TIER_METHOD_CLOSE;
 		r.handle = old;
 		rpc_status(h, &r);
 	}
@@ -665,9 +663,9 @@ static struct smb_filename *tier_realpath(struct vfs_handle_struct *h, TALLOC_CT
 static int dir_open_cursor(struct tier_dir *d)
 {
 	TALLOC_CTX *tmp = talloc_new(d);
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
-	Tier__Ipc__Response *out;
-	r.method = TIER__IPC__METHOD__OPENDIR;
+	TierRequest r = {0};
+	TierResponse *out;
+	r.method = TIER_METHOD_OPENDIR;
 	r.handle = d->handle;
 	out = tier_rpc(tmp, d->config->client, &r);
 	if (out) {
@@ -702,8 +700,8 @@ static struct dirent *tier_readdir(struct vfs_handle_struct *h, struct files_str
 				   DIR *dir)
 {
 	struct tier_dir *d = (struct tier_dir *)dir;
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
-	Tier__Ipc__Entry *entry;
+	TierRequest r = {0};
+	TierEntry *entry;
 	if (d->error) {
 		errno = d->error;
 		return NULL;
@@ -719,7 +717,7 @@ static struct dirent *tier_readdir(struct vfs_handle_struct *h, struct files_str
 		TALLOC_FREE(d->page_ctx);
 		d->page = NULL;
 		d->page_ctx = talloc_new(d);
-		r.method = TIER__IPC__METHOD__READDIR;
+		r.method = TIER_METHOD_READDIR;
 		r.handle = d->cursor;
 		r.max_entries = 256;
 		r.max_bytes = 256 * 1024;
@@ -754,14 +752,14 @@ static struct dirent *tier_readdir(struct vfs_handle_struct *h, struct files_str
 static void tier_rewinddir(struct vfs_handle_struct *h, DIR *dir)
 {
 	struct tier_dir *d = (struct tier_dir *)dir;
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
+	TierRequest r = {0};
 	TALLOC_CTX *tmp;
 	if (!d->cursor) {
 		d->error = 0;
 		return;
 	}
 	tmp = talloc_new(d);
-	r.method = TIER__IPC__METHOD__CLOSEDIR;
+	r.method = TIER_METHOD_CLOSEDIR;
 	r.handle = d->cursor;
 	if (!tier_rpc(tmp, d->config->client, &r)) {
 		d->error = errno;
@@ -779,9 +777,9 @@ static void tier_rewinddir(struct vfs_handle_struct *h, DIR *dir)
 static int tier_closedir(struct vfs_handle_struct *h, DIR *dir)
 {
 	struct tier_dir *d = (struct tier_dir *)dir;
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
+	TierRequest r = {0};
 	int ret;
-	r.method = TIER__IPC__METHOD__CLOSEDIR;
+	r.method = TIER_METHOD_CLOSEDIR;
 	r.handle = d->cursor;
 	ret = d->cursor ? rpc_status(h, &r) : 0;
 	{
@@ -806,10 +804,10 @@ static uint64_t tier_disk_free(struct vfs_handle_struct *h,
 			       uint64_t *free_blocks, uint64_t *total_blocks)
 {
 	TALLOC_CTX *tmp = talloc_new(h);
-	Tier__Ipc__Request r = TIER__IPC__REQUEST__INIT;
-	Tier__Ipc__Response *out;
+	TierRequest r = {0};
+	TierResponse *out;
 	uint64_t ret = (uint64_t)-1;
-	r.method = TIER__IPC__METHOD__FSINFO;
+	r.method = TIER_METHOD_FSINFO;
 	r.handle = config(h)->root;
 	out = tier_rpc(tmp, config(h)->client, &r);
 	if (out) {

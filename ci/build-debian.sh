@@ -7,7 +7,7 @@ if [[ ${1:-} == prepare ]]; then
     sed -i 's/Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources
     apt-get update -qq
     apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates ccache \
-        python3 python3-dev samba samba-dev smbclient protobuf-c-compiler libprotobuf-c-dev
+        python3 python3-dev samba samba-dev smbclient
     apt-get build-dep -y samba
     {
         dpkg-query -W

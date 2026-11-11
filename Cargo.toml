@@ -1,3 +1,7 @@
+[workspace]
+members = ["samba/client"]
+resolver = "3"
+
 [package]
 name = "tier"
 version = "0.5.0"

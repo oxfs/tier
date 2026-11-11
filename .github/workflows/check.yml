@@ -61,15 +61,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ubuntu-amd64-rust-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}-${{ github.sha }}
+          key: ubuntu-amd64-rust-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'samba/client/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            ubuntu-amd64-rust-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}-
+            ubuntu-amd64-rust-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'samba/client/Cargo.toml') }}-
             ubuntu-amd64-rust-${{ steps.rust-version.outputs.version }}-
       - run: make check
       - run: rust-analyzer diagnostics . --severity error
       - run: tests/capacity-smoke.sh
       - id: rust-build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --workspace
       - uses: actions/cache/save@v4
         if: ${{ !cancelled() && steps.rust-build.outcome == 'success' && steps.rust-cache.outputs.cache-primary-key != '' && steps.rust-cache.outputs.cache-hit != 'true' }}
         with:

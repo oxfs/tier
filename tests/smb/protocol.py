@@ -1,4 +1,4 @@
-"""Exercise the C IPC decoder and asynchronous timeout through a real smbd."""
+"""Exercise the VFS IPC client and asynchronous timeout through a real smbd."""
 
 import os
 import select
@@ -111,6 +111,9 @@ class ProtocolTests(unittest.TestCase):
     def test_malformed_responses_fail_and_are_logged(self):
         corruptions = {
             "magic": lambda request_id: frame(request_id, magic=0),
+            "version": lambda request_id: HEADER.pack(MAGIC, 2, 0, request_id, 0, 0),
+            "flags": lambda request_id: HEADER.pack(MAGIC, 1, 1, request_id, 0, 0),
+            "unexpected_data": lambda request_id: frame(request_id, data=b"x"),
             "unknown_id": lambda request_id: frame(request_id + 1),
             "protobuf": lambda request_id: frame(request_id, b"\xff"),
             "length": lambda request_id: HEADER.pack(MAGIC, 1, 0, request_id, LIMIT + 1, 0),
@@ -129,6 +132,35 @@ class ProtocolTests(unittest.TestCase):
                     result = self.client("ls")
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("tier IPC failed:", (self.root / "smb.log").read_text())
+
+    def test_fragmented_replies_preserve_file_content(self):
+        # Force the header, protobuf and raw READ data across separate writes.
+        # TCP/Unix streams can still coalesce writes; unit tests cover every
+        # parser boundary, while this verifies the real tevent integration.
+        def proxy(front, stop):
+            with socket.socket(socket.AF_UNIX) as back:
+                back.connect(str(self.root / "tier.sock"))
+                back.settimeout(5)
+                while not stop.is_set():
+                    for source in select.select([front, back], [], [], 0.1)[0]:
+                        request_id, message, data = receive_frame(source)
+                        reply = frame(request_id, message, data)
+                        if source is front:
+                            back.sendall(reply)
+                        else:
+                            cuts = (1, HEADER.size - 1, HEADER.size, HEADER.size + len(message))
+                            offset = 0
+                            for end in cuts:
+                                if end > offset:
+                                    front.sendall(reply[offset:end])
+                                    offset = end
+                            front.sendall(reply[offset:])
+
+        output = self.root / "fragmented-output"
+        with backend(self.root, proxy):
+            result = self.client(f"get timeout-probe {output}")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(output.read_bytes(), (self.root / "input").read_bytes())
 
     def test_async_read_timeout(self):
         # Relay all control operations to Tier, but withhold READ replies. The

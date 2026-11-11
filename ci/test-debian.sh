@@ -4,7 +4,7 @@ set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y --no-install-recommends samba smbclient libprotobuf-c1 libjemalloc2 ca-certificates python3-venv
+apt-get install -y --no-install-recommends samba smbclient libjemalloc2 ca-certificates python3-venv
 python3 -m venv /tmp/smb-python
 /tmp/smb-python/bin/pip install --disable-pip-version-check -r "$repo/tests/smb/requirements.txt"
 export PATH="/tmp/smb-python/bin:$PATH"

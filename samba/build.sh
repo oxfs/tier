@@ -4,6 +4,11 @@ set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 work=${TIER_SAMBA_BUILD_DIR:-/tmp/tier-samba-build}
 out=${1:-"$work/output"}
+client=${TIER_CLIENT_LIB:-"$repo/target/release/libtier_client.a"}
+[[ -f "$client" ]] || {
+    echo "Missing $client; run cargo build --release --workspace first." >&2
+    exit 1
+}
 mkdir -p "$work" "$out"
 out=$(cd "$out" && pwd)
 version=$(dpkg-query -W -f='${Version}' samba)
@@ -23,27 +28,47 @@ if [[ ! -d "$source_dir" ]]; then
 fi
 [[ $(dpkg-parsechangelog -l "$source_dir/debian/changelog" -S Version) == "$source_version" ]]
 cp "$repo/samba/"{vfs_tier.c,tier_client.c,tier_client.h} "$source_dir/source3/modules/"
-protoc-c -I "$repo/proto" --c_out="$source_dir/source3/modules" "$repo/proto/tier.proto"
-python3 - "$source_dir" <<'PY'
+cp "$repo/samba/client/tier_rust.h" "$source_dir/source3/modules/"
+cp "$client" "$source_dir/source3/modules/libtier_client.a"
+python3 - "$source_dir" <<'PYBUILD'
 from pathlib import Path
+import re
 import sys
 root = Path(sys.argv[1])
+# Existing build trees may still contain the former protobuf-c module definition.
 p = root / 'source3/wscript'
 s = p.read_text()
-check = "    conf.CHECK_LIB('protobuf-c', shlib=True, mandatory=True)"
-if check not in s:
-    p.write_text(s.replace('def configure(conf):', 'def configure(conf):\n' + check, 1))
+check = "    conf.CHECK_LIB('protobuf-c', shlib=True, mandatory=True)\n"
+if check in s:
+    p.write_text(s.replace(check, ''))
     (root / 'bin/configured.stamp').unlink(missing_ok=True)
 p = root / 'source3/modules/wscript_build'
-s = p.read_text()
-if "bld.SAMBA3_MODULE('vfs_tier'" not in s:
-    p.write_text(s + """
+s = re.sub(r"\nbld\.SAMBA3_MODULE\('vfs_tier'.*?enabled=True\)\n", "\n", p.read_text(), flags=re.S)
+marker = '\n# Tier Rust client linkage\n'
+s = s.split(marker)[0]
+p.write_text(s + marker + """
+from waflib import Utils
+from waflib.TaskGen import feature, after_method
+
+@feature('tier_rust_client')
+@after_method('apply_link')
+def link_tier_rust_client(self):
+    archive = self.path.find_resource('libtier_client.a')
+    self.link_task.dep_nodes.append(archive)
+    self.link_task.env = self.link_task.env.derive()
+    self.link_task.env.append_value('STLIBPATH', archive.parent.abspath())
+    self.link_task.env.append_value('STLIB', 'tier_client')
+    self.link_task.env.append_value('LIB', ['pthread', 'dl', 'm'])
+    self.link_task.env.append_value('LINKFLAGS', '-Wl,--exclude-libs,ALL')
+
 bld.SAMBA3_MODULE('vfs_tier', subsystem='vfs',
-    source='vfs_tier.c tier_client.c tier.pb-c.c',
-    deps='samba-util protobuf-c', cflags='-fvisibility=hidden',
+    source='vfs_tier.c tier_client.c',
+    deps='samba-util', cflags='-fvisibility=hidden',
     init_function='', internal_module=False, enabled=True)
+module = bld.get_tgen_by_name('vfs_tier')
+module.features = Utils.to_list(module.features) + ['tier_rust_client']
 """)
-PY
+PYBUILD
 cd "$source_dir"
 if command -v ccache >/dev/null; then
     export PATH="/usr/lib/ccache:$PATH"

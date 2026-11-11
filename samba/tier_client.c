@@ -6,8 +6,6 @@
 #include <sys/un.h>
 #include <time.h>
 
-#define TIER_HEADER 24
-#define TIER_MESSAGE_MAX (1024 * 1024)
 #define TIER_DATA_MAX (4 * 1024 * 1024)
 #define TIER_INFLIGHT_MAX 32
 #define TIER_TIMEOUT_SECONDS 60
@@ -26,13 +24,9 @@ struct tier_call {
 	struct tier_call_owner *owner;
 	struct tevent_timer *timer;
 	struct timespec deadline;
-	Tier__Ipc__Method method;
+	TierMethod method;
 	uint64_t id;
-	uint8_t *frame;
-	size_t length, sent;
-	Tier__Ipc__Response *response;
-	uint8_t *data;
-	size_t data_length;
+	TierResponse *response;
 	int error;
 	bool done, deferred;
 };
@@ -47,34 +41,13 @@ struct tier_client {
 	uint32_t max_data;
 	uint32_t max_inflight;
 	bool closing;
-	uint8_t header[TIER_HEADER];
-	size_t header_used, body_used, body_length;
-	uint8_t *body;
+	TierTransport *transport;
 };
-static uint64_t get_be(const uint8_t *p, size_t n)
-{
-	uint64_t v = 0;
-	while (n--)
-		v = (v << 8) | *p++;
-	return v;
-}
-static void put_be(uint8_t *p, uint64_t v, size_t n)
-{
-	while (n) {
-		p[--n] = v & 255;
-		v >>= 8;
-	}
-}
 static void interest(struct tier_client *c)
 {
-	struct tier_call *p;
 	uint16_t flags = TEVENT_FD_READ;
-	for (p = c->calls; p; p = p->next) {
-		if (p->sent < p->length) {
-			flags |= TEVENT_FD_WRITE;
-			break;
-		}
-	}
+	if (c->transport && tier_transport_wants_write(c->transport))
+		flags |= TEVENT_FD_WRITE;
 	if (c->fde)
 		tevent_fd_set_flags(c->fde, c->error ? 0 : flags);
 }
@@ -86,7 +59,6 @@ static void finish(struct tier_call *p, int error)
 		p->client->deferred--;
 	p->error = error;
 	p->done = true;
-	TALLOC_FREE(p->frame);
 	TALLOC_FREE(p->timer);
 	if (p->owner)
 		talloc_steal(p->owner, p);
@@ -111,6 +83,8 @@ static void fail(struct tier_client *c, int error)
 		shutdown(c->fd, SHUT_RDWR);
 	while (c->calls)
 		finish(c->calls, c->error);
+	tier_transport_free(c->transport);
+	c->transport = NULL;
 	interest(c);
 }
 static int call_destroy(struct tier_call *p)
@@ -118,7 +92,7 @@ static int call_destroy(struct tier_call *p)
 	if (p->owner)
 		p->owner->call = NULL;
 	if (p->response)
-		tier__ipc__response__free_unpacked(p->response, NULL);
+		tier_response_free(p->response);
 	return 0;
 }
 static int owner_destroy(struct tier_call_owner *owner)
@@ -150,111 +124,35 @@ static int client_destroy(struct tier_client *c)
 }
 static void pump(struct tier_client *c, bool writable)
 {
-	struct tier_call *p;
-	ssize_t n;
+	TierResponse *response;
+	uint64_t id;
+	int error;
 	if (c->error)
 		return;
-	if (writable) {
-		for (p = c->calls; p; p = p->next) {
-			while (p->sent < p->length) {
-				n = send(c->fd, p->frame + p->sent, p->length - p->sent,
-					 MSG_NOSIGNAL);
-				if (n < 0 && errno == EINTR)
-					continue;
-				if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-					goto receive;
-				if (n <= 0) {
-					fail(c, n ? errno : EPIPE);
-					return;
-				}
-				p->sent += n;
-			}
-		}
-	}
-receive:
-	for (;;) {
-		uint32_t mlen, dlen;
-		uint64_t id;
-		if (c->header_used < TIER_HEADER) {
-			n = recv(c->fd, c->header + c->header_used,
-				 TIER_HEADER - c->header_used, 0);
-			if (n < 0 && errno == EINTR)
-				continue;
-			if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-				break;
-			if (n <= 0) {
-				fail(c, n ? errno : ECONNRESET);
-				return;
-			}
-			c->header_used += n;
-			if (c->header_used != TIER_HEADER)
-				continue;
-			mlen = get_be(c->header + 16, 4);
-			dlen = get_be(c->header + 20, 4);
-			if (get_be(c->header, 4) != 0x54494552 ||
-			    get_be(c->header + 4, 2) != 1 ||
-			    get_be(c->header + 6, 2) != 0 || mlen > TIER_MESSAGE_MAX ||
-			    dlen > c->max_data) {
-				fail(c, EPROTO);
-				return;
-			}
-			c->body_length = (size_t)mlen + dlen;
-			c->body = talloc_array(c, uint8_t, c->body_length);
-			if (!c->body) {
-				fail(c, ENOMEM);
-				return;
-			}
-		}
-		if (c->body_used < c->body_length) {
-			n = recv(c->fd, c->body + c->body_used,
-				 c->body_length - c->body_used, 0);
-			if (n < 0 && errno == EINTR)
-				continue;
-			if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-				break;
-			if (n <= 0) {
-				fail(c, n ? errno : ECONNRESET);
-				return;
-			}
-			c->body_used += n;
-			if (c->body_used != c->body_length)
-				continue;
-		}
-		id = get_be(c->header + 8, 8);
-		mlen = get_be(c->header + 16, 4);
-		dlen = get_be(c->header + 20, 4);
+	error = tier_transport_pump(c->transport, writable);
+	/* A peer may close after its final reply. Deliver complete responses before
+	 * failing the requests that did not receive one. */
+	while ((response = tier_transport_next(c->transport, &id)) != NULL) {
+		struct tier_call *p;
 		for (p = c->calls; p && p->id != id; p = p->next) {
 		}
-		if (!p || p->sent != p->length) {
+		if (!p) {
+			tier_response_free(response);
 			fail(c, EPROTO);
 			return;
 		}
-		p->response = tier__ipc__response__unpack(NULL, mlen, c->body);
-		if (!p->response) {
-			fail(c, EPROTO);
-			return;
-		}
-		if (p->response->error < 0 || p->response->error > 4095 ||
-		    (dlen &&
-		     (p->method != TIER__IPC__METHOD__READ || p->response->error))) {
-			fail(c, EPROTO);
-			return;
-		}
-		if (dlen) {
-			p->data = talloc_steal(p, c->body);
-			memmove(p->data, p->data + mlen, dlen);
-			p->data_length = dlen;
-			c->body = NULL;
-		}
-		TALLOC_FREE(c->body);
-		c->header_used = c->body_used = c->body_length = 0;
-		if (p->deferred && p->response->error) {
+		p->response = response;
+		if (p->deferred && response->error) {
 			DBG_ERR("tier deferred CLOSE failed: request=%llu errno=%d\n",
-				(unsigned long long)p->id, p->response->error);
-			fail(c, p->response->error);
+				(unsigned long long)p->id, response->error);
+			fail(c, response->error);
 			return;
 		}
 		finish(p, 0);
+	}
+	if (error) {
+		fail(c, error);
+		return;
 	}
 	interest(c);
 }
@@ -279,9 +177,9 @@ static int poll_client(struct tier_client *c)
 		int64_t deadline = (q->deadline.tv_sec - now.tv_sec) * 1000 +
 				   (q->deadline.tv_nsec - now.tv_nsec) / 1000000;
 		remaining = MIN(remaining, deadline);
-		if (q->sent < q->length)
-			fd.events |= POLLOUT;
 	}
+	if (tier_transport_wants_write(c->transport))
+		fd.events |= POLLOUT;
 	if (remaining <= 0) {
 		fail(c, ETIMEDOUT);
 		return -1;
@@ -297,11 +195,11 @@ static int poll_client(struct tier_client *c)
 	return c->error ? -1 : 0;
 }
 struct tier_call *tier_submit(TALLOC_CTX *ctx, struct tier_client *c,
-			      const Tier__Ipc__Request *request, const void *data,
-			      size_t length, struct tevent_req *async)
+			      const TierRequest *request, const void *data, size_t length,
+			      struct tevent_req *async)
 {
 	struct tier_call *p;
-	size_t mlen = tier__ipc__request__get_packed_size(request);
+	int error;
 	/* Deferred cleanup must not turn a previously available slot into EBUSY. */
 	while (!c->error && c->count >= c->max_inflight && c->deferred) {
 		if (poll_client(c))
@@ -322,10 +220,6 @@ struct tier_call *tier_submit(TALLOC_CTX *ctx, struct tier_client *c,
 		errno = EOVERFLOW;
 		return NULL;
 	}
-	if (mlen > TIER_MESSAGE_MAX || length > c->max_data) {
-		errno = EMSGSIZE;
-		return NULL;
-	}
 	p = talloc_zero(c, struct tier_call);
 	if (!p) {
 		errno = ENOMEM;
@@ -337,22 +231,6 @@ struct tier_call *tier_submit(TALLOC_CTX *ctx, struct tier_client *c,
 	if (async)
 		tevent_req_defer_callback(async, c->ev);
 	p->method = request->method;
-	p->length = TIER_HEADER + mlen + length;
-	p->frame = talloc_array(p, uint8_t, p->length);
-	if (!p->frame) {
-		TALLOC_FREE(p);
-		errno = ENOMEM;
-		return NULL;
-	}
-	put_be(p->frame, 0x54494552, 4);
-	put_be(p->frame + 4, 1, 2);
-	put_be(p->frame + 6, 0, 2);
-	put_be(p->frame + 8, p->id, 8);
-	put_be(p->frame + 16, mlen, 4);
-	put_be(p->frame + 20, length, 4);
-	tier__ipc__request__pack(request, p->frame + TIER_HEADER);
-	if (length)
-		memcpy(p->frame + TIER_HEADER + mlen, data, length);
 	p->owner = talloc_zero(ctx, struct tier_call_owner);
 	if (!p->owner) {
 		TALLOC_FREE(p);
@@ -374,6 +252,13 @@ struct tier_call *tier_submit(TALLOC_CTX *ctx, struct tier_client *c,
 		errno = ENOMEM;
 		return NULL;
 	}
+	error = tier_transport_submit(c->transport, request, data, length, p->id);
+	if (error) {
+		TALLOC_FREE(p->owner);
+		TALLOC_FREE(p);
+		errno = error;
+		return NULL;
+	}
 	DLIST_ADD_END(c->calls, p);
 	c->count++;
 	interest(c);
@@ -391,7 +276,7 @@ int tier_wait(struct tier_call *p)
 	}
 	return 0;
 }
-Tier__Ipc__Response *tier_result(struct tier_call *p, void **data, size_t *length)
+TierResponse *tier_result(struct tier_call *p, void **data, size_t *length)
 {
 	if (!p->done || p->error || !p->response) {
 		errno = p->error ? p->error : EIO;
@@ -411,13 +296,12 @@ Tier__Ipc__Response *tier_result(struct tier_call *p, void **data, size_t *lengt
 		return NULL;
 	}
 	if (data)
-		*data = p->data;
+		*data = p->response->data;
 	if (length)
-		*length = p->data_length;
+		*length = p->response->data_length;
 	return p->response;
 }
-Tier__Ipc__Response *tier_rpc(TALLOC_CTX *ctx, struct tier_client *c,
-			      const Tier__Ipc__Request *request)
+TierResponse *tier_rpc(TALLOC_CTX *ctx, struct tier_client *c, const TierRequest *request)
 {
 	struct tier_call *p = tier_submit(ctx, c, request, NULL, 0, NULL);
 	if (!p || tier_wait(p))
@@ -426,9 +310,9 @@ Tier__Ipc__Response *tier_rpc(TALLOC_CTX *ctx, struct tier_client *c,
 }
 int tier_defer_close(struct tier_client *c, uint64_t handle)
 {
-	Tier__Ipc__Request request = TIER__IPC__REQUEST__INIT;
+	TierRequest request = {0};
 	struct tier_call *p;
-	request.method = TIER__IPC__METHOD__CLOSE;
+	request.method = TIER_METHOD_CLOSE;
 	request.handle = handle;
 	p = tier_submit(c, c, &request, NULL, 0, NULL);
 	if (!p)
@@ -445,8 +329,8 @@ struct tier_client *tier_client_connect(TALLOC_CTX *ctx, struct tevent_context *
 {
 	struct sockaddr_un addr = {.sun_family = AF_UNIX};
 	struct tier_client *c;
-	Tier__Ipc__Request request = TIER__IPC__REQUEST__INIT;
-	Tier__Ipc__Response *response;
+	TierRequest request = {0};
+	TierResponse *response;
 	TALLOC_CTX *tmp;
 	if (strlen(path) >= sizeof(addr.sun_path)) {
 		errno = ENAMETOOLONG;
@@ -470,13 +354,18 @@ struct tier_client *tier_client_connect(TALLOC_CTX *ctx, struct tevent_context *
 		goto error;
 	if (fcntl(c->fd, F_SETFL, O_NONBLOCK))
 		goto error;
+	c->transport = tier_transport_new(c->fd);
+	if (!c->transport) {
+		errno = ENOMEM;
+		goto error;
+	}
 	c->fde = tevent_add_fd(ev, c, c->fd, TEVENT_FD_READ, socket_event, c);
 	if (!c->fde) {
 		errno = ENOMEM;
 		goto error;
 	}
 	tmp = talloc_new(c);
-	request.method = TIER__IPC__METHOD__HELLO;
+	request.method = TIER_METHOD_HELLO;
 	request.protocol_version = 1;
 	response = tier_rpc(tmp, c, &request);
 	if (!response)
@@ -487,6 +376,7 @@ struct tier_client *tier_client_connect(TALLOC_CTX *ctx, struct tevent_context *
 		goto error;
 	}
 	c->max_data = MIN(response->max_data, TIER_DATA_MAX);
+	tier_transport_set_max_data(c->transport, c->max_data);
 	c->max_inflight = MIN(response->max_inflight, TIER_INFLIGHT_MAX);
 	TALLOC_FREE(tmp);
 	return c;

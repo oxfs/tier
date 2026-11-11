@@ -1,0 +1,16 @@
+[package]
+name = "tier-client"
+version = "0.5.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+libc = "0.2"
+prost = "0.14"
+
+[build-dependencies]
+prost-build = "0.14"
+protoc-bin-vendored = "3"

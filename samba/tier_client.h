@@ -1,18 +1,16 @@
 #ifndef TIER_CLIENT_H
 #define TIER_CLIENT_H
-#include "tier.pb-c.h"
+#include "tier_rust.h"
 
 struct tier_client;
 struct tier_call;
 struct tier_client *tier_client_connect(TALLOC_CTX *, struct tevent_context *,
 					const char *);
-struct tier_call *tier_submit(TALLOC_CTX *, struct tier_client *,
-			      const Tier__Ipc__Request *, const void *, size_t,
-			      struct tevent_req *);
+struct tier_call *tier_submit(TALLOC_CTX *, struct tier_client *, const TierRequest *,
+			      const void *, size_t, struct tevent_req *);
 int tier_wait(struct tier_call *);
-Tier__Ipc__Response *tier_result(struct tier_call *, void **, size_t *);
-Tier__Ipc__Response *tier_rpc(TALLOC_CTX *, struct tier_client *,
-			      const Tier__Ipc__Request *);
+TierResponse *tier_result(struct tier_call *, void **, size_t *);
+TierResponse *tier_rpc(TALLOC_CTX *, struct tier_client *, const TierRequest *);
 int tier_defer_close(struct tier_client *, uint64_t);
 uint32_t tier_max_data(struct tier_client *);
 #endif
