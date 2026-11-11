@@ -2,11 +2,20 @@ use anyhow::{Context, Result, bail};
 use std::{io, path::Path};
 use tier_v2::{Store, config::Config};
 
+mod daemon;
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().collect();
-    let usage = "usage: tier-v2 CONFIG {scan|read PATH|write PATH|sync PATH|check PATH}";
+    let usage = "usage: tier-v2 CONFIG {init|run|scan|read PATH|write PATH|sync PATH|check PATH}";
     let config = args.get(1).context(usage)?;
     let command = args.get(2).and_then(|arg| arg.to_str()).context(usage)?;
+    if command == "init" && args.len() == 3 {
+        Store::initialize(Config::load(Path::new(config))?)?;
+        return Ok(());
+    }
+    if command == "run" && args.len() == 3 {
+        return daemon::run(Path::new(config));
+    }
     let store = Store::new(Config::load(Path::new(config))?)?;
     match command {
         "scan" if args.len() == 3 => {

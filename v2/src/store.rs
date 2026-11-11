@@ -1,6 +1,6 @@
 use crate::{
     config::{Config, validate_relative},
-    descriptor::{self, State},
+    descriptor::{self, FileAttributes, State},
 };
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
@@ -9,11 +9,14 @@ use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, Write},
+    os::fd::{AsRawFd, RawFd},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
 pub struct Store {
-    config: Config,
+    pub(crate) config: Config,
+    pub(crate) identities: std::collections::BTreeMap<PathBuf, String>,
 }
 
 // The lock lives at least as long as the content fd, including caller reads.
@@ -24,6 +27,22 @@ pub struct Reader {
 pub struct Writer {
     file: File,
     _lock: File,
+}
+
+impl AsRawFd for Reader {
+    fn as_raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+}
+impl AsRawFd for Writer {
+    fn as_raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+}
+impl Reader {
+    pub fn metadata(&self) -> io::Result<fs::Metadata> {
+        self.file.metadata()
+    }
 }
 
 impl Read for Reader {
@@ -50,6 +69,9 @@ impl Seek for Writer {
     }
 }
 impl Writer {
+    pub fn metadata(&self) -> io::Result<fs::Metadata> {
+        self.file.metadata()
+    }
     pub fn sync_all(&self) -> io::Result<()> {
         self.file.sync_all()
     }
@@ -66,21 +88,53 @@ pub struct Report {
 }
 
 impl Store {
-    pub fn new(mut config: Config) -> Result<Self> {
+    pub fn new(config: Config) -> Result<Self> {
+        Self::open(config, false)
+    }
+
+    pub fn initialize(config: Config) -> Result<Self> {
+        Self::open(config, true)
+    }
+
+    fn open(mut config: Config, initialize: bool) -> Result<Self> {
         config.validate()?;
         // Existing roots are intentional: never recreate a missing mounted disk.
         config.primary = fs::canonicalize(&config.primary)?;
         for root in config.replicas.values_mut() {
-            *root = fs::canonicalize(&*root)?;
+            if root.exists() {
+                *root = fs::canonicalize(&*root)?;
+            }
         }
         config.validate()?;
-        for root in std::iter::once(&config.primary).chain(config.replicas.values()) {
-            ensure!(root.is_dir(), "storage root is not a directory");
+        ensure!(config.primary.is_dir(), "primary root is not a directory");
+        let mut store = Self {
+            config,
+            identities: Default::default(),
+        };
+        if initialize {
+            store.initialize_roots()?;
+        } else {
+            store.identities = serde_json::from_slice(
+                &fs::read(store.root().join(".tier/storage.json"))
+                    .context("primary storage is not initialized or unavailable")?,
+            )?;
+            store.verify_root(store.root())?;
+            for root in store.config.replicas.values() {
+                ensure!(
+                    store.identities.contains_key(root),
+                    "new replica requires explicit initialization: {}",
+                    root.display()
+                );
+            }
         }
-        Ok(Self { config })
+        if store.root().join(".tier/namespace.json").exists() {
+            let _namespace = store.namespace(true)?;
+            store.recover_namespace()?;
+        }
+        Ok(store)
     }
 
-    fn path(root: &Path, relative: &Path) -> Result<PathBuf> {
+    pub(crate) fn path(root: &Path, relative: &Path) -> Result<PathBuf> {
         ensure!(
             root.is_dir(),
             "storage root unavailable: {}",
@@ -106,17 +160,17 @@ impl Store {
         Ok(path)
     }
 
-    fn content(&self, relative: &Path) -> Result<PathBuf> {
+    pub(crate) fn content(&self, relative: &Path) -> Result<PathBuf> {
         validate_relative(relative)?;
         ensure!(!relative.as_os_str().is_empty(), "file path is empty");
         Self::path(&self.config.primary, relative)
     }
 
-    fn metadata(root: &Path, relative: &Path) -> Result<PathBuf> {
+    pub(crate) fn metadata(root: &Path, relative: &Path) -> Result<PathBuf> {
         Self::path(root, &Path::new(".tier/meta").join(relative))
     }
 
-    fn lock(&self, relative: &Path) -> Result<File> {
+    pub(crate) fn lock(&self, relative: &Path) -> Result<File> {
         self.content(relative)?;
         let path = Self::metadata(&self.config.primary, relative)?;
         create_parent(&path)?;
@@ -131,8 +185,13 @@ impl Store {
     }
 
     pub fn read(&self, relative: &Path) -> Result<Reader> {
+        let _namespace = self.namespace(false)?;
+        if !self.content(relative)?.exists() && !Self::metadata(self.root(), relative)?.is_file() {
+            return Err(io::Error::from(io::ErrorKind::NotFound).into());
+        }
         let mut lock = self.lock(relative)?;
-        FileExt::lock_shared(&lock)?;
+        FileExt::try_lock_shared(&lock)?;
+        let _state = self.state_lock(relative, false)?;
         let state = descriptor::load(&mut lock)?.map(|(_, state)| state);
         let primary = self.content(relative)?;
         let file = if primary.exists() {
@@ -149,15 +208,49 @@ impl Store {
     // All modifications must go through this entry, including after primary GC.
     // Native uncoordinated writes to the backing directories are unsupported.
     pub fn write(&self, relative: &Path) -> Result<Writer> {
+        self.open_write(relative, true, false, false)
+    }
+
+    pub fn open_write(
+        &self,
+        relative: &Path,
+        create: bool,
+        exclusive: bool,
+        truncate: bool,
+    ) -> Result<Writer> {
+        let _namespace = self.namespace(false)?;
+        if !create
+            && !self.content(relative)?.exists()
+            && !Self::metadata(self.root(), relative)?.is_file()
+        {
+            return Err(io::Error::from(io::ErrorKind::NotFound).into());
+        }
         let mut lock = self.lock(relative)?;
-        FileExt::lock_exclusive(&lock)?;
+        FileExt::try_lock_shared(&lock)?;
+        let _state = self.state_lock(relative, true)?;
         let state = descriptor::load(&mut lock)?.map(|(_, state)| state);
         let primary = self.content(relative)?;
+        let exists = primary.exists() || state.is_some();
+        if state
+            .as_ref()
+            .is_some_and(|state| !state.archives.is_empty())
+        {
+            return Err(io::Error::from_raw_os_error(libc::EROFS).into());
+        }
+        if exists && create && exclusive {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
+        }
+        if !exists && !create {
+            return Err(io::Error::from(io::ErrorKind::NotFound).into());
+        }
         if !primary.exists()
             && let Some(state) = &state
         {
-            let source = self.replica(relative, state)?;
-            copy_atomic(source, &primary)?;
+            // Existing replica readers must finish before changing the writable
+            // inode; otherwise a reader would silently stay on stale content.
+            FileExt::try_lock_exclusive(&lock)?;
+            let mut source = self.replica(relative, state)?;
+            copy_file(&mut source, &primary, self.root())?;
         }
         let generation = state.map_or(Ok(1), |state| {
             state
@@ -171,13 +264,14 @@ impl Store {
             .read(true)
             .write(true)
             .create(true)
-            .truncate(false)
+            .truncate(truncate)
             .open(&primary)?;
         sync_parent(&primary)?;
+        FileExt::lock_shared(&lock)?;
         Ok(Writer { file, _lock: lock })
     }
 
-    fn replica(&self, relative: &Path, state: &State) -> Result<File> {
+    pub(crate) fn replica(&self, relative: &Path, state: &State) -> Result<File> {
         let digest = state
             .digest
             .as_ref()
@@ -187,6 +281,7 @@ impl Store {
                 continue;
             };
             let candidate = (|| -> Result<File> {
+                self.verify_root(root)?;
                 let mut file = File::open(Self::path(root, relative)?)?;
                 ensure!(
                     checksum(&mut file)? == (digest.clone(), state.size),
@@ -199,10 +294,17 @@ impl Store {
                 return Ok(file);
             }
         }
+        if !state.archives.is_empty() {
+            return crate::archive::read(&self.config, state);
+        }
         bail!("no verified replica for {}", relative.display())
     }
 
     pub fn reconcile(&self, relative: &Path) -> Result<bool> {
+        let _namespace = self.namespace(false)?;
+        let Some(_state) = self.try_state_lock(relative)? else {
+            return Ok(false);
+        };
         let mut lock = self.lock(relative)?;
         if !try_lock(&lock, true)? {
             return Ok(false);
@@ -220,6 +322,7 @@ impl Store {
         if let Some(state) = &current
             && state.digest.is_some()
             && state.replicas == selected
+            && crate::archive::satisfied(policy.archive.as_ref(), state)
         {
             self.verify_content(relative, state)?;
             self.mirror(relative, &mut lock)?;
@@ -245,10 +348,11 @@ impl Store {
         // Restore the primary before dropping the last recorded replica.
         if policy.copies == 0 && !primary.exists() {
             source.rewind()?;
-            copy_atomic(&mut source, &primary)?;
+            copy_file(&mut source, &primary, self.root())?;
         }
         let mut replicas = Vec::new();
         for (name, root) in self.config.replicas.iter().take(policy.copies) {
+            self.verify_root(root)?;
             let destination = Self::path(root, relative)?;
             let matches = File::open(&destination)
                 .ok()
@@ -256,15 +360,30 @@ impl Store {
                 .is_some_and(|value| value == (digest.clone(), size));
             if !matches {
                 source.rewind()?;
-                copy_atomic(&mut source, &destination)?;
+                copy_file(&mut source, &destination, root)?;
             }
             replicas.push(name.clone());
         }
+        let archives = if let Some(archive) = &policy.archive {
+            crate::archive::upload(&self.config, archive, &mut source, &digest, size)?
+        } else {
+            Vec::new()
+        };
         let state = State {
             generation: current.map_or(1, |state| state.generation),
             replicas,
             digest: Some(digest),
             size,
+            archives,
+            attributes: Some({
+                let metadata = source.metadata()?;
+                FileAttributes {
+                    size,
+                    modified_secs: metadata.mtime(),
+                    modified_nanos: metadata.mtime_nsec(),
+                    mode: metadata.mode(),
+                }
+            }),
         };
         descriptor::save(&mut lock, &state)?;
         // Mirror descriptors to every configured disk, even disks without content.
@@ -278,6 +397,15 @@ impl Store {
     }
 
     pub fn scan(&self) -> Result<Report> {
+        self.scan_with_audit(true)
+    }
+
+    pub fn scan_pending(&self) -> Result<Report> {
+        self.scan_with_audit(false)
+    }
+
+    fn scan_with_audit(&self, audit: bool) -> Result<Report> {
+        let _namespace = self.namespace(false)?;
         let mut files = BTreeSet::new();
         self.walk(&self.config.primary, Path::new(""), &mut files, true)?;
         let metadata = Self::path(&self.config.primary, Path::new(".tier/meta"))?;
@@ -289,8 +417,11 @@ impl Store {
         let mut ready = Vec::new();
         for relative in files {
             let classification = (|| -> Result<Option<bool>> {
+                let Some(_state) = self.try_state_lock(&relative)? else {
+                    return Ok(None);
+                };
                 let mut lock = self.lock(&relative)?;
-                if !try_lock(&lock, false)? {
+                if !try_lock(&lock, true)? {
                     return Ok(None);
                 }
                 let policy = self.config.policy_for(&relative)?;
@@ -305,6 +436,7 @@ impl Store {
                     |(_, state)| {
                         state.digest.is_none()
                             || state.replicas != selected
+                            || !crate::archive::satisfied(policy.archive.as_ref(), &state)
                             || (policy.gc && self.config.primary.join(&relative).exists())
                     },
                 )))
@@ -328,7 +460,7 @@ impl Store {
             }
         }
         // Only inspect old copies once foreground replication has caught up.
-        if report.errors.is_empty() && report.busy == 0 {
+        if audit && report.errors.is_empty() && report.busy == 0 {
             for relative in ready {
                 match self.check(&relative) {
                     Ok(true) => report.completed += 1,
@@ -364,6 +496,7 @@ impl Store {
             if kind.is_dir() {
                 if mirror_dirs {
                     for replica in self.config.replicas.values() {
+                        self.verify_root(replica)?;
                         let directory = Self::path(replica, &path)?;
                         create_parent(&directory.join("placeholder"))?;
                     }
@@ -379,8 +512,12 @@ impl Store {
 
     // Inspection never repairs or deletes: inconsistencies are explicit alerts.
     pub fn check(&self, relative: &Path) -> Result<bool> {
+        let _namespace = self.namespace(false)?;
+        let Some(_state) = self.try_state_lock(relative)? else {
+            return Ok(false);
+        };
         let mut lock = self.lock(relative)?;
-        if !try_lock(&lock, false)? {
+        if !try_lock(&lock, true)? {
             return Ok(false);
         }
         let state = descriptor::load(&mut lock)?
@@ -393,6 +530,7 @@ impl Store {
     fn verify(&self, relative: &Path, state: &State) -> Result<()> {
         self.verify_content(relative, state)?;
         for (name, root) in &self.config.replicas {
+            self.verify_root(root)?;
             let mut file = File::open(Self::metadata(root, relative)?)?;
             let mirrored = descriptor::load(&mut file)?
                 .context("empty mirrored descriptor")?
@@ -409,7 +547,7 @@ impl Store {
         let digest = state.digest.as_ref().context("file awaits replication")?;
         let primary = self.content(relative)?;
         ensure!(
-            primary.exists() || !state.replicas.is_empty(),
+            primary.exists() || !state.replicas.is_empty() || !state.archives.is_empty(),
             "no content locations remain"
         );
         if primary.exists() {
@@ -425,17 +563,20 @@ impl Store {
                 .replicas
                 .get(name)
                 .context("unknown replica disk")?;
+            self.verify_root(root)?;
             let mut file = File::open(Self::path(root, relative)?)?;
             ensure!(
                 checksum(&mut file)? == (digest.clone(), state.size),
                 "content mismatch on {name}"
             );
         }
+        crate::archive::verify(&self.config, state)?;
         Ok(())
     }
 
     fn mirror(&self, relative: &Path, lock: &mut File) -> Result<()> {
         for root in self.config.replicas.values() {
+            self.verify_root(root)?;
             lock.rewind()?;
             copy_atomic(&mut *lock, &Self::metadata(root, relative)?)?;
         }
@@ -472,12 +613,12 @@ fn checksum(file: &mut File) -> Result<(String, u64)> {
     Ok((format!("{:x}", digest.finalize()), size))
 }
 
-fn sync_parent(path: &Path) -> Result<()> {
+pub(crate) fn sync_parent(path: &Path) -> Result<()> {
     File::open(path.parent().context("missing parent directory")?)?.sync_all()?;
     Ok(())
 }
 
-fn create_parent(path: &Path) -> Result<()> {
+pub(crate) fn create_parent(path: &Path) -> Result<()> {
     let parent = path.parent().context("missing parent directory")?;
     if !parent.exists() {
         create_parent(parent)?;
@@ -490,11 +631,31 @@ fn create_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_atomic(mut source: impl Read, destination: &Path) -> Result<()> {
+pub(crate) fn copy_atomic(mut source: impl Read, destination: &Path) -> Result<()> {
     create_parent(destination)?;
     let mut temporary =
         tempfile::NamedTempFile::new_in(destination.parent().context("missing parent")?)?;
     io::copy(&mut source, &mut temporary)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(destination)?;
+    sync_parent(destination)
+}
+
+fn copy_file(source: &mut File, destination: &Path, root: &Path) -> Result<()> {
+    let metadata = source.metadata()?;
+    create_parent(destination)?;
+    let staging = Store::path(root, Path::new(".tier/tmp"))?;
+    create_parent(&staging.join("placeholder"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(staging)?;
+    io::copy(source, &mut temporary)?;
+    temporary
+        .as_file()
+        .set_permissions(metadata.permissions())?;
+    temporary.as_file().set_times(
+        fs::FileTimes::new()
+            .set_accessed(metadata.accessed()?)
+            .set_modified(metadata.modified()?),
+    )?;
     temporary.as_file().sync_all()?;
     temporary.persist(destination)?;
     sync_parent(destination)

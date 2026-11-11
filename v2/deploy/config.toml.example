@@ -1,0 +1,19 @@
+primary = "/srv/tier/primary"
+
+[replicas]
+disk1 = "/srv/tier/disk1"
+disk2 = "/srv/tier/disk2"
+
+[[policies]]
+path = ""
+copies = 2
+gc = false
+
+[[policies]]
+path = "cold"
+copies = 2
+gc = true
+
+[background]
+scan_interval_secs = 60
+audit_interval_secs = 86400
