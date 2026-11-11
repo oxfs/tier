@@ -11,7 +11,7 @@ EXTENDS Naturals, Integers, FiniteSets, TLC
 \* BeginWrite: core/file.rs::open_id invalidates the protected generation.
 \* Verify: core/reconcile.rs::prepare_protected checks again after hashing.
 \* Publish: reconcile_one / archive_one recheck version under the file lock.
-\* Evict: core/target.rs::relieve_cache / archive.rs verify retained copies.
+\* Evict: core/reconcile.rs / archive.rs verify retained copies before GC.
 \* Read: core/file.rs::ensure_body accepts only current-generation copies.
 \* Guards are configurable only to check that the model detects regressions.
 CONSTANTS Targets, Local, MaxGeneration,

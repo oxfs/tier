@@ -190,7 +190,7 @@ fn stable_handle_observes_writes_after_rename_and_truncation() -> anyhow::Result
     Ok(())
 }
 #[test]
-fn write_capacity_fallback_keeps_current_mapping_and_live_size() -> anyhow::Result<()> {
+fn active_writes_keep_their_inode_after_policy_changes() -> anyhow::Result<()> {
     let (tmp, e) = setup(&["cache", "disk"])?;
     let mut policy = Policy {
         write_cache: vec!["cache".into()],
@@ -205,15 +205,16 @@ fn write_capacity_fallback_keeps_current_mapping_and_live_size() -> anyhow::Resu
     let h = e.open_file("/before", true, true, false)?;
     assert_eq!(h.write_at(0, b"hello")?, 5);
     e.rename("/before", "/after")?;
-    // Any allocated filesystem space reaches the 1% rounded-up watermark.
-    // The active file cannot be evicted, forcing this WRITE to switch targets.
+    // Watermarks choose placement for new files. An active writer stays on its
+    // original inode even when the policy would now prefer another target.
     policy.low_water = 0;
     policy.high_water = 1;
     e.set_policy("/", &policy)?;
     assert_eq!(h.write_at(5, b"-disk")?, 5);
-    let disk_objects = objects(&tmp.path().join("disk"))?;
-    assert_eq!(disk_objects.len(), 1);
-    assert_eq!(fs::read(&disk_objects[0])?, b"hello-disk");
+    assert!(objects(&tmp.path().join("disk"))?.is_empty());
+    let cache_objects = objects(&tmp.path().join("cache"))?;
+    assert_eq!(cache_objects.len(), 1);
+    assert_eq!(fs::read(&cache_objects[0])?, b"hello-disk");
     assert_eq!(e.stat("/after")?.size, 10);
     assert_eq!(h.write_at(1, b"A")?, 1);
     h.set_len(3)?;

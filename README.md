@@ -44,7 +44,7 @@ Windows 通过 `\\NAS地址\tier` 访问。升级 Samba 后，安装匹配的 Ti
 文件映射导出为 CSV，记录逻辑路径和各副本的实际位置，用于找回文件或迁移到普通目录，不能用于恢复 Tier 元数据。正式迁移应先停服，再离线导出映射并复制文件，避免迁移期间映射变化：
 
 ```sh
-sudo systemctl stop tier
+sudo systemctl stop smbd tier
 sudo tier --config /etc/tier/tier.toml export /mnt/backup/files.csv
 ```
 
@@ -52,7 +52,7 @@ sudo tier --config /etc/tier/tier.toml export /mnt/backup/files.csv
 
 ```sh
 sudo tier backups /mnt/backup/metadata
-sudo systemctl stop tier
+sudo systemctl stop smbd tier
 sudo tier inspect /mnt/backup/metadata /mnt/surviving-disk
 sudo tier --db /var/lib/tier/recovered restore /mnt/backup/metadata --target disk1=/mnt/surviving-disk
 ```

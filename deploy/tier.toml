@@ -29,6 +29,10 @@ global_cursor_memory_mib = 128
 connection_cursor_memory_mib = 64
 per_cursor_memory_kib = 256
 cursor_buffer_kib = 64
+# Local physical-location cache per VFS connection; zero disables direct access.
+direct_cache_entries = 4096
+# Lost control connections delay mapping changes until this lease expires.
+direct_lease_secs = 30
 
 # Restart Tier after changing these settings. Cache + write buffers are not a
 # total process-memory limit; leave room for indexes, compaction and file cache.

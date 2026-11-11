@@ -3,9 +3,10 @@
 #include "tier_rust.h"
 
 struct tier_client;
+struct pthreadpool_tevent;
 struct tier_call;
 struct tier_client *tier_client_connect(TALLOC_CTX *, struct tevent_context *,
-					const char *);
+					const char *, struct pthreadpool_tevent *);
 struct tier_call *tier_submit(TALLOC_CTX *, struct tier_client *, const TierRequest *,
 			      const void *, size_t, struct tevent_req *);
 int tier_wait(struct tier_call *);

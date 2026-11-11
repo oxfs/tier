@@ -244,98 +244,6 @@ impl Engine {
             .and_then(|t| Ok(fingerprint(&mut t.open_object(object)?)?.1 == hash))
             .unwrap_or(false)
     }
-    pub(crate) fn relieve_cache(
-        &self,
-        name: &str,
-        exclude: &str,
-        additional: u64,
-        high_water: u8,
-    ) -> Result<bool> {
-        let fits = || -> Result<bool> {
-            let stat = self.target_stat(name)?;
-            let free = stat.f_bavail.saturating_mul(stat.f_frsize);
-            let used = 100
-                - stat
-                    .f_bavail
-                    .saturating_sub(additional.div_ceil(stat.f_frsize.max(1)))
-                    .saturating_mul(100)
-                    / stat.f_blocks.max(1);
-            Ok(free >= additional && used < u64::from(high_water))
-        };
-        if fits()? {
-            return Ok(true);
-        }
-        for (_, candidate) in self.scan::<Record>(schema::NODES)? {
-            let id = &candidate.node.id;
-            if id == exclude || candidate.node.is_dir || candidate.dirty || candidate.hash.is_none()
-            {
-                continue;
-            }
-            let lock = self.file_lock(id);
-            let Some(mut state) = lock.try_lock() else {
-                continue;
-            };
-            if state.handles != 0 {
-                continue;
-            }
-            let mut record = self.record(id)?;
-            if record.dirty || record.node.version != candidate.node.version {
-                continue;
-            }
-            let policy = self.policy(id)?;
-            if !policy.write_cache.contains(&name.to_owned())
-                || policy.persistent_storage.contains(&name.to_owned())
-                || policy.persistent_copies == 0
-            {
-                continue;
-            }
-            let copies = self.copies(id)?;
-            let Some(old) = copies.iter().find(|c| c.target == name) else {
-                continue;
-            };
-            let hash = record.hash.as_deref().context("missing protected digest")?;
-            let verified = copies
-                .iter()
-                .filter(|c| {
-                    c.target != name
-                        && c.version == record.node.version
-                        && policy.persistent_storage.contains(&c.target)
-                        && self.matches_copy(&c.target, &c.object, hash)
-                })
-                .collect::<Vec<_>>();
-            if verified.len() < policy.persistent_copies {
-                continue;
-            }
-            let _namespace = self.inner.namespace.read();
-            if self.policy(id)? != policy {
-                continue;
-            }
-            if record.primary.as_deref() == Some(name) {
-                record.primary = Some(verified[0].target.clone());
-            }
-            let garbage = schema::garbage(name);
-            self.atomic(
-                vec![
-                    Self::encoded(schema::node(id), &record)?,
-                    Self::encoded(garbage.clone(), old)?,
-                ],
-                vec![schema::copy(id, name)],
-                true,
-            )?;
-            state.body = None;
-            drop(_namespace);
-            if let Ok(root) = self.target(name)
-                && root.remove_object(&old.object).is_ok()
-            {
-                self.delete_record(&garbage)?;
-            }
-            if fits()? {
-                return Ok(true);
-            }
-        }
-        fits()
-    }
-
     pub(crate) fn choose_target(&self, policy: &Policy, id: &str) -> Result<String> {
         let mut cache = policy.write_cache.clone();
         rank(&mut cache, id);
@@ -344,11 +252,7 @@ impl Engine {
         for name in cache {
             if let Ok(s) = self.target_stat(&name) {
                 let used = 100 - s.f_bavail.saturating_mul(100) / s.f_blocks.max(1);
-                if used < u64::from(policy.high_water)
-                    || self
-                        .relieve_cache(&name, id, 0, policy.high_water)
-                        .unwrap_or(false)
-                {
+                if used < u64::from(policy.high_water) {
                     return Ok(name);
                 }
             }
@@ -367,6 +271,9 @@ impl Engine {
     pub(crate) fn collect_garbage(&self) -> Result<()> {
         for (k, c) in self.scan::<Copy>(schema::GARBAGE)? {
             let lock = self.file_lock(&c.node);
+            let Some(_pin) = self.try_idle_pin(&c.node)? else {
+                continue;
+            };
             let _guard = lock.lock();
             // A -> B -> A may reuse a still-existing hard-link name. Never
             // unlink a path now selected by the authoritative copy record.

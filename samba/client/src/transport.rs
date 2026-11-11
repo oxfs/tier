@@ -9,10 +9,16 @@ pub(crate) struct Outgoing {
 }
 pub(crate) struct Pending {
     pub(crate) method: i32,
+    pub(crate) request: pb::Request,
     pub(crate) sent: bool,
 }
 pub struct TierTransport {
     pub(crate) fd: i32,
+    pub(crate) local: crate::local::Local,
+    pub(crate) control: Option<crate::control::Control>,
+    pub(crate) control_token: String,
+    pub(crate) is_control: bool,
+    pub(crate) notifications: VecDeque<u64>,
     pub(crate) max_data: usize,
     pub(crate) error: i32,
     pub(crate) outgoing: VecDeque<Outgoing>,
@@ -24,9 +30,24 @@ pub struct TierTransport {
     pub(crate) body_used: usize,
 }
 impl TierTransport {
+    pub(crate) fn abort(&mut self, error: i32) {
+        self.error = error;
+        self.outgoing.clear();
+        self.pending.clear();
+        self.ready.clear();
+        self.body = Vec::new();
+        self.control = None;
+        self.control_token.clear();
+        self.local.disconnected();
+    }
     pub(crate) fn new(fd: i32) -> Self {
         Self {
             fd,
+            local: crate::local::Local::new(1024, fd),
+            control: None,
+            control_token: String::new(),
+            is_control: false,
+            notifications: VecDeque::new(),
             max_data: MAX_DATA,
             error: 0,
             outgoing: VecDeque::new(),
@@ -39,11 +60,48 @@ impl TierTransport {
         }
     }
     pub(crate) fn submit(&mut self, request: pb::Request, data: &[u8], id: u64) -> Result<(), i32> {
+        if self.local.contains(request.handle) {
+            let (response, data) = if request.method == pb::Method::Read as i32 {
+                let mut job = self
+                    .local
+                    .read(request.handle, request.offset, request.length as usize)?
+                    .ok_or(libc::EBADF)?;
+                job.run();
+                (
+                    pb::Response {
+                        error: job.error,
+                        count: if job.error == 0 {
+                            job.data.len() as u32
+                        } else {
+                            0
+                        },
+                        ..Default::default()
+                    },
+                    job.data,
+                )
+            } else {
+                (
+                    self.local.request(&request)?.ok_or(libc::EBADF)?,
+                    Vec::new(),
+                )
+            };
+            self.ready
+                .push_back((id, ResponseOwner::new(response, data, 0)?));
+            return Ok(());
+        }
         if self.error != 0 {
             return Err(self.error);
         }
         if id == 0 || self.pending.contains_key(&id) {
             return Err(libc::EINVAL);
+        }
+        if self.control.is_some() {
+            self.pump_control()?;
+            if let Some(response) = self.local.request(&request)? {
+                self.ready
+                    .push_back((id, ResponseOwner::new(response, Vec::new(), 0)?));
+                return Ok(());
+            }
         }
         let mlen = request.encoded_len();
         if mlen > MAX_MESSAGE || data.len() > self.max_data {
@@ -60,6 +118,7 @@ impl TierTransport {
             id,
             Pending {
                 method: request.method,
+                request,
                 sent: false,
             },
         );
@@ -70,6 +129,7 @@ impl TierTransport {
         if self.error != 0 {
             return Err(self.error);
         }
+        self.pump_control()?;
         if writable {
             while let Some(frame) = self.outgoing.front_mut() {
                 let bytes = &frame.bytes[frame.sent..];
@@ -122,6 +182,17 @@ impl TierTransport {
             }
             let id = u64::from_be_bytes(self.header[8..16].try_into().unwrap());
             let mlen = u32::from_be_bytes(self.header[16..20].try_into().unwrap()) as usize;
+            if self.is_control && id == 0 {
+                let response =
+                    pb::Response::decode(&self.body[..mlen]).map_err(|_| libc::EPROTO)?;
+                if response.error != 0 || self.body.len() != mlen || response.cache_epoch == 0 {
+                    return Err(libc::EPROTO);
+                }
+                self.notifications.push_back(response.cache_epoch);
+                self.header_used = 0;
+                self.body_used = 0;
+                continue;
+            }
             let pending = self.pending.get(&id).ok_or(libc::EPROTO)?;
             if !pending.sent {
                 return Err(libc::EPROTO);
@@ -133,6 +204,10 @@ impl TierTransport {
             {
                 return Err(libc::EPROTO);
             }
+            if pending.method == pb::Method::Hello as i32 {
+                self.control_token = response.control_token.clone();
+            }
+            self.local.observe(&pending.request, &response);
             // Raw data stays in its receive allocation, following the protobuf bytes.
             let response = ResponseOwner::new(response, std::mem::take(&mut self.body), mlen)?;
             self.pending.remove(&id);
@@ -140,6 +215,7 @@ impl TierTransport {
             self.header_used = 0;
             self.body_used = 0;
         }
+        self.pump_control()?;
         Ok(())
     }
 }

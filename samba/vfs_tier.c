@@ -123,7 +123,8 @@ static int tier_connect(struct vfs_handle_struct *h, const char *service,
 	h->data = c;
 	c->cwd_name = talloc_strdup(c, "/");
 	become_root();
-	c->client = tier_client_connect(c, h->conn->sconn->ev_ctx, path);
+	c->client =
+	    tier_client_connect(c, h->conn->sconn->ev_ctx, path, h->conn->sconn->pool);
 	{
 		int saved = errno;
 		unbecome_root();
@@ -240,6 +241,12 @@ static int tier_openat(struct vfs_handle_struct *h, const struct files_struct *d
 			errno = EINVAL;
 			goto done;
 		}
+	/* A data-read-only handle may still request mutable metadata rights.
+	 * Those handles must stay registered with Tier for later SETATTR calls. */
+	r.local_access = r.access == TIER_ACCESS_READ_ONLY &&
+			 !(fsp->access_mask &
+			   (SEC_FILE_WRITE_ATTRIBUTE | SEC_FILE_WRITE_EA |
+			    SEC_STD_WRITE_DAC | SEC_STD_WRITE_OWNER | SEC_STD_DELETE));
 	r.directory = (how->flags & O_DIRECTORY) != 0;
 	r.truncate = (how->flags & O_TRUNC) != 0;
 	if (how->flags & O_CREAT)

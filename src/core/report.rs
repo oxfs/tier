@@ -20,7 +20,7 @@ impl Engine {
             let mut logical = 0u64;
             let mut bytes = std::collections::BTreeMap::<String, Option<u64>>::new();
             for r in self.subtree(&t.node)? {
-                logical = logical.saturating_add(r.node.size);
+                logical = logical.saturating_add(self.stat_id(&r.node.id)?.size);
                 for c in self.copies(&r.node.id)? {
                     let amount = self
                         .target(&c.target)

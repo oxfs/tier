@@ -36,6 +36,8 @@ enum Method {
   READDIR = 16;
   CLOSEDIR = 17;
   DETACH = 18;
+  CONTROL_ATTACH = 19;
+  REVOKE_ACK = 20;
 }
 enum Access { METADATA = 0; READ_ONLY = 1; WRITE_ONLY = 2; READ_WRITE = 3; }
 enum Disposition { EXISTING = 0; CREATE_NEW = 1; OPEN_OR_CREATE = 2; }
@@ -85,8 +87,23 @@ message Request {
   uint32 max_entries = 16;
   uint32 max_bytes = 17;
   uint32 protocol_version = 18;
+  string control_token = 19;
+  uint64 cache_epoch = 20;
+  bool local_access = 22;
 }
-message Entry { string name = 1; Attr attr = 2; }
+// New local stat/open operations require a live control connection and an
+// unexpired absolute CLOCK_MONOTONIC deadline, checked after the operation too.
+// Successfully opened descriptors retain their OFD pin independently of grants.
+message LocalMapping {
+  bytes path = 2;
+  uint64 epoch = 3;
+  uint64 deadline_ns = 4;
+  uint64 device = 5;
+  uint64 inode = 6;
+  bytes pin_path = 7;
+  uint64 pin_offset = 8;
+}
+message Entry { string name = 1; Attr attr = 2; LocalMapping local = 3; }
 message Response {
   // Linux errno, zero on success. Text is diagnostic only.
   int32 error = 1;
@@ -104,4 +121,12 @@ message Response {
   uint32 max_message = 13;
   uint32 max_data = 14;
   uint32 max_inflight = 15;
+  string control_token = 16;
+  // Unsolicited control notifications use frame ID zero and revoke cache_epoch.
+  // REVOKE_ACK retires the mapping epoch; opened files remain independently pinned.
+  uint64 cache_epoch = 17;
+  uint64 lease_deadline_ns = 18;
+  LocalMapping local = 19;
+  uint32 max_handles = 20;
+  uint32 max_cache_entries = 21;
 }

@@ -1,4 +1,5 @@
 //! Local, session-scoped storage protocol used by the Samba VFS client.
+pub(crate) mod direct;
 mod scheduler;
 mod server;
 
@@ -41,6 +42,8 @@ pub struct IpcOptions {
     pub connection_cursor_memory_mib: usize,
     pub per_cursor_memory_kib: usize,
     pub cursor_buffer_kib: usize,
+    pub direct_cache_entries: usize,
+    pub direct_lease_secs: u64,
 }
 impl Default for IpcOptions {
     fn default() -> Self {
@@ -58,12 +61,22 @@ impl Default for IpcOptions {
             connection_cursor_memory_mib: 64,
             per_cursor_memory_kib: 256,
             cursor_buffer_kib: 64,
+            direct_cache_entries: 4096,
+            direct_lease_secs: 30,
         }
     }
 }
 impl IpcOptions {
     pub fn validate(&self) -> anyhow::Result<()> {
         use anyhow::ensure;
+        ensure!(
+            self.direct_cache_entries <= u32::MAX as usize,
+            "ipc.direct_cache_entries exceeds protocol limit"
+        );
+        ensure!(
+            self.direct_lease_secs > 0 && self.direct_lease_secs <= 3600,
+            "ipc.direct_lease_secs must be between 1 and 3600"
+        );
         for (name, value) in [
             ("max_connections", self.max_connections),
             (

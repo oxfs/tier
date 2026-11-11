@@ -37,6 +37,14 @@ def receive_frame(stream):
     return request_id, read(message_len), read(data_len)
 
 
+def rpc_only_hello(message):
+    # These single-connection proxies test RPC framing/failure handling. Disable
+    # local access so reads cannot bypass the deliberately faulty transport.
+    if message[:2] == b"\x08\x01":
+        return message + b"\xb0\x01\x00"  # Request.local_access (22) = false.
+    return message
+
+
 @contextmanager
 def backend(root, responder):
     """One fake/proxy session, with bounded waits and exception propagation."""
@@ -146,7 +154,7 @@ class ProtocolTests(unittest.TestCase):
                         request_id, message, data = receive_frame(source)
                         reply = frame(request_id, message, data)
                         if source is front:
-                            back.sendall(reply)
+                            back.sendall(frame(request_id, rpc_only_hello(message), data))
                         else:
                             cuts = (1, HEADER.size - 1, HEADER.size, HEADER.size + len(message))
                             offset = 0
@@ -176,7 +184,7 @@ class ProtocolTests(unittest.TestCase):
                         if source is front:
                             if message[:2] == b"\x08\x0b":
                                 dropped.add(request_id)
-                            back.sendall(frame(request_id, message, data))
+                            back.sendall(frame(request_id, rpc_only_hello(message), data))
                         elif request_id not in dropped:
                             front.sendall(frame(request_id, message, data))
 
@@ -224,7 +232,7 @@ class ProtocolTests(unittest.TestCase):
                                         # Listing opens only metadata pathrefs.
                                         close_id = request_id
                                         intercepted.set()
-                                    back.sendall(frame(request_id, message, data))
+                                    back.sendall(frame(request_id, rpc_only_hello(message), data))
                                 elif request_id == hello_id and single_slot:
                                     # A final scalar occurrence overrides HELLO's
                                     # max_inflight: the next call must drain CLOSE.

@@ -88,8 +88,11 @@ pub(crate) struct MetadataStore {
 
 impl MetadataStore {
     fn open(path: &Path, options: &Options) -> Result<Self> {
+        // Paths exported to another process must not depend on this process's cwd.
+        fs::create_dir_all(path)?;
+        let path = fs::canonicalize(path)?;
         Ok(Self {
-            db: DB::open(options, path)?,
+            db: DB::open(options, &path)?,
             queues: std::array::from_fn(|_| Mutex::new(())),
         })
     }
@@ -188,12 +191,20 @@ impl Engine {
     pub fn open_with_options(path: &Path, settings: &RocksDbOptions) -> Result<Self> {
         let options = settings.build()?;
         let db = MetadataStore::open(path, &options)?;
+        // Never replace this inode: surviving clients may still hold OFD pins.
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(db.path().join("access.lock"))?;
         let engine = Self {
             inner: Arc::new(Inner {
                 db,
                 namespace: RwLock::new(()),
                 files: Mutex::new(HashMap::new()),
                 maintenance: Mutex::new(()),
+                direct: Arc::new(crate::ipc::direct::DirectAccess::new()),
             }),
         };
         if let Some(format) = engine.kv_get::<String>(schema::SYSTEM_FORMAT)? {

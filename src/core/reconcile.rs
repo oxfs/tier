@@ -44,6 +44,9 @@ impl Engine {
     }
     pub(crate) fn prepare_protected(&self, id: &str) -> Result<Option<Record>> {
         let lock = self.file_lock(id);
+        let Some(pin) = self.try_idle_pin(id)? else {
+            return Ok(None);
+        };
         let guard = lock.lock();
         let r = self.record(id)?;
         let p = self.policy(id)?;
@@ -60,15 +63,23 @@ impl Engine {
             .context("no current primary")?;
         let target = self.target(&c.target)?;
         let mut source = target.open_object(&c.object)?;
+        drop(pin);
         drop(guard);
         let (size, hash) = fingerprint(&mut source)?;
         Self::sync_object(&target, &c.object, &source)?;
+        let Some(_pin) = self.try_idle_pin(id)? else {
+            return Ok(None);
+        };
         let guard = lock.lock();
         let mut latest = self.record(id)?;
         if guard.writer || latest.node.version != r.node.version {
             return Ok(None);
         }
-        latest.node.size = size;
+        Self::apply_physical_attrs(&mut latest.node, &source.metadata()?)?;
+        ensure!(
+            latest.node.size == size,
+            "source size changed during verification"
+        );
         latest.hash = Some(hash.clone());
         latest.dirty = false;
         latest.error = None;
@@ -112,14 +123,9 @@ impl Engine {
             }
         }
         if valid.is_empty() && required > 0 {
-            let lock = self.file_lock(id);
-            let mut state = lock.lock();
-            if state.writer {
+            if !self.recall_idle(id)? {
                 return Ok(());
             }
-            state.body = None;
-            self.recall_body(id, &mut state)?;
-            drop(state);
             valid = self
                 .copies(id)?
                 .into_iter()
@@ -165,6 +171,9 @@ impl Engine {
             let mut input = self.target(&source.target)?.open_object(&source.object)?;
             let lock = self.file_lock(id);
             let candidate = {
+                let Some(_pin) = self.try_idle_pin(id)? else {
+                    return Ok(());
+                };
                 let _guard = lock.lock();
                 self.create_object(&name, id)
             };
@@ -193,15 +202,21 @@ impl Engine {
                     fingerprint(&mut output)?.1 == hash,
                     "replica verification failed"
                 );
+                Self::copy_physical_times(&input, &output)?;
                 Self::sync_object(&root, &object, &output)
             })();
             if copied.is_err() {
-                let _guard = lock.lock();
                 if root.remove_object(&object).is_ok() {
                     self.delete_record(&candidate_gc)?;
                 }
                 continue;
             }
+            let Some(_pin) = self.try_idle_pin(id)? else {
+                if root.remove_object(&object).is_ok() {
+                    self.delete_record(&candidate_gc)?;
+                }
+                return Ok(());
+            };
             let state = lock.lock();
             let _namespace = self.inner.namespace.read();
             let publish = (|| -> Result<bool> {
@@ -237,6 +252,9 @@ impl Engine {
             "persistent storage placement incomplete"
         );
         let lock = self.file_lock(id);
+        let Some(_pin) = self.try_idle_pin(id)? else {
+            return Ok(());
+        };
         let mut state = lock.lock();
         let _namespace = self.inner.namespace.read();
         let mut latest = self.record(id)?;

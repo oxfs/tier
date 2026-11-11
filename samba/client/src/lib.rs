@@ -1,6 +1,8 @@
 //! Nonblocking Tier IPC transport driven by Samba's tevent adapter.
 //! No runtime or threads are created here; C retains socket ownership.
+mod control;
 mod ffi;
+mod local;
 mod transport;
 mod pb {
     include!(concat!(env!("OUT_DIR"), "/tier.ipc.rs"));

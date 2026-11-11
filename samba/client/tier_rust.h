@@ -70,6 +70,7 @@ typedef struct {
 	bool stable;
 	const TierChanges *changes;
 	uint32_t max_entries, max_bytes, protocol_version;
+	bool local_access;
 } TierRequest;
 typedef struct {
 	char *name;
@@ -105,4 +106,14 @@ bool tier_transport_wants_write(const TierTransport *);
 TierResponse *tier_transport_next(TierTransport *, uint64_t *id);
 void tier_transport_set_max_data(TierTransport *, uint32_t);
 void tier_response_free(TierResponse *);
+typedef struct ReadJob TierReadJob;
+int tier_control_connect(TierTransport *, const char *);
+bool tier_is_local_handle(const TierTransport *, uint64_t);
+void tier_local_hits(const TierTransport *, uint64_t (*)[3]);
+void tier_transport_abort(TierTransport *, int);
+int tier_control_fd(const TierTransport *);
+bool tier_control_wants_write(const TierTransport *);
+int tier_local_read(TierTransport *, uint64_t, uint64_t, size_t, TierReadJob **);
+void tier_local_read_run(TierReadJob *);
+TierResponse *tier_local_read_finish(TierReadJob *);
 #endif

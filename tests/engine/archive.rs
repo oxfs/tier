@@ -4,7 +4,7 @@ use std::{
     fs,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -75,7 +75,12 @@ fn discarded_upload_cleanup_does_not_block_namespace_writes() -> Result<()> {
         let (send, receive) = mpsc::channel();
         let shared = &engine;
         let mkdir = scope.spawn(move || {
-            send.send(shared.mkdir("/unrelated")).unwrap();
+            send.send((|| -> Result<()> {
+                shared.mkdir("/unrelated")?;
+                // A stale upload's slow DELETE must not retain an exclusive pin.
+                shared.open_file("/renamed", false, false, false)?.close()
+            })())
+            .unwrap();
         });
         let result = receive.recv_timeout(Duration::from_secs(2));
         // Always release the remote request before asserting, including on failure.
@@ -95,6 +100,8 @@ fn discarded_upload_cleanup_does_not_block_namespace_writes() -> Result<()> {
 fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
     let http = Server::http("127.0.0.1:0").map_err(|e| anyhow::anyhow!("{e}"))?;
     let url = format!("http://{}/dav", http.server_addr());
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let download_count = downloads.clone();
     let corrupt = Arc::new(AtomicBool::new(true));
     let bad = corrupt.clone();
     let reject_uploads = Arc::new(AtomicBool::new(false));
@@ -120,12 +127,15 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
                     objects.insert(key, buf);
                     (201, vec![])
                 }
-                Method::Get => match objects.get(&key) {
-                    _ if *missing.lock().unwrap() == key => (404, vec![]),
-                    None => (404, vec![]),
-                    Some(_) if bad.load(Ordering::Relaxed) => (200, b"corrupt".to_vec()),
-                    Some(data) => (200, data.clone()),
-                },
+                Method::Get => {
+                    download_count.fetch_add(1, Ordering::Relaxed);
+                    match objects.get(&key) {
+                        _ if *missing.lock().unwrap() == key => (404, vec![]),
+                        None => (404, vec![]),
+                        Some(_) if bad.load(Ordering::Relaxed) => (200, b"corrupt".to_vec()),
+                        Some(data) => (200, data.clone()),
+                    }
+                }
                 Method::Delete => {
                     objects.remove(&key);
                     (204, vec![])
@@ -172,6 +182,32 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
     corrupt.store(false, Ordering::Relaxed);
     engine.archive_tick()?;
     assert_eq!(engine.state()?["health"][0]["status"], "remote_only");
+    // Browsing/opening archive-only files must not download them. Concurrent
+    // first reads share the FileState and publish only one verified local copy.
+    let before = downloads.load(Ordering::Relaxed);
+    assert_eq!(engine.stat("/photo")?.size, 11);
+    assert_eq!(engine.list("/")?, ["photo"]);
+    let first = engine.open_file("/photo", false, false, false)?;
+    let second = engine.open_file("/photo", false, false, false)?;
+    assert_eq!(first.read_at(0, &mut [])?, 0);
+    assert_eq!(downloads.load(Ordering::Relaxed), before);
+    let barrier = std::sync::Barrier::new(2);
+    let read = |file: tier::core::FileHandle| -> Result<()> {
+        barrier.wait();
+        let mut bytes = [0; 11];
+        assert_eq!(file.read_at(0, &mut bytes)?, bytes.len());
+        assert_eq!(&bytes, b"photo bytes");
+        file.close()
+    };
+    thread::scope(|scope| -> Result<()> {
+        let other = scope.spawn(|| read(second));
+        read(first)?;
+        other.join().unwrap()?;
+        Ok(())
+    })?;
+    assert_eq!(downloads.load(Ordering::Relaxed), before + 1);
+    engine.archive_tick()?;
+    assert_eq!(engine.state()?["health"][0]["status"], "remote_only");
     // Failed background renaming keeps the previous readable remote mapping.
     let old_objects = objects.lock().unwrap().clone();
     engine.rename("/photo", "/旅行 #?%.jpg")?;
@@ -197,6 +233,13 @@ fn evict_only_after_verified_upload_and_recall_by_digest() -> Result<()> {
     engine.archive_tick()?;
     // With no local source, corrupt remote content is never accepted on recall.
     corrupt.store(true, Ordering::Relaxed);
+    let archived = engine.open_file("/photo", false, false, false)?;
+    assert_eq!(engine.stat("/photo")?.size, 11);
+    assert_eq!(archived.read_at(0, &mut [])?, 0);
+    archived.sync()?;
+    assert_eq!(engine.state()?["health"][0]["status"], "remote_only");
+    assert!(archived.read_at(0, &mut [0; 11]).is_err());
+    archived.close()?;
     assert!(engine.get("/photo").is_err());
     corrupt.store(false, Ordering::Relaxed);
     assert_eq!(engine.get("/photo")?, b"photo bytes");

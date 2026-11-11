@@ -9,8 +9,9 @@ EXTENDS Naturals, Integers, TLC
 \* Namespace publication/directory fsync are covered by PhysicalRename instead.
 \*
 \* Implementation: core/file.rs::open_id synchronously invalidates protected
-\* metadata before mutating a body; write_at updates metadata without syncing;
+\* metadata before mutating a body; write_at changes the physical body only;
 \* FileHandle::sync calls sync_object before core/store.rs::sync_metadata.
+\* metadata.content denotes the intended content generation, not size/mtime.
 \* The lock is held through FLUSH, so writes cannot interleave its stages.
 \* This does not model fsync/WAL errors (which must not return success), actual
 \* sector tearing, device fsync dishonesty, checksums or recovery availability.
@@ -27,7 +28,8 @@ Init ==
 
 BeginWrite ==
     /\ phase = "idle" /\ metadata.generation < MaxGeneration
-    /\ metadata' = [metadata EXCEPT !.generation = @ + 1, !.protected = FALSE]
+    /\ metadata' = [metadata EXCEPT !.generation = @ + 1, !.protected = FALSE,
+                                    !.content = metadata.generation + 1]
     /\ durableMetadata' = IF CheckInvalidation /\ durableMetadata.protected
                           THEN metadata' ELSE durableMetadata
     /\ phase' = "ready" /\ acknowledged' = None
@@ -36,9 +38,8 @@ BeginWrite ==
 Write ==
     /\ phase = "ready"
     /\ data' = metadata.generation
-    /\ metadata' = [metadata EXCEPT !.content = metadata.generation]
     /\ unsynced' = TRUE /\ phase' = "written"
-    /\ UNCHANGED <<durableMetadata, durableData, acknowledged>>
+    /\ UNCHANGED <<metadata, durableMetadata, durableData, acknowledged>>
 
 \* Unrequested writeback can persist all or part of unsynced data. WAL can also
 \* persist before the data: only dirty records may describe such content.

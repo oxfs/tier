@@ -34,21 +34,80 @@ impl Engine {
     }
 
     pub(crate) fn stat_id(&self, id: &str) -> Result<Node> {
-        Ok(self.record(id)?.node)
+        self.physical_attrs(self.record(id)?)
+    }
+    /// The record is a closed-file/archive snapshot, not a write-through stat cache.
+    /// Never acquire a file mutex here: namespace callers may already hold it.
+    fn physical_attrs(&self, r: Record) -> Result<Node> {
+        let mut node = r.node;
+        if !node.is_dir {
+            let mut copies = self.copies(&node.id)?;
+            copies.sort_by_key(|copy| Some(&copy.target) != r.primary.as_ref());
+            for copy in copies
+                .into_iter()
+                .filter(|copy| copy.version == node.version)
+            {
+                if let Ok(metadata) = self
+                    .target(&copy.target)
+                    .and_then(|root| Ok(root.open_object(&copy.object)?.metadata()?))
+                {
+                    Self::apply_physical_attrs(&mut node, &metadata)?;
+                    break;
+                }
+            }
+        }
+        Ok(node)
+    }
+    pub(crate) fn apply_physical_attrs(node: &mut Node, metadata: &fs::Metadata) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        node.size = metadata.len();
+        node.mtime = metadata.modified()?;
+        node.atime = metadata.accessed()?;
+        let nanos =
+            i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec());
+        let magnitude = nanos.unsigned_abs();
+        let elapsed = std::time::Duration::new(
+            (magnitude / 1_000_000_000).try_into()?,
+            (magnitude % 1_000_000_000) as u32,
+        );
+        node.ctime = if nanos < 0 {
+            UNIX_EPOCH - elapsed
+        } else {
+            UNIX_EPOCH + elapsed
+        };
+        Ok(())
+    }
+    pub(crate) fn restore_physical_times(file: &fs::File, node: &Node) -> Result<()> {
+        file.set_times(
+            fs::FileTimes::new()
+                .set_accessed(node.atime)
+                .set_modified(node.mtime),
+        )?;
+        Ok(())
+    }
+    pub(crate) fn copy_physical_times(source: &fs::File, destination: &fs::File) -> Result<()> {
+        let metadata = source.metadata()?;
+        destination.set_times(
+            fs::FileTimes::new()
+                .set_accessed(metadata.accessed()?)
+                .set_modified(metadata.modified()?),
+        )?;
+        Ok(())
     }
     pub(crate) fn parent_id(&self, id: &str) -> Result<String> {
         Ok(self.record(id)?.parent.unwrap_or_else(|| "root".into()))
     }
     pub(crate) fn stat_child(&self, parent: &str, name: &str) -> Result<Node> {
         let _guard = self.inner.namespace.read();
-        self.stat_child_unlocked(parent, name)
+        let node = self.stat_child_unlocked(parent, name)?;
+        self.stat_id(&node.id)
     }
     fn stat_child_unlocked(&self, parent: &str, name: &str) -> Result<Node> {
         if !self.record(parent)?.node.is_dir {
             return Err(failure(libc::ENOTDIR));
         }
         let id: String = self.require(&entry(parent, name))?;
-        self.stat_id(&id)
+        Ok(self.record(&id)?.node)
     }
     pub(crate) fn children(&self, parent: &str) -> Result<Vec<(String, Node)>> {
         let mut out = vec![];
@@ -81,21 +140,23 @@ impl Engine {
                 .get_pinned(schema::node(&id))?
                 .ok_or_else(|| failure(libc::ENOENT))?;
             let r: Record = Self::decode(&bytes)?;
-            visitor(r.name, r.node)?;
+            let name = r.name.clone();
+            visitor(name, self.physical_attrs(r)?)?;
         }
         Ok(())
     }
     pub fn stat(&self, path: &str) -> Result<Node> {
         let _guard = self.inner.namespace.read();
-        self.lookup_unlocked(path)
+        let node = self.lookup_unlocked(path)?;
+        self.stat_id(&node.id)
     }
     /// Caller holds the namespace lock while resolving and using this identity.
     pub(crate) fn lookup_unlocked(&self, path: &str) -> Result<Node> {
         if path == "/" {
-            return self.stat_id("root");
+            return Ok(self.record("root")?.node);
         }
         ensure!(path.starts_with('/'), "invalid path");
-        let mut node = self.stat_id("root")?;
+        let mut node = self.record("root")?.node;
         for name in path[1..].split('/') {
             ensure!(safe_name(name), "invalid path");
             node = self.stat_child_unlocked(&node.id, name)?;
@@ -118,6 +179,24 @@ impl Engine {
         let lock = self.file_lock(id);
         let _guard = lock.lock();
         let mut r = self.record(id)?;
+        if !r.node.is_dir {
+            let mut times = fs::FileTimes::new();
+            if let Some(t) = atime {
+                times = times.set_accessed(t);
+            }
+            if let Some(t) = mtime {
+                times = times.set_modified(t);
+            }
+            for copy in self
+                .copies(id)?
+                .into_iter()
+                .filter(|c| c.version == r.node.version)
+            {
+                if let Ok(root) = self.target(&copy.target) {
+                    root.open_object(&copy.object)?.set_times(times)?;
+                }
+            }
+        }
         if let Some(t) = atime {
             r.node.atime = t;
         }
@@ -244,6 +323,7 @@ impl Engine {
                 }
                 let mut puts = vec![];
                 let mut deletes = vec![entry(fp, from)];
+                let mut replaced_pin = None;
                 let destination = self.kv_get::<String>(&entry(tp, to))?;
                 if let Some(dst) = destination
                     && dst != src.id
@@ -263,7 +343,8 @@ impl Engine {
                         return Err(failure(libc::ENOTEMPTY));
                     }
                     let original = self.path_for(&dst)?.unwrap_or_default();
-                    self.detach_mutations(n, &original, &mut puts, &mut deletes)?;
+                    replaced_pin =
+                        Some(self.detach_mutations(n, &original, &mut puts, &mut deletes)?);
                 }
                 let mut record = self.record(&src.id)?;
                 record.parent = Some(tp.into());
@@ -273,6 +354,7 @@ impl Engine {
                 puts.push(Self::encoded(entry(tp, to), &src.id)?);
                 puts.push(Self::rescan_record(&src.id)?);
                 self.atomic(puts, deletes, false)?;
+                drop(replaced_pin);
                 Ok(())
             },
         )
@@ -284,7 +366,10 @@ impl Engine {
         path: &str,
         puts: &mut Vec<(String, Vec<u8>)>,
         deletes: &mut Vec<String>,
-    ) -> Result<()> {
+    ) -> Result<pin::FilePin> {
+        let pin = self
+            .try_idle_pin(&r.node.id)?
+            .ok_or_else(|| failure(libc::EBUSY))?;
         let policy = self.policy(&r.node.id)?;
         let archive_policy = self.archive_policy(&r.node.id)?;
         let ttl = policy.trash_ttl_secs;
@@ -308,7 +393,7 @@ impl Engine {
             Self::encoded(schema::trash(next), &trash)?,
             Self::encoded(schema::TRASH_SEQ.into(), &next)?,
         ]);
-        Ok(())
+        Ok(pin)
     }
     pub fn remove(&self, path: &str) -> Result<()> {
         self.namespace_files(
@@ -318,7 +403,8 @@ impl Engine {
                 ensure!(n.id != "root", "cannot remove root");
                 let mut puts = vec![];
                 let mut deletes = vec![];
-                self.detach_mutations(self.record(&n.id)?, path, &mut puts, &mut deletes)?;
+                let _pin =
+                    self.detach_mutations(self.record(&n.id)?, path, &mut puts, &mut deletes)?;
                 self.atomic(puts, deletes, false)
             },
         )
@@ -341,7 +427,8 @@ impl Engine {
                 let path = self.path_for(&n.id)?.unwrap_or_default();
                 let mut puts = vec![];
                 let mut deletes = vec![];
-                self.detach_mutations(self.record(&n.id)?, &path, &mut puts, &mut deletes)?;
+                let _pin =
+                    self.detach_mutations(self.record(&n.id)?, &path, &mut puts, &mut deletes)?;
                 self.atomic(puts, deletes, false)
             },
         )
@@ -405,6 +492,13 @@ impl Engine {
                 let t: Trash = self.require(&schema::trash(id))?;
                 let records = self.subtree(&t.node)?;
                 ensure!(guards.iter().all(|g| g.handles == 0), "file is open");
+                let _pins = records
+                    .iter()
+                    .map(|r| {
+                        self.try_idle_pin(&r.node.id)?
+                            .ok_or_else(|| failure(libc::EBUSY))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let mut puts = vec![];
                 let mut deletes = vec![schema::trash(id)];
                 for r in records {
@@ -438,6 +532,103 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_attributes_do_not_require_per_write_metadata_updates() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let engine = Engine::open(&root.path().join("metadata"))?;
+        let disk = root.path().join("disk");
+        fs::create_dir(&disk)?;
+        engine.add_target("disk", &disk)?;
+        engine.set_policy(
+            "/",
+            &Policy {
+                write_cache: vec!["disk".into()],
+                low_water: 99,
+                high_water: 100,
+                ..Default::default()
+            },
+        )?;
+        let handle = engine.open_file("/file", true, true, false)?;
+        let id = engine.stat("/file")?.id;
+        assert!(engine.local_file_info(&id)?.is_none());
+        let key = schema::node(&id);
+        let before: Option<serde_json::Value> = engine.inner.db.get(&key)?;
+        handle.write_at(0, b"contents")?;
+        assert_eq!(engine.inner.db.get::<serde_json::Value>(&key)?, before);
+        assert_eq!(engine.stat("/file")?.size, 8);
+        assert_eq!(engine.children("root")?[0].1.size, 8);
+        handle.set_len(3)?;
+        assert_eq!(engine.inner.db.get::<serde_json::Value>(&key)?, before);
+        assert_eq!(engine.stat_id(&id)?.size, 3);
+        let time = UNIX_EPOCH + std::time::Duration::from_secs(123456789);
+        engine.set_times(&id, Some(time), Some(time))?;
+        assert_eq!(engine.stat_id(&id)?.mtime, time);
+        handle.close()?;
+        assert_eq!(engine.record(&id)?.node.size, 3);
+        assert_eq!(engine.record(&id)?.node.mtime, time);
+        engine.reconcile()?;
+        assert_eq!(engine.stat_id(&id)?.mtime, time);
+        let local = engine
+            .local_file_info(&id)?
+            .context("missing local mapping")?;
+        assert_eq!(local.node.size, 3);
+        assert_eq!(fs::read(&local.path)?, b"con");
+        use std::os::unix::fs::MetadataExt;
+        let physical = fs::metadata(&local.path)?;
+        assert_eq!(local.device, physical.dev());
+        assert_eq!(local.inode, physical.ino());
+        let writer = engine.open_file("/file", true, false, false)?;
+        assert!(engine.local_file_info(&id)?.is_none());
+        writer.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn missing_dirty_body_is_not_recreated_from_stale_empty_snapshot() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let engine = Engine::open(&root.path().join("metadata"))?;
+        let disk = root.path().join("disk");
+        fs::create_dir(&disk)?;
+        engine.add_target("disk", &disk)?;
+        engine.set_policy(
+            "/",
+            &Policy {
+                write_cache: vec!["disk".into()],
+                low_water: 99,
+                high_water: 100,
+                ..Default::default()
+            },
+        )?;
+        let handle = engine.open_file("/file", true, true, false)?;
+        let id = engine.stat("/file")?.id;
+        let dirty = engine.record(&id)?;
+        handle.write_at(0, b"only copy")?;
+        handle.close()?;
+        // A crash before close leaves the durable invalidation and old stat snapshot.
+        engine.put_record(&schema::node(&id), &dirty, true)?;
+        drop(engine);
+        let engine = Engine::open(&root.path().join("metadata"))?;
+        assert_eq!(engine.stat("/file")?.size, 9);
+        fs::rename(&disk, root.path().join("offline"))?;
+        fs::create_dir(&disk)?;
+        // A different available target makes accidental empty-file creation observable.
+        let spare = root.path().join("spare");
+        fs::create_dir(&spare)?;
+        engine.register_target("spare", &spare, Some("spare"), true)?;
+        engine.set_policy(
+            "/",
+            &Policy {
+                write_cache: vec!["spare".into()],
+                low_water: 99,
+                high_water: 100,
+                ..Default::default()
+            },
+        )?;
+        assert!(engine.get("/file").is_err());
+        assert_eq!(engine.record(&id)?.primary, Some("disk".into()));
+        Ok(())
+    }
 
     #[test]
     fn waiting_for_file_io_does_not_block_other_namespace_operations() -> Result<()> {

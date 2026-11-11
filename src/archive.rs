@@ -211,6 +211,9 @@ impl Engine {
             self.reschedule_work(schema::WorkKind::Archive, &id, failed)?;
         }
         for (k, c) in self.scan::<ArchiveCopy>(schema::ARCHIVE_GC)? {
+            if self.try_idle_pin(&c.node)?.is_none() {
+                continue;
+            }
             if let Err(e) = self
                 .archive_client(&c.target)
                 .and_then(|client| client.remove(&c.key))
@@ -252,6 +255,9 @@ impl Engine {
                     .count();
                 if n >= count {
                     let lock = self.file_lock(id);
+                    let Some(_pin) = self.try_idle_pin(id)? else {
+                        return Ok(());
+                    };
                     let guard = lock.lock();
                     let _namespace = self.inner.namespace.read();
                     if !guard.writer && self.record(id)?.node.version == r.node.version {
@@ -332,6 +338,10 @@ impl Engine {
             let client = self.archive_client(name)?;
             let object = client.upload(&mut source, hash, &r.name)?;
             let lock = self.file_lock(id);
+            let Some(_pin) = self.try_idle_pin(id)? else {
+                client.remove(&object)?;
+                return Ok(());
+            };
             let guard = lock.lock();
             let namespace = self.inner.namespace.read();
             let latest = self.record(id)?;
@@ -342,6 +352,7 @@ impl Engine {
             {
                 drop(namespace);
                 drop(guard);
+                drop(_pin);
                 client.remove(&object)?;
                 return Ok(());
             }
@@ -376,6 +387,9 @@ impl Engine {
         );
         // Each selected remote was read back immediately above, before local eviction.
         let lock = self.file_lock(id);
+        let Some(_pin) = self.try_idle_pin(id)? else {
+            return Ok(());
+        };
         let mut guard = lock.lock();
         let _namespace = self.inner.namespace.read();
         let mut latest = self.record(id)?;

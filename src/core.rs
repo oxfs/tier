@@ -2,6 +2,7 @@ mod catalog;
 mod file;
 mod model;
 pub(crate) mod objects;
+mod pin;
 mod queue;
 mod reconcile;
 mod report;
@@ -42,6 +43,7 @@ pub(crate) struct Inner {
     pub namespace: RwLock<()>,
     pub files: Mutex<HashMap<String, Weak<Mutex<FileState>>>>,
     pub maintenance: Mutex<()>,
+    pub direct: Arc<crate::ipc::direct::DirectAccess>,
 }
 #[derive(Clone)]
 pub struct Engine {
@@ -76,6 +78,9 @@ pub(crate) fn failure(errno: i32) -> anyhow::Error {
     io::Error::from_raw_os_error(errno).into()
 }
 impl Engine {
+    pub(crate) fn direct_access(&self) -> Arc<crate::ipc::direct::DirectAccess> {
+        self.inner.direct.clone()
+    }
     pub(crate) fn record(&self, id: &str) -> Result<Record> {
         self.require(&schema::node(id))
     }
@@ -129,36 +134,16 @@ impl Engine {
     }
     pub(crate) fn policy(&self, id: &str) -> Result<Policy> {
         let view = self.inner.db.snapshot();
-        Self::policy_in_view(&view, id, None)
-    }
-    /// Caller holds the file lock, keeping this record stable through the write.
-    /// Policy ancestry and the record come from the same snapshot; no cross-request cache.
-    pub(crate) fn record_with_policy(&self, id: &str) -> Result<(Record, Policy)> {
-        let view = self.inner.db.snapshot();
-        let record: Record =
-            Self::view_get(&view, &schema::node(id))?.ok_or_else(|| failure(libc::ENOENT))?;
-        let policy = Self::policy_in_view(&view, id, Some(&record))?;
-        Ok((record, policy))
-    }
-    fn policy_in_view(
-        view: &rocksdb::Snapshot<'_>,
-        id: &str,
-        mut first: Option<&Record>,
-    ) -> Result<Policy> {
         let mut id = id.to_owned();
         let mut seen = HashSet::new();
         loop {
             ensure!(seen.insert(id.clone()), "namespace cycle");
-            if let Some(policy) = Self::view_get(view, &schema::policy(&id))? {
+            if let Some(policy) = Self::view_get(&view, &schema::policy(&id))? {
                 return Ok(policy);
             }
-            let parent = if let Some(record) = first.take() {
-                record.parent.clone()
-            } else {
-                Self::view_get::<Record>(view, &schema::node(&id))?
-                    .ok_or_else(|| failure(libc::ENOENT))?
-                    .parent
-            };
+            let parent = Self::view_get::<Record>(&view, &schema::node(&id))?
+                .ok_or_else(|| failure(libc::ENOENT))?
+                .parent;
             if let Some(parent) = parent {
                 id = parent;
             } else {

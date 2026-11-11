@@ -24,7 +24,7 @@ counterexample() {
     fi
     printf 'PASS counterexample: %s/%s\n' "$name" "$guard"
 }
-for name in Protection Durability PhysicalRename Placement; do
+for name in Protection Durability PhysicalRename Placement DirectAccess; do
     run "$name" "$name.cfg"
 done
 counterexample Protection CheckGeneration '(PublishesCurrent|DataAvailable)'
@@ -40,3 +40,9 @@ counterexample PhysicalRename CheckGCCurrent '(DurableMappingHasBody|LiveMapping
 counterexample PhysicalRename CheckIntent NoUntrackedAlias
 counterexample Placement CheckPolicy PublishesCurrentPolicy
 counterexample Placement CheckLive PublishesLiveNode
+counterexample DirectAccess CheckPublication GrantsOutsideMutation
+counterexample DirectAccess CheckEpoch '(ReadsCurrent|HandlesProtected)'
+counterexample DirectAccess CheckPins HandlesProtected
+counterexample DirectAccess CheckDeadline '(ReadsCurrent|HandlesProtected)'
+counterexample DirectAccess CheckDaemon ReadsCurrent
+counterexample DirectAccess CheckDisconnect '(ReadsCurrent|HandlesProtected)'

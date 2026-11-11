@@ -27,6 +27,7 @@ struct Shared {
     options: Arc<IpcOptions>,
     engine: Engine,
     workers: Arc<Semaphore>,
+    connections: Arc<Semaphore>,
     buffers: Buffers,
     file_order: Arc<FileOrder>,
     cursor_budget: Arc<Mutex<usize>>,
@@ -75,11 +76,11 @@ impl Buffers {
         }
     }
 }
-fn errno(code: i32) -> anyhow::Error {
+pub(super) fn errno(code: i32) -> anyhow::Error {
     io::Error::from_raw_os_error(code).into()
 }
 
-struct Handle {
+pub(super) struct Handle {
     node: String,
     // Only blocking operations access this lock; it never crosses an await.
     file: Option<Mutex<FileHandle>>,
@@ -121,6 +122,7 @@ struct Cursor {
     memory_bytes: usize,
     budget: CursorBudget,
     buffer_bytes: usize,
+    generation: u64,
 }
 impl Cursor {
     fn new(budget: CursorBudget, buffer_bytes: usize) -> Self {
@@ -131,6 +133,7 @@ impl Cursor {
             memory_bytes: 0,
             budget,
             buffer_bytes,
+            generation: 0,
         }
     }
     fn append(&mut self, entry: Entry) -> Result<()> {
@@ -226,6 +229,7 @@ struct Session {
     cursor_budget: Arc<Mutex<usize>>,
     hello: bool,
     attached: bool,
+    direct: Option<Arc<super::direct::DirectSession>>,
 }
 impl Session {
     fn handle(&self, id: u64) -> Result<Arc<Handle>> {
@@ -235,14 +239,15 @@ impl Session {
             .ok_or_else(|| errno(libc::EBADF))
     }
     fn insert(&mut self, handle: Handle) -> Result<u64> {
+        let id = self.next;
+        let next = id
+            .checked_add(1)
+            .filter(|id| id & (1 << 63) == 0)
+            .ok_or_else(|| errno(libc::EMFILE))?;
         if self.handles.len() + self.cursors.len() >= self.options.max_handles_per_connection {
             return Err(errno(libc::EMFILE));
         }
-        let id = self.next;
-        self.next = self
-            .next
-            .checked_add(1)
-            .ok_or_else(|| errno(libc::EMFILE))?;
+        self.next = next;
         self.handles.insert(id, Arc::new(handle));
         Ok(id)
     }
@@ -350,6 +355,7 @@ impl IpcServer {
             let shared = Arc::new(Shared {
                 engine,
                 workers: Arc::new(Semaphore::new(options.max_running_requests)),
+                connections: Arc::new(Semaphore::new(options.max_connections)),
                 buffers: Buffers::new(&options),
                 options,
                 file_order: Arc::new(FileOrder::default()),
@@ -366,8 +372,8 @@ impl IpcServer {
                     }
                     incoming = listener.accept() => {
                         match incoming {
-                            Ok((stream, _)) if trusted_peer(&stream) && sessions.len() < shared.options.max_connections => {
-                                sessions.spawn(serve(stream, shared.clone(), stopped.clone()));
+                            Ok((stream, _)) if trusted_peer(&stream) && sessions.len() < shared.options.max_connections.saturating_mul(2) => {
+                                sessions.spawn(route(stream, shared.clone(), stopped.clone()));
                             }
                             Ok(_) => {},
                             Err(error) => { tracing::error!(%error, "IPC accept failed"); break; }
@@ -417,7 +423,139 @@ fn trusted_peer(stream: &UnixStream) -> bool {
     })
 }
 
-async fn serve(stream: UnixStream, shared: Arc<Shared>, mut stopped: watch::Receiver<bool>) {
+async fn route(mut stream: UnixStream, shared: Arc<Shared>, mut stopped: watch::Receiver<bool>) {
+    let first = tokio::select! {
+        _ = async { let _ = stopped.wait_for(|value| *value).await; } => return,
+        frame = tokio::time::timeout(Duration::from_secs(shared.options.reply_timeout_secs), Frame::read_async(&mut stream)) => frame,
+    };
+    let Ok(Ok(Some(first))) = first else {
+        return;
+    };
+    let Ok(request) = Request::decode(first.message.as_slice()) else {
+        return;
+    };
+    if request.method == Method::ControlAttach as i32 {
+        if first.id == 0 || !first.data.is_empty() {
+            return;
+        }
+        let Some(session) = shared.engine.direct_access().find(&request.control_token) else {
+            return;
+        };
+        // The token is only disclosed on a trusted main connection. A single
+        // control reader remains independent of main-session storage barriers.
+        let Ok(notifications) = session.attach() else {
+            return;
+        };
+        if let Err(error) = control(
+            stream,
+            first.id,
+            session.clone(),
+            shared,
+            notifications,
+            stopped,
+        )
+        .await
+        {
+            tracing::warn!(%error, "direct-access control connection failed");
+        }
+        session.disconnect();
+    } else {
+        let Ok(_connection) = shared.connections.clone().try_acquire_owned() else {
+            return;
+        };
+        serve(stream, shared, stopped, first).await;
+    }
+}
+
+async fn control(
+    stream: UnixStream,
+    attach_id: u64,
+    session: Arc<super::direct::DirectSession>,
+    shared: Arc<Shared>,
+    mut notifications: tokio::sync::mpsc::UnboundedReceiver<super::direct::Revocation>,
+    mut stopped: watch::Receiver<bool>,
+) -> Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+    let timeout = Duration::from_secs(shared.options.reply_timeout_secs);
+    async fn send(
+        writer: &mut OwnedWriteHalf,
+        timeout: Duration,
+        id: u64,
+        response: Response,
+    ) -> Result<()> {
+        tokio::time::timeout(
+            timeout,
+            Frame {
+                id,
+                message: response.encode_to_vec(),
+                data: vec![],
+            }
+            .write_async(writer),
+        )
+        .await??;
+        Ok(())
+    }
+    send(&mut writer, timeout, attach_id, Response::default()).await?;
+    let mut pending: Option<super::direct::Revocation> = None;
+    loop {
+        let frame = {
+            let read = Frame::read_async(&mut reader);
+            tokio::pin!(read);
+            loop {
+                tokio::select! {
+                    _ = async { let _ = stopped.wait_for(|value| *value).await; } => return Ok(()),
+                    notice = notifications.recv() => {
+                        let Some(notice) = notice else { return Ok(()); };
+                        if notice.epoch < session.epoch() {
+                            let _ = notice.done.send(true);
+                            continue;
+                        }
+                        anyhow::ensure!(pending.is_none(), "overlapping cache revocations");
+                        send(&mut writer, timeout, 0, Response { cache_epoch: notice.epoch, ..Default::default() }).await?;
+                        pending = Some(notice);
+                    }
+                    frame = &mut read => break frame?,
+                }
+            }
+        };
+        let Some(frame) = frame else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            frame.id != 0 && frame.data.is_empty(),
+            "invalid control frame"
+        );
+        let request = Request::decode(frame.message.as_slice())?;
+        anyhow::ensure!(
+            request.method == Method::RevokeAck as i32,
+            "invalid control method"
+        );
+        let epoch = request.cache_epoch;
+        session.acknowledge(epoch)?;
+        send(
+            &mut writer,
+            timeout,
+            frame.id,
+            Response {
+                cache_epoch: session.epoch(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        if let Some(notice) = pending.take() {
+            anyhow::ensure!(notice.epoch == epoch, "invalid revocation acknowledgement");
+            let _ = notice.done.send(true);
+        }
+    }
+}
+
+async fn serve(
+    stream: UnixStream,
+    shared: Arc<Shared>,
+    mut stopped: watch::Receiver<bool>,
+    first: Frame,
+) {
+    let mut first = Some(first);
     let (mut reader, writer) = stream.into_split();
     let mut session = Some(Session {
         options: shared.options.clone(),
@@ -429,6 +567,7 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>, mut stopped: watch::Rece
         cursor_budget: shared.cursor_budget.clone(),
         hello: false,
         attached: false,
+        direct: None,
     });
     let limiter = Arc::new(Semaphore::new(shared.options.max_inflight_per_connection));
     let data_buffers = Arc::new(Semaphore::new(
@@ -450,7 +589,10 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>, mut stopped: watch::Rece
         let limited_frame = async {
             // Limit in-flight requests and queued replies before allocating a frame.
             let local = limiter.clone().acquire_owned().await.unwrap();
-            let frame = Frame::read_async(&mut reader).await;
+            let frame = match first.take() {
+                Some(frame) => Ok(Some(frame)),
+                None => Frame::read_async(&mut reader).await,
+            };
             (local, frame)
         };
         // Keep the same read future across completions: cancelling a partial
@@ -515,6 +657,34 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>, mut stopped: watch::Rece
             tasks.push(replies.send(std::future::ready(Ok(response))));
             continue;
         }
+        if session
+            .as_ref()
+            .unwrap()
+            .direct
+            .as_ref()
+            .is_some_and(|direct| !direct.healthy())
+        {
+            break;
+        }
+        let mutation = if matches!(
+            method,
+            Method::Setattr | Method::Mkdir | Method::Rename | Method::Unlink | Method::Detach
+        ) || (method == Method::Open
+            && (request.access == Access::WriteOnly as i32
+                || request.access == Access::ReadWrite as i32
+                || request.disposition != Disposition::Existing as i32))
+        {
+            match shared.engine.direct_access().mutation().await {
+                Ok(permit) => Some(permit),
+                Err(error) => {
+                    let response = outbound(frame.id, method, Err(error), local, global);
+                    tasks.push(replies.send(std::future::ready(Ok(response))));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         if matches!(
             method,
             Method::Read | Method::Write | Method::Sync | Method::Getattr | Method::Setattr
@@ -533,6 +703,7 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>, mut stopped: watch::Rece
                 shared
                     .file_order
                     .spawn(handle.node.clone(), shared.workers.clone(), move || {
+                        let _mutation = mutation;
                         let result = execute_file(&engine, &handle, request, frame.data);
                         // FileHandle destruction and its core locks stay on this thread.
                         drop(handle);
@@ -548,6 +719,7 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>, mut stopped: watch::Rece
             let permit = shared.workers.clone().acquire_owned().await.unwrap();
             let result = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
+                let _mutation = mutation;
                 let result = execute(&mut current, request, &instance);
                 (current, outbound(frame.id, method, result, local, global))
             })
@@ -569,6 +741,9 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>, mut stopped: watch::Rece
     // a disk write, release its execution permit, or race handle destruction.
     while tasks.next().await.is_some() {}
     drop(replies);
+    if let Some(direct) = session.as_ref().and_then(|session| session.direct.as_ref()) {
+        direct.disconnect();
+    }
     if let Err(error) = tokio::task::spawn_blocking(move || drop(session)).await {
         tracing::error!(%error, "IPC session cleanup failed");
     }
@@ -684,7 +859,12 @@ impl ReplyWriter {
 fn ok(response: Response) -> Reply {
     Ok((response, vec![]))
 }
-fn handle(node: String, file: Option<FileHandle>, readable: bool, writable: bool) -> Handle {
+pub(super) fn handle(
+    node: String,
+    file: Option<FileHandle>,
+    readable: bool,
+    writable: bool,
+) -> Handle {
     Handle {
         node,
         file: file.map(Mutex::new),
@@ -707,11 +887,23 @@ fn execute(session: &mut Session, request: Request, instance: &str) -> Reply {
                 return Err(errno(libc::EPROTONOSUPPORT));
             }
             session.hello = true;
+            if request.local_access
+                && session.options.direct_cache_entries != 0
+                && let Some(direct) = session.engine.direct_access().session(
+                    session.options.max_connections,
+                    Duration::from_secs(session.options.direct_lease_secs),
+                )
+            {
+                response.control_token = direct.token.clone();
+                session.direct = Some(direct);
+            }
             response.instance = instance.to_owned();
             response.protocol_version = u32::from(VERSION);
             response.max_message = MAX_MESSAGE as u32;
             response.max_data = MAX_DATA as u32;
             response.max_inflight = session.options.max_inflight_per_connection as u32;
+            response.max_handles = session.options.max_handles_per_connection as u32;
+            response.max_cache_entries = session.options.direct_cache_entries as u32;
         }
         Method::Attach => {
             if session.attached {
@@ -726,7 +918,13 @@ fn execute(session: &mut Session, request: Request, instance: &str) -> Reply {
             session.attached = true;
         }
         Method::StatAt => {
-            response.attr = Some(attr(&session.resolve(request.parent, &request.name)?))
+            let generation = session.engine.direct_access().grant_generation();
+            let node = session.resolve(request.parent, &request.name)?;
+            response.attr = Some(attr(&node));
+            if let Some(direct) = &session.direct {
+                response.local =
+                    direct.grant(&session.engine, &node.id, generation, node.version)?;
+            }
         }
         Method::Open => {
             let access = Access::try_from(request.access).map_err(|_| errno(libc::EINVAL))?;
@@ -831,15 +1029,21 @@ fn execute(session: &mut Session, request: Request, instance: &str) -> Reply {
                 session.options.global_cursor_memory_mib * 1024 * 1024,
             )?;
             let mut cursor = Cursor::new(budget, session.options.cursor_buffer_kib * 1024);
+            cursor.generation = session.engine.direct_access().grant_generation();
             session.engine.visit_children(&node.id, |name, node| {
                 cursor.append(Entry {
                     name,
                     attr: Some(attr(&node)),
+                    local: None,
                 })
             })?;
             cursor.finish()?;
             let id = session.next;
-            session.next += 1;
+            let next = id
+                .checked_add(1)
+                .filter(|id| id & (1 << 63) == 0)
+                .ok_or_else(|| errno(libc::EMFILE))?;
+            session.next = next;
             session.cursor_bytes += cursor.budget.bytes;
             session.cursors.insert(id, cursor);
             response.handle = id;
@@ -853,10 +1057,27 @@ fn execute(session: &mut Session, request: Request, instance: &str) -> Reply {
             let budget = (request.max_bytes as usize).clamp(4096, MAX_MESSAGE - 128);
             let mut bytes = 0;
             while response.entries.len() < count {
-                let Some(entry) = cursor.next()? else {
+                let Some(mut entry) = cursor.next()? else {
                     break;
                 };
-                let size = entry.encoded_len() + 8;
+                if let (Some(direct), Some(attr)) = (&session.direct, &entry.attr) {
+                    entry.local = direct.grant(
+                        &session.engine,
+                        &attr.node_id,
+                        cursor.generation,
+                        attr.version,
+                    )?;
+                }
+                let mut size = entry.encoded_len() + 8;
+                if size > budget {
+                    // A long backing path must not make a small directory page
+                    // stall forever. The physical mapping is only an optimization.
+                    entry.local = None;
+                    size = entry.encoded_len() + 8;
+                }
+                if size > budget {
+                    return Err(errno(libc::EOVERFLOW));
+                }
                 if size + bytes > budget {
                     cursor.pending = Some(entry);
                     break;
@@ -1148,6 +1369,7 @@ mod tests {
                 cursor.append(Entry {
                     name: format!("entry-{index:04}"),
                     attr: None,
+                    local: None,
                 })?;
             }
             cursor.finish()?;
@@ -1180,6 +1402,7 @@ mod tests {
         cursor.append(Entry {
             name: "buffered".into(),
             attr: None,
+            local: None,
         })?;
         assert!(cursor.finish().is_err());
         Ok(())
@@ -1195,6 +1418,7 @@ mod tests {
         cursor.append(Entry {
             name: "truncated".into(),
             attr: None,
+            local: None,
         })?;
         cursor.finish()?;
         let CursorSource::Disk(reader) = &mut cursor.source else {

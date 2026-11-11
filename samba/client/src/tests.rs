@@ -56,6 +56,7 @@ fn fragmented_reply_at_every_boundary_retains_data_after_transport_drop() {
         entries: vec![pb::Entry {
             name: "entry".into(),
             attr: None,
+            local: None,
         }],
         ..Default::default()
     };
@@ -281,7 +282,8 @@ fn c_header_matches_rust_layout_and_protocol_enums() {
         changes,
         max_entries,
         max_bytes,
-        protocol_version
+        protocol_version,
+        local_access
     );
     layout!(TierEntry, name, attr);
     layout!(
@@ -392,5 +394,61 @@ fn out_of_order_replies_keep_ids_and_ffi_ownership() {
         tier_response_free(first);
         tier_response_free(std::ptr::null_mut());
         tier_transport_free(std::ptr::null_mut());
+    }
+}
+
+#[test]
+fn directory_response_owns_all_entry_attributes_and_optional_times() {
+    let response = pb::Response {
+        entries: (0..256)
+            .map(|i| pb::Entry {
+                name: format!("entry-{i}"),
+                local: None,
+                attr: Some(pb::Attr {
+                    node_id: format!("node-{i}"),
+                    inode: i + 1,
+                    mtime: Some(pb::Timestamp {
+                        seconds: i as i64,
+                        nanos: 7,
+                    }),
+                    btime: (i % 2 == 0).then_some(pb::Timestamp {
+                        seconds: 123,
+                        nanos: 0,
+                    }),
+                    ..Default::default()
+                }),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let owner = ResponseOwner::new(response, Vec::new(), 0).unwrap();
+    assert_eq!(owner.view.n_entries, 256);
+    // C may keep all these views alive until it releases the response owner.
+    unsafe {
+        for (i, entry) in std::slice::from_raw_parts(owner.view.entries, owner.view.n_entries)
+            .iter()
+            .enumerate()
+        {
+            let entry = &**entry;
+            let attr = &*entry.attr;
+            assert_eq!(
+                CStr::from_ptr(entry.name).to_str().unwrap(),
+                format!("entry-{i}")
+            );
+            assert_eq!(
+                CStr::from_ptr(attr.node_id).to_str().unwrap(),
+                format!("node-{i}")
+            );
+            assert_eq!(attr.inode, i as u64 + 1);
+            assert_eq!((*attr.mtime).seconds, i as i64);
+            assert_eq!((*attr.mtime).nanos, 7);
+            assert!(attr.atime.is_null());
+            assert!(attr.ctime.is_null());
+            if i % 2 == 0 {
+                assert_eq!((*attr.btime).seconds, 123);
+            } else {
+                assert!(attr.btime.is_null());
+            }
+        }
     }
 }

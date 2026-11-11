@@ -21,9 +21,13 @@ struct Client {
     stream: UnixStream,
     next: u64,
     root: u64,
+    control_token: String,
 }
 impl Client {
     fn connect(path: &Path) -> Result<Self> {
+        Self::connect_with_local(path, false)
+    }
+    fn connect_with_local(path: &Path, local_access: bool) -> Result<Self> {
         let stream = UnixStream::connect(path)?;
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -31,15 +35,20 @@ impl Client {
             stream,
             next: 1,
             root: 0,
+            control_token: String::new(),
         };
-        client.call(
-            Request {
-                method: Method::Hello as i32,
-                protocol_version: VERSION.into(),
-                ..Default::default()
-            },
-            vec![],
-        )?;
+        client.control_token = client
+            .call(
+                Request {
+                    method: Method::Hello as i32,
+                    protocol_version: VERSION.into(),
+                    local_access,
+                    ..Default::default()
+                },
+                vec![],
+            )?
+            .0
+            .control_token;
         client.root = client
             .call(
                 Request {
@@ -621,6 +630,7 @@ fn attach_rejects_an_unsupported_subdirectory_instead_of_exporting_root() -> Res
         stream,
         next: 1,
         root: 0,
+        control_token: String::new(),
     };
     client.call(
         Request {
@@ -822,6 +832,7 @@ fn configured_single_slot_limits_keep_protocol_and_storage_usable() -> Result<()
         stream: UnixStream::connect(&path)?,
         next: 1,
         root: 0,
+        control_token: String::new(),
     };
     client
         .stream
@@ -923,5 +934,174 @@ fn configured_single_slot_limits_keep_protocol_and_storage_usable() -> Result<()
     assert!(page.eof);
     server.shutdown();
     assert_eq!(engine.get("/limited")?, body);
+    Ok(())
+}
+
+fn direct_control(path: &Path, main: &Client) -> Result<Client> {
+    let stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut control = Client {
+        stream,
+        next: 1,
+        root: 0,
+        control_token: String::new(),
+    };
+    control.call(
+        Request {
+            method: Method::ControlAttach as i32,
+            control_token: main.control_token.clone(),
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    Ok(control)
+}
+
+fn local_mapping(client: &mut Client, name: &str) -> Result<LocalMapping> {
+    client
+        .call(
+            Request {
+                method: Method::StatAt as i32,
+                parent: client.root,
+                name: name.into(),
+                ..Default::default()
+            },
+            vec![],
+        )?
+        .0
+        .local
+        .context("expected local mapping")
+}
+
+#[test]
+fn mapping_revocation_does_not_wait_for_open_read_handle() -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::{ffi::OsStrExt, fs::FileExt};
+    let (temp, engine, _server) = fixture()?;
+    engine.put("/pinned", b"before")?;
+    let path = temp.path().join("tier.sock");
+    let mut reader = Client::connect_with_local(&path, true)?;
+    let mut control = direct_control(&path, &reader)?;
+    let mapping = local_mapping(&mut reader, "pinned")?;
+    let pin = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(std::ffi::OsStr::from_bytes(&mapping.pin_path))?;
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_RDLCK as _;
+    lock.l_whence = libc::SEEK_SET as _;
+    lock.l_start = mapping.pin_offset as _;
+    lock.l_len = 1;
+    assert_eq!(
+        unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_OFD_SETLK, &lock) },
+        0
+    );
+    let file = fs::File::open(std::ffi::OsStr::from_bytes(&mapping.path))?;
+    let mut writer = Client::connect(&path)?;
+    let request = writer.submit(
+        Request {
+            method: Method::Open as i32,
+            parent: writer.root,
+            name: "pinned".into(),
+            access: Access::ReadWrite as i32,
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    let (id, notice, data) = control.receive()?;
+    assert_eq!(id, 0);
+    assert_eq!(notice.cache_epoch, mapping.epoch);
+    assert!(data.is_empty());
+    // A mapping ACK carries no handle registration and does not close the fd.
+    control.call(
+        Request {
+            method: Method::RevokeAck as i32,
+            cache_epoch: mapping.epoch,
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    let (id, response, _) = writer.receive()?;
+    assert_eq!(id, request);
+    assert_eq!(response.error, 0, "{}", response.message);
+    writer.call(
+        Request {
+            method: Method::Write as i32,
+            handle: response.handle,
+            length: 6,
+            ..Default::default()
+        },
+        b"after!".to_vec(),
+    )?;
+    let mut contents = [0; 6];
+    file.read_exact_at(&mut contents, 0)?;
+    assert_eq!(&contents, b"after!");
+    writer.call(
+        Request {
+            method: Method::Close as i32,
+            handle: response.handle,
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    writer.submit(
+        Request {
+            method: Method::Unlink as i32,
+            parent: writer.root,
+            name: "pinned".into(),
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    assert_eq!(writer.receive()?.1.error, libc::EBUSY);
+    drop(file);
+    drop(pin);
+    writer.call(
+        Request {
+            method: Method::Unlink as i32,
+            parent: writer.root,
+            name: "pinned".into(),
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn disconnected_mapping_lease_remains_a_mutation_barrier() -> Result<()> {
+    let options = IpcOptions {
+        direct_lease_secs: 1,
+        ..Default::default()
+    };
+    let (temp, engine, _server) = fixture_with_options(1, &options)?;
+    engine.put("/file", b"content")?;
+    let path = temp.path().join("tier.sock");
+    let mut reader = Client::connect_with_local(&path, true)?;
+    let control = direct_control(&path, &reader)?;
+    let mapping = local_mapping(&mut reader, "file")?;
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) },
+        0
+    );
+    let remaining = mapping
+        .deadline_ns
+        .saturating_sub(now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64);
+    let started = std::time::Instant::now();
+    drop(control);
+    drop(reader);
+    let mut writer = Client::connect(&path)?;
+    writer.call(
+        Request {
+            method: Method::Unlink as i32,
+            parent: writer.root,
+            name: "file".into(),
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    assert!(started.elapsed() >= Duration::from_nanos(remaining.saturating_sub(20_000_000)));
     Ok(())
 }

@@ -283,10 +283,10 @@ export const forms: Record<string, Field[]> = {
     },
     {
       key: "direct_fallback",
-      label: "缓存不足时直写持久化存储",
+      label: "新文件缓存不足时直写持久化存储",
       kind: "checkbox",
       cacheOnly: true,
-      hint: "关闭时，缓存空间不足会导致此次写入失败。",
+      hint: "仅在新文件分配位置时回退。已打开的文件不会中途换盘，磁盘写满时本次写入失败。",
     },
     {
       section: "删除与修复",

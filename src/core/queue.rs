@@ -53,12 +53,15 @@ impl Engine {
         failed: bool,
     ) -> Result<()> {
         let lock = self.file_lock(id);
-        let state = lock.lock();
+        // Leave the due entry intact when foreground I/O owns this state.
+        let Some(state) = lock.try_lock() else {
+            return Ok(());
+        };
         let _namespace = self.inner.namespace.read();
         if let Some(r) = self.kv_get::<Record>(&schema::node(id))?
             && self.live(id)?
         {
-            let delay = if state.writer {
+            let delay = if state.writer || self.try_idle_pin(id)?.is_none() {
                 5
             } else if failed {
                 60

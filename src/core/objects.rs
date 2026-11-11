@@ -41,8 +41,11 @@ impl Engine {
     pub(crate) fn refresh_object_names(&self, id: &str) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
         let lock = self.file_lock(id);
+        let Some(_pin) = self.try_idle_pin(id)? else {
+            return Ok(());
+        };
         let mut state = lock.lock();
-        if state.writer {
+        if state.handles != 0 {
             return Ok(());
         }
         let record = self.record(id)?;

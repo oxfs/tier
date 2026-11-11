@@ -7,6 +7,7 @@ use std::{
     ptr,
 };
 #[repr(C)]
+#[derive(Default)]
 pub struct TierTimestamp {
     pub(crate) seconds: i64,
     pub(crate) nanos: u32,
@@ -58,6 +59,7 @@ pub struct TierRequest {
     pub(crate) max_entries: u32,
     pub(crate) max_bytes: u32,
     pub(crate) protocol_version: u32,
+    pub(crate) local_access: bool,
 }
 #[repr(C)]
 pub struct TierEntry {
@@ -85,14 +87,18 @@ pub struct TierResponse {
     pub(crate) data: *mut u8,
     pub(crate) data_length: usize,
 }
-// Boxed elements keep addresses stable while the owning vectors grow.
+// Each attribute owns its timestamps in one stable allocation.
+struct OwnedAttr {
+    view: TierAttr,
+    timestamps: [TierTimestamp; 4],
+}
+// Boxed attributes keep addresses stable while the owning vector grows.
 #[derive(Default)]
 #[allow(clippy::vec_box)]
 struct Arena {
     pub(crate) strings: Vec<CString>,
-    pub(crate) timestamps: Vec<Box<TierTimestamp>>,
-    pub(crate) attrs: Vec<Box<TierAttr>>,
-    pub(crate) entries: Vec<Box<TierEntry>>,
+    attrs: Vec<Box<OwnedAttr>>,
+    entries: Vec<TierEntry>,
 }
 impl Arena {
     fn string(&mut self, value: String) -> Result<*mut c_char, i32> {
@@ -101,40 +107,48 @@ impl Arena {
         self.strings.push(value);
         Ok(pointer)
     }
-    fn timestamp(&mut self, value: Option<pb::Timestamp>) -> *mut TierTimestamp {
-        let Some(value) = value else {
-            return ptr::null_mut();
-        };
-        let mut value = Box::new(TierTimestamp {
-            seconds: value.seconds,
-            nanos: value.nanos,
-        });
-        let pointer = &mut *value as *mut _;
-        self.timestamps.push(value);
-        pointer
-    }
     fn attr(&mut self, value: Option<pb::Attr>) -> Result<*mut TierAttr, i32> {
         let Some(value) = value else {
             return Ok(ptr::null_mut());
         };
-        let mut value = Box::new(TierAttr {
-            node_id: self.string(value.node_id)?,
-            inode: value.inode,
-            directory: value.directory,
-            size: value.size,
-            allocated: value.allocated,
-            mode: value.mode,
-            uid: value.uid,
-            gid: value.gid,
-            nlink: value.nlink,
-            atime: self.timestamp(value.atime),
-            mtime: self.timestamp(value.mtime),
-            ctime: self.timestamp(value.ctime),
-            btime: self.timestamp(value.btime),
-            version: value.version,
+        let times = [value.atime, value.mtime, value.ctime, value.btime];
+        let mut owned = Box::new(OwnedAttr {
+            view: TierAttr {
+                node_id: self.string(value.node_id)?,
+                inode: value.inode,
+                directory: value.directory,
+                size: value.size,
+                allocated: value.allocated,
+                mode: value.mode,
+                uid: value.uid,
+                gid: value.gid,
+                nlink: value.nlink,
+                atime: ptr::null_mut(),
+                mtime: ptr::null_mut(),
+                ctime: ptr::null_mut(),
+                btime: ptr::null_mut(),
+                version: value.version,
+            },
+            timestamps: std::array::from_fn(|_| TierTimestamp::default()),
         });
-        let pointer = &mut *value as *mut _;
-        self.attrs.push(value);
+        let mut addresses = [ptr::null_mut(); 4];
+        for (index, time) in times.into_iter().enumerate() {
+            if let Some(time) = time {
+                owned.timestamps[index] = TierTimestamp {
+                    seconds: time.seconds,
+                    nanos: time.nanos,
+                };
+                addresses[index] = &mut owned.timestamps[index];
+            }
+        }
+        [
+            owned.view.atime,
+            owned.view.mtime,
+            owned.view.ctime,
+            owned.view.btime,
+        ] = addresses;
+        let pointer = &mut owned.view as *mut _;
+        self.attrs.push(owned);
         Ok(pointer)
     }
 }
@@ -152,16 +166,21 @@ impl ResponseOwner {
         mut data: Vec<u8>,
         data_offset: usize,
     ) -> Result<Box<Self>, i32> {
-        let mut arena = Arena::default();
+        let mut arena = Arena {
+            entries: Vec::with_capacity(response.entries.len()),
+            attrs: Vec::with_capacity(response.entries.len() + 1),
+            strings: Vec::with_capacity(response.entries.len() * 2 + 3),
+        };
         let mut entries = Vec::with_capacity(response.entries.len());
         for entry in response.entries {
-            let mut entry = Box::new(TierEntry {
+            let entry = TierEntry {
                 name: arena.string(entry.name)?,
                 attr: arena.attr(entry.attr)?,
-            });
-            entries.push(&mut *entry as *mut _);
+            };
             arena.entries.push(entry);
         }
+        // Publish entry pointers only after the contiguous storage is complete.
+        entries.extend(arena.entries.iter_mut().map(|entry| entry as *mut _));
         let view = TierResponse {
             error: response.error,
             message: arena.string(response.message)?,
@@ -240,6 +259,8 @@ impl TierRequest {
             max_entries: self.max_entries,
             max_bytes: self.max_bytes,
             protocol_version: self.protocol_version,
+            local_access: self.local_access,
+            ..Default::default()
         })
     }
 }
@@ -282,7 +303,11 @@ pub(crate) unsafe extern "C" fn tier_transport_submit(
             }
             unsafe { std::slice::from_raw_parts(data, length) }
         };
-        transport.submit(unsafe { request.to_proto()? }, data, id)
+        let mut request = unsafe { request.to_proto()? };
+        if request.method == pb::Method::Hello as i32 {
+            request.local_access = transport.local.peer.is_some();
+        }
+        transport.submit(request, data, id)
     })
 }
 #[unsafe(no_mangle)]
@@ -337,5 +362,90 @@ pub(crate) unsafe extern "C" fn tier_transport_set_max_data(
 pub(crate) unsafe extern "C" fn tier_response_free(response: *mut TierResponse) {
     if !response.is_null() {
         drop(unsafe { Box::from_raw(response.cast::<ResponseOwner>()) });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn tier_control_connect(
+    t: *mut TierTransport,
+    path: *const c_char,
+) -> i32 {
+    guard(|| {
+        unsafe { t.as_mut() }
+            .ok_or(libc::EINVAL)?
+            .connect_control(&unsafe { string(path)? })
+    })
+}
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn tier_control_fd(t: *const TierTransport) -> i32 {
+    unsafe { t.as_ref() }.map_or(-1, TierTransport::control_fd)
+}
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn tier_control_wants_write(t: *const TierTransport) -> bool {
+    unsafe { t.as_ref() }.is_some_and(TierTransport::control_writable)
+}
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn tier_local_read(
+    t: *mut TierTransport,
+    handle: u64,
+    offset: u64,
+    length: usize,
+    job: *mut *mut crate::local::ReadJob,
+) -> i32 {
+    guard(|| {
+        let t = unsafe { t.as_mut() }.ok_or(libc::EINVAL)?;
+        let job = unsafe { job.as_mut() }.ok_or(libc::EINVAL)?;
+        *job = ptr::null_mut();
+        if let Some(read) = t.local.read(handle, offset, length)? {
+            *job = Box::into_raw(Box::new(read));
+        }
+        Ok(())
+    })
+}
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn tier_local_read_run(job: *mut crate::local::ReadJob) {
+    if let Some(job) = unsafe { job.as_mut() }
+        && guard(|| {
+            job.run();
+            Ok(())
+        }) != 0
+    {
+        job.error = libc::EIO;
+    }
+}
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn tier_local_read_finish(
+    job: *mut crate::local::ReadJob,
+) -> *mut TierResponse {
+    if job.is_null() {
+        return ptr::null_mut();
+    }
+    let mut job = unsafe { Box::from_raw(job) };
+    let data = std::mem::take(&mut job.data);
+    let response = pb::Response {
+        error: job.error,
+        count: if job.error == 0 { data.len() as u32 } else { 0 },
+        ..Default::default()
+    };
+    ResponseOwner::new(response, data, 0).map_or(ptr::null_mut(), |r| Box::into_raw(r).cast())
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn tier_is_local_handle(t: *const TierTransport, handle: u64) -> bool {
+    unsafe { t.as_ref() }.is_some_and(|t| t.local.contains(handle))
+}
+
+/// Counters are updated only on the owning tevent thread, before read dispatch.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn tier_local_hits(t: *const TierTransport, hits: *mut [u64; 3]) {
+    if let Some(hits) = unsafe { hits.as_mut() } {
+        *hits = unsafe { t.as_ref() }.map_or([0; 3], |t| t.local.hits);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn tier_transport_abort(t: *mut TierTransport, error: i32) {
+    if let Some(t) = unsafe { t.as_mut() } {
+        t.abort(error);
     }
 }

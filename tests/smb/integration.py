@@ -36,6 +36,43 @@ class ConnectedTest(unittest.TestCase):
 
 
 class SMBTests(ConnectedTest):
+    def test_open_reader_pins_placement_without_blocking_in_place_writes(self):
+        self.env.write("pinned-before", b"before")
+        original = list((self.env.root / "objects").rglob("*--pinned-before"))
+        self.assertEqual(len(original), 1)
+        self.assertIn("pinned-before", smbclient.listdir(self.env.base, **self.env.config))
+        with smbclient.open_file(
+            self.env.path("pinned-before"),
+            "rb",
+            buffering=0,
+            share_access="rwd",
+            **self.env.config,
+        ) as reader:
+            smbclient.rename(
+                self.env.path("pinned-before"), self.env.path("pinned-after"), **self.env.config
+            )
+            self.env.action("repair", {})
+            self.assertTrue(original[0].exists())
+            writer_options = dict(self.env.config, connection_cache={})
+            try:
+                with smbclient.open_file(
+                    self.env.path("pinned-after"),
+                    "r+b",
+                    buffering=0,
+                    share_access="rwd",
+                    **writer_options,
+                ) as writer:
+                    writer.write(b"after!")
+                    writer.flush()
+                self.assertEqual(reader.read(), b"after!")
+            finally:
+                smbclient.reset_connection_cache(
+                    connection_cache=writer_options["connection_cache"]
+                )
+        self.env.action("repair", {})
+        self.assertFalse(original[0].exists())
+        self.assertEqual(self.env.read("pinned-after"), b"after!")
+
     def test_physical_names_and_mapping_export(self):
         self.env.write("physical-before.txt", b"portable contents")
         initial = list((self.env.root / "objects").rglob("*--physical-before.txt"))
@@ -369,21 +406,29 @@ class SMBTests(ConnectedTest):
 
 class ShutdownTests(ConnectedTest):
     def test_backend_death_and_graceful_shutdown(self):
-        # A killed backend invalidates old handles; a fresh tree connection recovers.
+        # Pinned direct readers survive backend death; RPC writers do not.
         self.env.write("durable", b"survives daemon restart")
+        self.env.write("rpc-only", b"writer requires backend")
+        remote = smbclient.open_file(
+            self.env.path("rpc-only"), "r+b", buffering=0, share_access="rwd", **self.env.config
+        )
+        self.assertIn("durable", smbclient.listdir(self.env.base, **self.env.config))
+        smbclient.stat(self.env.path("durable"), **self.env.config)
         old = smbclient.open_file(
             self.env.path("durable"), "rb", buffering=0, share_access="rwd", **self.env.config
         )
         os.kill(int(os.environ["TIER_TEST_PID"]), signal.SIGKILL)
         time.sleep(0.2)
+        self.assertEqual(old.read(), b"survives daemon restart")
+        old.close()
         try:
-            old.read(1)
+            remote.write(b"must fail")
         except (OSError, SMBResponseException):
             pass
         else:
-            raise AssertionError("old handle survived backend death")
+            raise AssertionError("RPC writer survived backend death")
         try:
-            old.close()
+            remote.close()
         except (OSError, SMBResponseException):
             pass
         try:

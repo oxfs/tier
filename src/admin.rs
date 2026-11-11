@@ -167,6 +167,7 @@ async fn check_origin(State(addr): State<SocketAddr>, request: Request, next: Ne
 
 async fn blocking(
     backend: Backend,
+    changes_files: bool,
     gate: Option<Arc<tokio::sync::Mutex<()>>>,
     operation: impl FnOnce(&Backend) -> Result<Value> + Send + 'static,
 ) -> Response {
@@ -181,8 +182,16 @@ async fn blocking(
         Some(gate) => Some(gate.lock_owned().await),
         None => None,
     };
+    let mutation = if changes_files {
+        match backend.engine.direct_access().mutation().await {
+            Ok(permit) => Some(permit),
+            Err(error) => return bad_request(error.to_string()),
+        }
+    } else {
+        None
+    };
     match tokio::task::spawn_blocking(move || {
-        let (_permit, _maintenance) = (permit, maintenance);
+        let (_permit, _maintenance, _mutation) = (permit, maintenance, mutation);
         operation(&backend)
     })
     .await
@@ -204,7 +213,7 @@ struct TrashQuery {
 }
 
 async fn read_trash(State(backend): State<Backend>, Query(query): Query<TrashQuery>) -> Response {
-    blocking(backend, None, move |backend| {
+    blocking(backend, false, None, move |backend| {
         backend
             .engine
             .trash_page(query.page.unwrap_or(1), query.page_size.unwrap_or(25))
@@ -213,7 +222,7 @@ async fn read_trash(State(backend): State<Backend>, Query(query): Query<TrashQue
 }
 
 async fn read_state(State(backend): State<Backend>) -> Response {
-    blocking(backend, None, |backend| backend.engine.state()).await
+    blocking(backend, false, None, |backend| backend.engine.state()).await
 }
 async fn execute(
     State(backend): State<Backend>,
@@ -226,7 +235,17 @@ async fn execute(
                 Command::Backup { kind } => Some(backend.maintenance.backup_gate(*kind)),
                 _ => None,
             };
-            blocking(backend, gate, move |backend| command.run(backend)).await
+            let changes_files = !matches!(
+                command,
+                Command::Backup { .. }
+                    | Command::BackupSchedule { .. }
+                    | Command::Inspect { .. }
+                    | Command::Export { .. }
+            );
+            blocking(backend, changes_files, gate, move |backend| {
+                command.run(backend)
+            })
+            .await
         }
         Err(error) => (error.status(), Json(json!({"error":error.body_text()}))).into_response(),
     }
@@ -328,7 +347,7 @@ mod tests {
             };
             let (started, ready) = tokio::sync::oneshot::channel();
             let (release, released) = std::sync::mpsc::channel();
-            let first = tokio::spawn(blocking(backend.clone(), None, move |_| {
+            let first = tokio::spawn(blocking(backend.clone(), false, None, move |_| {
                 let _ = started.send(());
                 released.recv()?;
                 Ok(json!({}))
@@ -337,7 +356,7 @@ mod tests {
             // Fill the configured request limit while the sole blocking thread
             // is busy; further work is rejected rather than queued forever.
             let queued = backend.limiter.clone().acquire_many_owned(2).await?;
-            let rejected = blocking(backend, None, |_| Ok(json!({}))).await;
+            let rejected = blocking(backend, false, None, |_| Ok(json!({}))).await;
             assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
             drop(queued);
             let mut shutdown = tokio::spawn(server.shutdown());

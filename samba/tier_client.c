@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "includes.h"
 #include "tier_client.h"
+#include "smbd/smbd.h"
+#include "lib/pthreadpool/pthreadpool_tevent.h"
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -27,12 +29,14 @@ struct tier_call {
 	TierMethod method;
 	uint64_t id;
 	TierResponse *response;
+	TierReadJob *local_job;
 	int error;
 	bool done, deferred;
 };
 struct tier_client {
 	int fd;
-	struct tevent_fd *fde;
+	struct tevent_fd *fde, *control_fde;
+	struct pthreadpool_tevent *pool;
 	struct tevent_context *ev;
 	struct tier_call *calls;
 	uint64_t next_id;
@@ -43,6 +47,9 @@ struct tier_client {
 	bool closing;
 	TierTransport *transport;
 };
+static void pump(struct tier_client *c, bool writable);
+static int poll_client(struct tier_client *c);
+
 static void interest(struct tier_client *c)
 {
 	uint16_t flags = TEVENT_FD_READ;
@@ -50,6 +57,11 @@ static void interest(struct tier_client *c)
 		flags |= TEVENT_FD_WRITE;
 	if (c->fde)
 		tevent_fd_set_flags(c->fde, c->error ? 0 : flags);
+	flags = TEVENT_FD_READ;
+	if (c->transport && tier_control_wants_write(c->transport))
+		flags |= TEVENT_FD_WRITE;
+	if (c->control_fde)
+		tevent_fd_set_flags(c->control_fde, c->error ? 0 : flags);
 }
 static void finish(struct tier_call *p, int error)
 {
@@ -83,12 +95,13 @@ static void fail(struct tier_client *c, int error)
 		shutdown(c->fd, SHUT_RDWR);
 	while (c->calls)
 		finish(c->calls, c->error);
-	tier_transport_free(c->transport);
-	c->transport = NULL;
 	interest(c);
+	tier_transport_abort(c->transport, c->error);
 }
 static int call_destroy(struct tier_call *p)
 {
+	if (p->local_job)
+		return -1;
 	if (p->owner)
 		p->owner->call = NULL;
 	if (p->response)
@@ -116,8 +129,16 @@ static void call_timeout(struct tevent_context *ev, struct tevent_timer *timer,
 }
 static int client_destroy(struct tier_client *c)
 {
+	uint64_t hits[3];
+	tier_local_hits(c->transport, &hits);
+	if (hits[0] || hits[1] || hits[2])
+		DBG_INFO("tier local access: stat=%llu open=%llu read=%llu\n",
+			 (unsigned long long)hits[0], (unsigned long long)hits[1],
+			 (unsigned long long)hits[2]);
 	c->closing = true;
 	fail(c, ECONNRESET);
+	tier_transport_free(c->transport);
+	c->transport = NULL;
 	if (c->fd >= 0)
 		close(c->fd);
 	return 0;
@@ -127,9 +148,7 @@ static void pump(struct tier_client *c, bool writable)
 	TierResponse *response;
 	uint64_t id;
 	int error;
-	if (c->error)
-		return;
-	error = tier_transport_pump(c->transport, writable);
+	error = c->error ? 0 : tier_transport_pump(c->transport, writable);
 	/* A peer may close after its final reply. Deliver complete responses before
 	 * failing the requests that did not receive one. */
 	while ((response = tier_transport_next(c->transport, &id)) != NULL) {
@@ -161,13 +180,14 @@ static void socket_event(struct tevent_context *ev, struct tevent_fd *fde, uint1
 {
 	pump(data, flags & TEVENT_FD_WRITE);
 }
-/* Poll only this IPC connection; entering tevent here would reenter Samba. */
+/* Service both IPC channels without reentering Samba. */
 static int poll_client(struct tier_client *c)
 {
-	struct pollfd fd = {.fd = c->fd, .events = POLLIN};
+	struct pollfd fds[2] = {{.fd = c->fd, .events = POLLIN},
+				{.fd = tier_control_fd(c->transport), .events = POLLIN}};
 	struct tier_call *q;
 	struct timespec now;
-	int64_t remaining = INT64_MAX;
+	int64_t remaining = TIER_TIMEOUT_SECONDS * 1000;
 	int ret;
 	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
 		fail(c, errno);
@@ -179,20 +199,47 @@ static int poll_client(struct tier_client *c)
 		remaining = MIN(remaining, deadline);
 	}
 	if (tier_transport_wants_write(c->transport))
-		fd.events |= POLLOUT;
+		fds[0].events |= POLLOUT;
+	if (tier_control_wants_write(c->transport))
+		fds[1].events |= POLLOUT;
 	if (remaining <= 0) {
 		fail(c, ETIMEDOUT);
 		return -1;
 	}
-	ret = poll(&fd, 1, (int)MIN(remaining, INT_MAX));
+	ret = poll(fds, 2, (int)MIN(remaining, INT_MAX));
 	if (ret < 0 && errno == EINTR)
 		return 0;
-	if (ret <= 0) {
-		fail(c, ret ? errno : ETIMEDOUT);
+	if (ret < 0) {
+		fail(c, errno);
 		return -1;
 	}
-	pump(c, fd.revents & POLLOUT);
+	pump(c, fds[0].revents & POLLOUT);
 	return c->error ? -1 : 0;
+}
+/* Samba owns the disk worker pool. Rust owns the job and read buffer. */
+static void local_read_run(void *data)
+{
+	struct tier_call *p = data;
+	tier_local_read_run(p->local_job);
+}
+static void local_read_done(struct tevent_req *subreq)
+{
+	struct tier_call *p = tevent_req_callback_data(subreq, struct tier_call);
+	int error = pthreadpool_tevent_job_recv(subreq);
+	TierResponse *response;
+	TALLOC_FREE(subreq);
+	response = tier_local_read_finish(p->local_job);
+	p->local_job = NULL;
+	if (p->done) {
+		tier_response_free(response);
+		if (!p->owner)
+			TALLOC_FREE(p);
+		return;
+	}
+	p->response = response;
+	struct tier_client *c = p->client;
+	finish(p, error ? error : (response ? 0 : ENOMEM));
+	pump(c, true);
 }
 struct tier_call *tier_submit(TALLOC_CTX *ctx, struct tier_client *c,
 			      const TierRequest *request, const void *data, size_t length,
@@ -205,7 +252,7 @@ struct tier_call *tier_submit(TALLOC_CTX *ctx, struct tier_client *c,
 		if (poll_client(c))
 			break;
 	}
-	if (c->error) {
+	if (c->error && !tier_is_local_handle(c->transport, request->handle)) {
 		errno = c->error;
 		return NULL;
 	}
@@ -252,7 +299,30 @@ struct tier_call *tier_submit(TALLOC_CTX *ctx, struct tier_client *c,
 		errno = ENOMEM;
 		return NULL;
 	}
-	error = tier_transport_submit(c->transport, request, data, length, p->id);
+	if (async && request->method == TIER_METHOD_READ) {
+		do {
+			error = tier_local_read(c->transport, request->handle,
+						request->offset, request->length,
+						&p->local_job);
+			if (error == EAGAIN && poll_client(c))
+				error = c->error;
+		} while (error == EAGAIN);
+	} else {
+		error = 0;
+	}
+	if (!error && !p->local_job) {
+		do {
+			/* Physical paths come only from authenticated Tier grants. Samba
+			 * already checks logical access; backing objects belong to Tier.
+			 */
+			become_root();
+			error = tier_transport_submit(c->transport, request, data, length,
+						      p->id);
+			unbecome_root();
+			if (error == EAGAIN && poll_client(c))
+				error = c->error;
+		} while (error == EAGAIN);
+	}
 	if (error) {
 		TALLOC_FREE(p->owner);
 		TALLOC_FREE(p);
@@ -261,6 +331,20 @@ struct tier_call *tier_submit(TALLOC_CTX *ctx, struct tier_client *c,
 	}
 	DLIST_ADD_END(c->calls, p);
 	c->count++;
+	if (p->local_job) {
+		struct tevent_req *job =
+		    pthreadpool_tevent_job_send(p, c->ev, c->pool, local_read_run, p);
+		if (!job) {
+			tier_response_free(tier_local_read_finish(p->local_job));
+			p->local_job = NULL;
+			finish(p, ENOMEM);
+		} else {
+			tevent_req_set_callback(job, local_read_done, p);
+		}
+	} else {
+		/* Cached replies have no future socket event to wake the dispatcher. */
+		pump(c, true);
+	}
 	interest(c);
 	return p;
 }
@@ -317,6 +401,16 @@ int tier_defer_close(struct tier_client *c, uint64_t handle)
 	p = tier_submit(c, c, &request, NULL, 0, NULL);
 	if (!p)
 		return -1;
+	if (p->done) {
+		int error =
+		    p->error ? p->error : (p->response ? p->response->error : EIO);
+		TALLOC_FREE(p->owner);
+		if (error) {
+			errno = error;
+			return -1;
+		}
+		return 0;
+	}
 	p->deferred = true;
 	c->deferred++;
 	/* The connection retains the call and any unsent frame until its reply.
@@ -325,7 +419,7 @@ int tier_defer_close(struct tier_client *c, uint64_t handle)
 	return 0;
 }
 struct tier_client *tier_client_connect(TALLOC_CTX *ctx, struct tevent_context *ev,
-					const char *path)
+					const char *path, struct pthreadpool_tevent *pool)
 {
 	struct sockaddr_un addr = {.sun_family = AF_UNIX};
 	struct tier_client *c;
@@ -343,6 +437,7 @@ struct tier_client *tier_client_connect(TALLOC_CTX *ctx, struct tevent_context *
 	}
 	c->fd = -1;
 	c->ev = ev;
+	c->pool = pool;
 	c->max_data = TIER_DATA_MAX;
 	c->max_inflight = TIER_INFLIGHT_MAX;
 	talloc_set_destructor(c, client_destroy);
@@ -379,6 +474,21 @@ struct tier_client *tier_client_connect(TALLOC_CTX *ctx, struct tevent_context *
 	tier_transport_set_max_data(c->transport, c->max_data);
 	c->max_inflight = MIN(response->max_inflight, TIER_INFLIGHT_MAX);
 	TALLOC_FREE(tmp);
+	int error = tier_control_connect(c->transport, path);
+	if (error) {
+		errno = error;
+		goto error;
+	}
+	int control_fd = tier_control_fd(c->transport);
+	if (control_fd >= 0) {
+		c->control_fde =
+		    tevent_add_fd(ev, c, control_fd, TEVENT_FD_READ, socket_event, c);
+		if (!c->control_fde) {
+			errno = ENOMEM;
+			goto error;
+		}
+		interest(c);
+	}
 	return c;
 error: {
 	int saved = errno;

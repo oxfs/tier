@@ -206,10 +206,15 @@ async fn background(
         if *stopped.borrow() {
             return Ok(());
         }
+        let mutation = if kind.is_none() {
+            Some(engine.direct_access().mutation().await?)
+        } else {
+            None
+        };
         let engine = engine.clone();
         let maintenance = maintenance.clone();
         tokio::task::spawn_blocking(move || {
-            let (_permit, _gate) = (permit, gate);
+            let (_permit, _gate, _mutation) = (permit, gate, mutation);
             match kind {
                 None => maintenance.tick(),
                 Some(kind) => {

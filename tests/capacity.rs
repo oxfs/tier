@@ -17,7 +17,7 @@ fn full_cache_uses_single_primary_fallback_and_reclaims_verified_copies() -> Res
         write_cache: vec!["cache".into()],
         persistent_storage: vec!["disk".into()],
         persistent_copies: 1,
-        low_water: 85,
+        low_water: 0,
         high_water: 90,
         ..Policy::default()
     };
@@ -28,8 +28,11 @@ fn full_cache_uses_single_primary_fallback_and_reclaims_verified_copies() -> Res
     assert_eq!(db.get("/first")?, blob);
     policy.direct_fallback = true;
     db.set_policy("/", &policy)?;
-    db.put("/second", &blob)?;
-    assert_eq!(db.get("/second")?, blob);
+    // Existing files never change inode during overwrite; fallback chooses a
+    // target only when allocating a new file.
+    assert!(db.put("/second", &blob).is_err());
+    db.put("/fallback", &blob)?;
+    assert_eq!(db.get("/fallback")?, blob);
     db.reconcile()?;
     db.state()?;
     policy.direct_fallback = false;
