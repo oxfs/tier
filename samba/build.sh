@@ -51,7 +51,7 @@ from waflib import Utils
 from waflib.TaskGen import feature, after_method
 
 @feature('tier_rust_client')
-@after_method('apply_link')
+@after_method('apply_link', 'propagate_uselib_vars')
 def link_tier_rust_client(self):
     archive = self.path.find_resource('libtier_client.a')
     self.link_task.dep_nodes.append(archive)
