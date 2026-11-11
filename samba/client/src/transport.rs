@@ -31,14 +31,13 @@ pub struct TierTransport {
 }
 impl TierTransport {
     pub(crate) fn abort(&mut self, error: i32) {
+        self.detach_control();
         self.error = error;
         self.outgoing.clear();
         self.pending.clear();
         self.ready.clear();
         self.body = Vec::new();
-        self.control = None;
         self.control_token.clear();
-        self.local.disconnected();
     }
     pub(crate) fn new(fd: i32) -> Self {
         Self {

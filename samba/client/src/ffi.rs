@@ -278,7 +278,8 @@ pub(crate) extern "C" fn tier_transport_new(fd: i32) -> *mut TierTransport {
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn tier_transport_free(transport: *mut TierTransport) {
     if !transport.is_null() {
-        drop(unsafe { Box::from_raw(transport) });
+        let mut transport = unsafe { Box::from_raw(transport) };
+        transport.abort(libc::ECONNRESET);
     }
 }
 #[unsafe(no_mangle)]
@@ -448,4 +449,9 @@ pub(crate) unsafe extern "C" fn tier_transport_abort(t: *mut TierTransport, erro
     if let Some(t) = unsafe { t.as_mut() } {
         t.abort(error);
     }
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn tier_control_pump(t: *mut TierTransport) -> i32 {
+    guard(|| unsafe { t.as_mut() }.ok_or(libc::EINVAL)?.pump_control())
 }

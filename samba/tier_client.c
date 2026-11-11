@@ -34,6 +34,7 @@ struct tier_call {
 	bool done, deferred;
 };
 struct tier_client {
+	struct tier_client *prev, *next;
 	int fd;
 	struct tevent_fd *fde, *control_fde;
 	struct pthreadpool_tevent *pool;
@@ -47,6 +48,7 @@ struct tier_client {
 	bool closing;
 	TierTransport *transport;
 };
+static struct tier_client *clients;
 static void pump(struct tier_client *c, bool writable);
 static int poll_client(struct tier_client *c);
 
@@ -96,6 +98,7 @@ static void fail(struct tier_client *c, int error)
 	while (c->calls)
 		finish(c->calls, c->error);
 	interest(c);
+	TALLOC_FREE(c->control_fde);
 	tier_transport_abort(c->transport, c->error);
 }
 static int call_destroy(struct tier_call *p)
@@ -136,7 +139,9 @@ static int client_destroy(struct tier_client *c)
 			 (unsigned long long)hits[0], (unsigned long long)hits[1],
 			 (unsigned long long)hits[2]);
 	c->closing = true;
+	DLIST_REMOVE(clients, c);
 	fail(c, ECONNRESET);
+	TALLOC_FREE(c->fde);
 	tier_transport_free(c->transport);
 	c->transport = NULL;
 	if (c->fd >= 0)
@@ -180,11 +185,15 @@ static void socket_event(struct tevent_context *ev, struct tevent_fd *fde, uint1
 {
 	pump(data, flags & TEVENT_FD_WRITE);
 }
-/* Service both IPC channels without reentering Samba. */
+/* A synchronous call blocks this smbd's event loop, including other tree
+ * connections. Keep every Tier control channel serviceable without entering
+ * tevent or dispatching another SMB request. */
 static int poll_client(struct tier_client *c)
 {
-	struct pollfd fds[2] = {{.fd = c->fd, .events = POLLIN},
-				{.fd = tier_control_fd(c->transport), .events = POLLIN}};
+	struct pollfd local_fds[8], *fds = local_fds;
+	struct tier_client *local_owners[8], **owners = local_owners, *other;
+	TALLOC_CTX *tmp = NULL;
+	size_t count = 1, index;
 	struct tier_call *q;
 	struct timespec now;
 	int64_t remaining = TIER_TIMEOUT_SECONDS * 1000;
@@ -193,6 +202,32 @@ static int poll_client(struct tier_client *c)
 		fail(c, errno);
 		return -1;
 	}
+	for (other = clients; other; other = other->next)
+		if (!other->error && tier_control_fd(other->transport) >= 0)
+			count++;
+	if (count > ARRAY_SIZE(local_fds)) {
+		tmp = talloc_new(c);
+		if (tmp) {
+			fds = talloc_array(tmp, struct pollfd, count);
+			owners = talloc_array(tmp, struct tier_client *, count);
+		}
+		if (!tmp || !fds || !owners) {
+			TALLOC_FREE(tmp);
+			fail(c, ENOMEM);
+			return -1;
+		}
+	}
+	fds[0] = (struct pollfd){.fd = c->fd, .events = POLLIN};
+	index = 1;
+	for (other = clients; other; other = other->next) {
+		int fd = tier_control_fd(other->transport);
+		if (other->error || fd < 0)
+			continue;
+		fds[index] = (struct pollfd){.fd = fd, .events = POLLIN};
+		if (tier_control_wants_write(other->transport))
+			fds[index].events |= POLLOUT;
+		owners[index++] = other;
+	}
 	for (q = c->calls; q; q = q->next) {
 		int64_t deadline = (q->deadline.tv_sec - now.tv_sec) * 1000 +
 				   (q->deadline.tv_nsec - now.tv_nsec) / 1000000;
@@ -200,20 +235,35 @@ static int poll_client(struct tier_client *c)
 	}
 	if (tier_transport_wants_write(c->transport))
 		fds[0].events |= POLLOUT;
-	if (tier_control_wants_write(c->transport))
-		fds[1].events |= POLLOUT;
 	if (remaining <= 0) {
+		TALLOC_FREE(tmp);
 		fail(c, ETIMEDOUT);
 		return -1;
 	}
-	ret = poll(fds, 2, (int)MIN(remaining, INT_MAX));
-	if (ret < 0 && errno == EINTR)
+	ret = poll(fds, count, (int)MIN(remaining, INT_MAX));
+	if (ret < 0 && errno == EINTR) {
+		TALLOC_FREE(tmp);
 		return 0;
+	}
 	if (ret < 0) {
-		fail(c, errno);
+		int error = errno;
+		TALLOC_FREE(tmp);
+		fail(c, error);
 		return -1;
 	}
+	for (index = 1; index < count; index++) {
+		int error;
+		other = owners[index];
+		if (other == c || !fds[index].revents || other->error)
+			continue;
+		error = tier_control_pump(other->transport);
+		if (error)
+			fail(other, error);
+		else
+			interest(other);
+	}
 	pump(c, fds[0].revents & POLLOUT);
+	TALLOC_FREE(tmp);
 	return c->error ? -1 : 0;
 }
 /* Samba owns the disk worker pool. Rust owns the job and read buffer. */
@@ -440,6 +490,7 @@ struct tier_client *tier_client_connect(TALLOC_CTX *ctx, struct tevent_context *
 	c->pool = pool;
 	c->max_data = TIER_DATA_MAX;
 	c->max_inflight = TIER_INFLIGHT_MAX;
+	DLIST_ADD(clients, c);
 	talloc_set_destructor(c, client_destroy);
 	c->fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (c->fd == -1)

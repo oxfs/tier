@@ -108,6 +108,7 @@ void tier_transport_set_max_data(TierTransport *, uint32_t);
 void tier_response_free(TierResponse *);
 typedef struct ReadJob TierReadJob;
 int tier_control_connect(TierTransport *, const char *);
+int tier_control_pump(TierTransport *);
 bool tier_is_local_handle(const TierTransport *, uint64_t);
 void tier_local_hits(const TierTransport *, uint64_t (*)[3]);
 void tier_transport_abort(TierTransport *, int);

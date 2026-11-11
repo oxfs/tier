@@ -105,14 +105,11 @@ impl DirectAccess {
                     .await,
                     Ok(Ok(()))
                 ) {
-                    {
-                        let _state = session.state.lock().unwrap();
-                        session.fenced.store(true, Ordering::Release);
-                    }
                     // On disconnect, wait out the original grant deadline. A client
                     // must reject a result completed after this deadline too.
                     let remaining = Duration::from_nanos(deadline.saturating_sub(monotonic_ns()));
                     tokio::time::sleep(remaining).await;
+                    session.retire_expired();
                 }
             }
             self.mutations.fetch_add(1, Ordering::AcqRel);
@@ -137,7 +134,7 @@ struct SessionState {
     epoch: u64,
     deadline: u64,
     control: Option<mpsc::UnboundedSender<Revocation>>,
-    revocation: Option<watch::Receiver<bool>>,
+    revocation: Option<watch::Sender<bool>>,
 }
 pub(super) struct DirectSession {
     pub token: String,
@@ -181,6 +178,31 @@ impl DirectSession {
     pub fn epoch(&self) -> u64 {
         self.state.lock().unwrap().epoch
     }
+    fn retire(&self, state: &mut SessionState) {
+        state.deadline = 0;
+        if let Some(done) = state.revocation.take() {
+            done.send_replace(true);
+        }
+        state.epoch = state.epoch.saturating_add(1);
+        if state.epoch == u64::MAX {
+            self.fenced.store(true, Ordering::Release);
+        }
+    }
+    fn retire_expired(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.deadline != 0 && monotonic_ns() >= state.deadline {
+            self.retire(&mut state);
+        }
+    }
+    pub fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        self.fenced.store(true, Ordering::Release);
+        self.retire(&mut state);
+        drop(state);
+        if let Some(coordinator) = self.coordinator.upgrade() {
+            coordinator.sessions.lock().unwrap().remove(&self.token);
+        }
+    }
     pub fn grant(
         &self,
         engine: &Engine,
@@ -217,9 +239,13 @@ impl DirectSession {
         {
             return Ok(None);
         }
-        // The client retires an expired mapping epoch before obtaining another.
-        // Open descriptors are independently pinned and do not need renewal.
+        // Every new stat/open checks its deadline before and after local I/O.
+        // An expired epoch can therefore retire without disconnecting an idle
+        // healthy client. Open descriptors retain independent kernel pins.
         if state.deadline != 0 && monotonic_ns() >= state.deadline {
+            self.retire(&mut state);
+        }
+        if !self.healthy() || state.revocation.is_some() {
             return Ok(None);
         }
         let deadline =
@@ -240,11 +266,15 @@ impl DirectSession {
         if state.deadline == 0 {
             return None;
         }
-        if let Some(receive) = &state.revocation {
-            return Some((self.clone(), state.deadline, receive.clone()));
+        if monotonic_ns() >= state.deadline {
+            self.retire(&mut state);
+            return None;
+        }
+        if let Some(done) = &state.revocation {
+            return Some((self.clone(), state.deadline, done.subscribe()));
         }
         let (done, receive) = watch::channel(false);
-        state.revocation = Some(receive.clone());
+        state.revocation = Some(done.clone());
         if let Some(control) = &state.control {
             let _ = control.send(Revocation {
                 epoch: state.epoch,
@@ -256,15 +286,16 @@ impl DirectSession {
     pub fn acknowledge(&self, epoch: u64) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         ensure!(
-            self.healthy() && epoch == state.epoch,
-            "invalid direct-access epoch"
+            self.healthy() && epoch != 0 && epoch <= state.epoch,
+            "invalid direct-access epoch: received={epoch}, current={}, fenced={}",
+            state.epoch,
+            !self.healthy()
         );
-        state.deadline = 0;
-        state.revocation = None;
-        state.epoch = state
-            .epoch
-            .checked_add(1)
-            .ok_or_else(|| super::server::errno(libc::EOVERFLOW))?;
+        // A notification may already be on the wire when its lease expires.
+        // Its delayed ACK must not retire grants from a newer epoch.
+        if epoch == state.epoch {
+            self.retire(&mut state);
+        }
         Ok(())
     }
 }
@@ -359,10 +390,38 @@ mod tests {
         session.acknowledge(1)?;
         let deadline = monotonic_ns() + 5_000_000_000;
         session.state.lock().unwrap().deadline = deadline;
-        assert!(session.acknowledge(1).is_err());
+        session.acknowledge(1)?;
         assert_eq!(session.epoch(), 2);
         assert_eq!(session.state.lock().unwrap().deadline, deadline);
+        assert!(session.acknowledge(3).is_err());
         session.acknowledge(2)?;
+        session.disconnect();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_mapping_does_not_disconnect_a_healthy_idle_client() -> Result<()> {
+        let coordinator = Arc::new(DirectAccess::new());
+        let (session, mut notifications) = granted(&coordinator, Duration::from_secs(5));
+        session.state.lock().unwrap().deadline = monotonic_ns().saturating_sub(1);
+        let permit = tokio::time::timeout(Duration::from_secs(1), coordinator.mutation()).await??;
+        assert!(session.healthy());
+        assert_eq!(session.epoch(), 2);
+        assert!(notifications.try_recv().is_err());
+        drop(permit);
+        session.disconnect();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graceful_release_wakes_revocation_before_notification_is_received() -> Result<()> {
+        let coordinator = Arc::new(DirectAccess::new());
+        let (session, _notifications) = granted(&coordinator, Duration::from_secs(5));
+        let (_, _, mut completion) = session.revoke().unwrap();
+        session.release();
+        tokio::time::timeout(Duration::from_secs(1), completion.wait_for(|done| *done)).await??;
+        assert!(!session.healthy());
+        assert_eq!(session.state.lock().unwrap().deadline, 0);
         session.disconnect();
         Ok(())
     }

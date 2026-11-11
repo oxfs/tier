@@ -1,7 +1,7 @@
 //! Connection-scoped physical mappings. A revoked grant is never reused.
 use crate::{MAX_DATA, pb};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     fs::File,
     os::fd::{AsRawFd, FromRawFd},
     os::unix::{
@@ -27,12 +27,12 @@ struct Handle {
 pub(crate) struct Local {
     pub(crate) peer: Option<Arc<File>>,
     pub(crate) hits: [u64; 3],
-    cache: HashMap<(u64, String), Mapping>,
-    order: BTreeMap<u64, (u64, String)>,
-    normal: HashSet<u64>,
+    cache: HashMap<(String, String), Mapping>,
+    order: BTreeMap<u64, (String, String)>,
+    normal: HashMap<u64, String>,
     handle_limit: usize,
     handles: HashMap<u64, Handle>,
-    cursors: HashMap<u64, u64>,
+    cursors: HashMap<u64, String>,
     capacity: usize,
     tick: u64,
     next_id: u64,
@@ -115,7 +115,7 @@ impl Local {
             hits: [0; 3],
             cache: HashMap::new(),
             order: BTreeMap::new(),
-            normal: HashSet::new(),
+            normal: HashMap::new(),
             handle_limit: 4096,
             handles: HashMap::new(),
             cursors: HashMap::new(),
@@ -141,16 +141,20 @@ impl Local {
                 self.handle_limit = response.max_handles as usize;
             }
         }
-        if request.method == pb::Method::Open as i32 || request.method == pb::Method::Attach as i32
+        if (request.method == pb::Method::Open as i32
+            || request.method == pb::Method::Attach as i32)
+            && let Some(attr) = &response.attr
         {
-            self.normal.insert(response.handle);
+            self.normal.insert(response.handle, attr.node_id.clone());
         }
         if request.method == pb::Method::Close as i32 || request.method == pb::Method::Detach as i32
         {
             self.normal.remove(&request.handle);
         }
-        if request.method == pb::Method::Opendir as i32 {
-            self.cursors.insert(response.handle, request.handle);
+        if request.method == pb::Method::Opendir as i32
+            && let Some(node) = self.normal.get(&request.handle)
+        {
+            self.cursors.insert(response.handle, node.clone());
         }
         if request.method == pb::Method::Closedir as i32 {
             self.cursors.remove(&request.handle);
@@ -162,16 +166,21 @@ impl Local {
             self.insert(request.parent, &request.name, local, attr);
         }
         if request.method == pb::Method::Readdir as i32
-            && let Some(parent) = self.cursors.get(&request.handle).copied()
+            && let Some(parent) = self.cursors.get(&request.handle).cloned()
         {
             for entry in &response.entries {
                 if let (Some(local), Some(attr)) = (&entry.local, &entry.attr) {
-                    self.insert(parent, &entry.name, local, attr);
+                    self.insert_node(&parent, &entry.name, local, attr);
                 }
             }
         }
     }
     fn insert(&mut self, parent: u64, name: &str, local: &pb::LocalMapping, attr: &pb::Attr) {
+        if let Some(parent) = self.normal.get(&parent).cloned() {
+            self.insert_node(&parent, name, local, attr);
+        }
+    }
+    fn insert_node(&mut self, parent: &str, name: &str, local: &pb::LocalMapping, attr: &pb::Attr) {
         if self.peer.is_none()
             || self.capacity == 0
             || attr.directory
@@ -180,7 +189,7 @@ impl Local {
         {
             return;
         }
-        let key = (parent, name.to_owned());
+        let key = (parent.to_owned(), name.to_owned());
         if let Some(old) = self.cache.remove(&key) {
             self.order.remove(&old.used);
         }
@@ -237,7 +246,10 @@ impl Local {
         if !stat && !open {
             return Ok(None);
         }
-        let key = (r.parent, r.name.clone());
+        let Some(parent) = self.normal.get(&r.parent) else {
+            return Ok(None);
+        };
+        let key = (parent.clone(), r.name.clone());
         let Some(mapping) = self.cache.get_mut(&key) else {
             return Ok(None);
         };
@@ -330,8 +342,10 @@ impl Local {
         self.revoked_through = self.revoked_through.max(epoch);
         self.revoked = Some(epoch);
     }
-    pub(crate) fn revoked_acknowledged(&mut self) {
-        self.revoked = None;
+    pub(crate) fn revoked_acknowledged(&mut self, epoch: u64) {
+        if self.revoked.is_some_and(|revoked| revoked <= epoch) {
+            self.revoked = None;
+        }
     }
     pub(crate) fn disconnected(&mut self) {
         self.cache.clear();
@@ -408,8 +422,10 @@ mod tests {
                 .unwrap();
             file.write_all(b"current contents").unwrap();
             let metadata = file.metadata().unwrap();
+            let mut local = Local::new(capacity, socket.as_raw_fd());
+            local.normal.insert(1, "parent".into());
             Self {
-                local: Local::new(capacity, socket.as_raw_fd()),
+                local,
                 path: path.clone(),
                 pin_path: pin_path.clone(),
                 mapping: pb::LocalMapping {
@@ -477,6 +493,87 @@ mod tests {
         }
     }
     #[test]
+    fn delayed_ack_does_not_clear_a_newer_revocation() {
+        let mut local = Local::new(0, -1);
+        local.revoke(1);
+        local.revoke(2);
+        local.revoked_acknowledged(1);
+        assert_eq!(local.revoked, Some(2));
+        local.revoked_acknowledged(2);
+        assert_eq!(local.revoked, None);
+        local.revoke(1);
+        assert_eq!(local.revoked, None);
+    }
+    #[test]
+    fn readdir_mapping_is_shared_by_distinct_handles_to_the_same_directory() {
+        let mut f = Fixture::new(2);
+        f.local.observe(
+            &pb::Request {
+                method: pb::Method::Opendir as i32,
+                handle: 1,
+                ..Default::default()
+            },
+            &pb::Response {
+                handle: 17,
+                ..Default::default()
+            },
+        );
+        f.local.observe(
+            &pb::Request {
+                method: pb::Method::Readdir as i32,
+                handle: 17,
+                ..Default::default()
+            },
+            &pb::Response {
+                entries: vec![pb::Entry {
+                    name: "a".into(),
+                    attr: Some(f.attr.clone()),
+                    local: Some(f.mapping.clone()),
+                }],
+                ..Default::default()
+            },
+        );
+        f.local.observe(
+            &pb::Request {
+                method: pb::Method::Open as i32,
+                ..Default::default()
+            },
+            &pb::Response {
+                handle: 2,
+                attr: Some(pb::Attr {
+                    node_id: "parent".into(),
+                    directory: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        f.local.observe(
+            &pb::Request {
+                method: pb::Method::Close as i32,
+                handle: 1,
+                ..Default::default()
+            },
+            &pb::Response::default(),
+        );
+        let opened = f
+            .local
+            .request(&pb::Request {
+                method: pb::Method::Open as i32,
+                parent: 2,
+                name: "a".into(),
+                access: pb::Access::ReadOnly as i32,
+                local_access: true,
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert!(opened.handle > LOCAL_ID);
+        let mut job = f.local.read(opened.handle, 0, 16).unwrap().unwrap();
+        job.run();
+        assert_eq!(job.data, b"current contents");
+    }
+    #[test]
     fn open_handle_survives_cache_revocation_and_pins_until_last_read_finishes() {
         let mut f = Fixture::new(2);
         f.insert("a");
@@ -492,7 +589,7 @@ mod tests {
             Some(libc::EAGAIN)
         );
         f.local.revoke(1);
-        f.local.revoked_acknowledged();
+        f.local.revoked_acknowledged(1);
         f.insert("a"); // An old READDIR response cannot repopulate the cache.
         assert!(f.local.request(&stat("a")).unwrap().is_none());
         f.local

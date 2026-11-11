@@ -510,6 +510,11 @@ async fn control(
                             let _ = notice.done.send(true);
                             continue;
                         }
+                        if pending.as_ref().is_some_and(|old| old.epoch < session.epoch())
+                            && let Some(old) = pending.take()
+                        {
+                            let _ = old.done.send(true);
+                        }
                         anyhow::ensure!(pending.is_none(), "overlapping cache revocations");
                         send(&mut writer, timeout, 0, Response { cache_epoch: notice.epoch, ..Default::default() }).await?;
                         pending = Some(notice);
@@ -526,6 +531,10 @@ async fn control(
             "invalid control frame"
         );
         let request = Request::decode(frame.message.as_slice())?;
+        if request.method == Method::Detach as i32 {
+            session.release();
+            return Ok(());
+        }
         anyhow::ensure!(
             request.method == Method::RevokeAck as i32,
             "invalid control method"
@@ -542,8 +551,9 @@ async fn control(
             },
         )
         .await?;
-        if let Some(notice) = pending.take() {
-            anyhow::ensure!(notice.epoch == epoch, "invalid revocation acknowledgement");
+        if pending.as_ref().is_some_and(|notice| notice.epoch <= epoch)
+            && let Some(notice) = pending.take()
+        {
             let _ = notice.done.send(true);
         }
     }
@@ -927,6 +937,7 @@ fn execute(session: &mut Session, request: Request, instance: &str) -> Reply {
             }
         }
         Method::Open => {
+            let generation = session.engine.direct_access().grant_generation();
             let access = Access::try_from(request.access).map_err(|_| errno(libc::EINVAL))?;
             let disposition =
                 Disposition::try_from(request.disposition).map_err(|_| errno(libc::EINVAL))?;
@@ -973,6 +984,15 @@ fn execute(session: &mut Session, request: Request, instance: &str) -> Reply {
                 )
             };
             response.attr = Some(attr(&session.engine.stat_id(&node.id)?));
+            if access == Access::Metadata
+                && disposition == Disposition::Existing
+                && request.handle == 0
+                && !node.is_dir
+                && let Some(direct) = &session.direct
+            {
+                response.local =
+                    direct.grant(&session.engine, &node.id, generation, node.version)?;
+            }
             response.handle = session.insert(handle(node.id, file, readable, writable))?;
         }
         Method::Mkdir => {

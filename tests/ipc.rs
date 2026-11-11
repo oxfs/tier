@@ -1105,3 +1105,93 @@ fn disconnected_mapping_lease_remains_a_mutation_barrier() -> Result<()> {
     assert!(started.elapsed() >= Duration::from_nanos(remaining.saturating_sub(20_000_000)));
     Ok(())
 }
+
+#[test]
+fn explicit_cache_release_unblocks_a_pending_mutation() -> Result<()> {
+    let (temp, engine, _server) = fixture()?;
+    engine.put("/file", b"content")?;
+    let path = temp.path().join("tier.sock");
+    let mut reader = Client::connect_with_local(&path, true)?;
+    let mut control = direct_control(&path, &reader)?;
+    local_mapping(&mut reader, "file")?;
+    let mut writer = Client::connect(&path)?;
+    writer.submit(
+        Request {
+            method: Method::Unlink as i32,
+            parent: writer.root,
+            name: "file".into(),
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    assert_eq!(control.receive()?.0, 0);
+    control.submit(
+        Request {
+            method: Method::Detach as i32,
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    writer
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(2)))?;
+    assert_eq!(writer.receive()?.1.error, 0);
+    Ok(())
+}
+
+#[test]
+fn expired_mapping_does_not_kill_an_idle_connection() -> Result<()> {
+    let options = IpcOptions {
+        direct_lease_secs: 1,
+        ..Default::default()
+    };
+    let (temp, engine, _server) = fixture_with_options(1, &options)?;
+    engine.put("/file", b"content")?;
+    let path = temp.path().join("tier.sock");
+    let mut reader = Client::connect_with_local(&path, true)?;
+    let mut control = direct_control(&path, &reader)?;
+    let old = local_mapping(&mut reader, "file")?;
+    std::thread::sleep(Duration::from_millis(1100));
+    let mut writer = Client::connect(&path)?;
+    writer.call(
+        Request {
+            method: Method::Mkdir as i32,
+            parent: writer.root,
+            name: "new".into(),
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    let fresh = local_mapping(&mut reader, "file")?;
+    assert!(fresh.epoch > old.epoch);
+    // An old acknowledgement must not clear a newer mapping authorization.
+    control.call(
+        Request {
+            method: Method::RevokeAck as i32,
+            cache_epoch: old.epoch,
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    writer.submit(
+        Request {
+            method: Method::Unlink as i32,
+            parent: writer.root,
+            name: "file".into(),
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    let (_, notice, _) = control.receive()?;
+    assert_eq!(notice.cache_epoch, fresh.epoch);
+    control.call(
+        Request {
+            method: Method::RevokeAck as i32,
+            cache_epoch: fresh.epoch,
+            ..Default::default()
+        },
+        vec![],
+    )?;
+    assert_eq!(writer.receive()?.1.error, 0);
+    Ok(())
+}

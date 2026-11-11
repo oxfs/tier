@@ -26,6 +26,7 @@ from smbprotocol.open import (
     QueryDirectoryFlags,
     ShareAccess,
 )
+from smbprotocol.tree import TreeConnect
 from support import Environment
 
 
@@ -36,6 +37,49 @@ class ConnectedTest(unittest.TestCase):
 
 
 class SMBTests(ConnectedTest):
+    def test_control_revocation_across_trees_on_one_connection(self):
+        self.env.write("same-process", b"before")
+        tree, _ = get_smb_tree(self.env.path("same-process"), **self.env.config)
+        other = TreeConnect(tree.session, tree.share_name)
+        other.connect()
+        self.addCleanup(other.disconnect)
+
+        def open_on(selected_tree, name, access, directory=False):
+            handle = Open(selected_tree, name)
+            handle.create(
+                ImpersonationLevel.Impersonation,
+                access,
+                FileAttributes.FILE_ATTRIBUTE_DIRECTORY
+                if directory
+                else FileAttributes.FILE_ATTRIBUTE_NORMAL,
+                ShareAccess.FILE_SHARE_READ
+                | ShareAccess.FILE_SHARE_WRITE
+                | ShareAccess.FILE_SHARE_DELETE,
+                CreateDisposition.FILE_OPEN,
+                CreateOptions.FILE_DIRECTORY_FILE
+                if directory
+                else CreateOptions.FILE_NON_DIRECTORY_FILE,
+            )
+            return handle
+
+        directory = open_on(other, "", FilePipePrinterAccessMask.GENERIC_READ, directory=True)
+        self.addCleanup(directory.close)
+        directory.query_directory("same-process", FileInformationClass.FILE_NAMES_INFORMATION)
+        # Both trees share one TCP connection and smbd event loop. A synchronous
+        # mutation on one tree must pump the other tree's cache-revocation ACK.
+        started = time.monotonic()
+        writer = open_on(tree, "same-process", FilePipePrinterAccessMask.GENERIC_WRITE)
+        try:
+            self.assertLess(time.monotonic() - started, 5)
+            writer.write(b"after!")
+        finally:
+            writer.close()
+        reader = open_on(other, "same-process", FilePipePrinterAccessMask.GENERIC_READ)
+        try:
+            self.assertEqual(reader.read(0, 6), b"after!")
+        finally:
+            reader.close()
+
     def test_open_reader_pins_placement_without_blocking_in_place_writes(self):
         self.env.write("pinned-before", b"before")
         original = list((self.env.root / "objects").rglob("*--pinned-before"))
@@ -367,7 +411,7 @@ class SMBTests(ConnectedTest):
             assert self.env.read("protected/saved") == b"verified-long-term-data"
             try:
                 self.env.read("protected/stale")
-            except OSError:
+            except (OSError, SMBResponseException):
                 pass
             else:
                 raise AssertionError("an obsolete replica was returned as current data")

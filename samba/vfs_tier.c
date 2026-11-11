@@ -604,6 +604,26 @@ static int tier_chdir(struct vfs_handle_struct *h, const struct smb_filename *na
 	int ret = -1;
 	if (!no_stream(name))
 		goto done;
+	/* The share root is stable and already attached. Reopening it on every
+	 * Samba service switch would also change all directory-cache keys. */
+	if (strcmp(name->base_name, "/") == 0) {
+		if (c->cwd != c->root) {
+			char *root_name = talloc_strdup(c, "/");
+			if (!root_name) {
+				errno = ENOMEM;
+				goto done;
+			}
+			old = c->cwd;
+			c->cwd = c->root;
+			TALLOC_FREE(c->cwd_name);
+			c->cwd_name = root_name;
+			/* A failed daemon cannot invalidate an already opened local fd.
+			 */
+			tier_defer_close(c->client, old);
+		}
+		ret = 0;
+		goto done;
+	}
 	r.method = TIER_METHOD_OPEN;
 	r.parent = c->cwd;
 	r.name = name->base_name;
