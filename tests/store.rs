@@ -70,7 +70,7 @@ fn namespace_survives_gc_rename_and_remove() -> Result<()> {
         store.list(Path::new("folder"))?,
         vec![PathBuf::from("file")]
     );
-    assert_eq!(store.stat(Path::new("folder/file"))?.len(), 8);
+    assert_eq!(store.stat(Path::new("folder/file"))?.0.len(), 8);
     let reader = store.read(Path::new("folder/file"))?;
     assert!(
         store
@@ -248,7 +248,7 @@ fn replica_stat_does_not_read_file_contents() -> Result<()> {
         fs::File::open(replica.join("file"))?
             .set_times(fs::FileTimes::new().set_accessed(std::time::UNIX_EPOCH))?;
     }
-    assert_eq!(store.stat(Path::new("file"))?.len(), 33);
+    assert_eq!(store.stat(Path::new("file"))?.0.len(), 33);
     for replica in &fixture.replicas {
         assert_eq!(fs::metadata(replica.join("file"))?.atime(), 0);
     }

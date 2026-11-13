@@ -39,12 +39,6 @@ impl AsRawFd for Writer {
         self.file.as_raw_fd()
     }
 }
-impl Reader {
-    pub fn metadata(&self) -> io::Result<fs::Metadata> {
-        self.file.metadata()
-    }
-}
-
 impl Read for Reader {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         self.file.read(bytes)

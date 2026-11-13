@@ -201,13 +201,9 @@ impl Store {
         Ok(locks)
     }
 
-    pub fn stat(&self, relative: &Path) -> Result<Metadata> {
-        Ok(self.stat_info(relative)?.0)
-    }
-
     /// Archive-only attributes come from the descriptor without recalling data.
-    /// The optional size overrides the descriptor file's physical length.
-    pub fn stat_info(&self, relative: &Path) -> Result<(Metadata, Option<crate::FileAttributes>)> {
+    /// Archived attributes override the descriptor file's physical attributes.
+    pub fn stat(&self, relative: &Path) -> Result<(Metadata, Option<crate::FileAttributes>)> {
         validate_relative(relative)?;
         let _namespace = self.namespace(false)?;
         let content = Self::path(self.root(), relative)?;

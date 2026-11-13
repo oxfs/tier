@@ -67,7 +67,7 @@ def webdav():
 
 def run(*args, input=None):
     result = subprocess.run(
-        args, input=input, text=True, capture_output=True, timeout=30
+        args, input=input, text=True, capture_output=True, timeout=30, check=False
     )
     if result.returncode:
         raise AssertionError(f"{args}: {result.stdout}\n{result.stderr}")
@@ -151,7 +151,11 @@ map archive = no
 
     def smb_command(command, fail=False):
         result = subprocess.run(
-            client + ["-c", command], capture_output=True, text=True, timeout=30
+            client + ["-c", command],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
         )
         output = result.stdout + result.stderr
         failed = result.returncode != 0 or "NT_STATUS_" in output

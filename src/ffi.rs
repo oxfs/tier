@@ -134,7 +134,7 @@ unsafe extern "C" fn tier_stat(
     out: *mut libc::stat,
 ) -> i32 {
     call(|| {
-        let (m, archived) = unsafe { &*store }.stat_info(unsafe { path(name) })?;
+        let (m, archived) = unsafe { &*store }.stat(unsafe { path(name) })?;
         let s = unsafe { &mut *out };
         *s = unsafe { std::mem::zeroed() };
         s.st_dev = m.dev();
@@ -255,7 +255,7 @@ unsafe extern "C" fn tier_setattr(
     call(|| {
         let store = unsafe { &*store };
         let relative = unsafe { path(name) };
-        let directory = store.stat_info(relative)?.0.is_dir();
+        let directory = store.stat(relative)?.0.is_dir();
         let writer = if directory {
             None
         } else {
