@@ -1,5 +1,5 @@
 use crate::{
-    config::{ArchivePolicy, ArchiveTarget, Config},
+    config::{ArchiveBackup, ArchiveTarget, Config},
     descriptor::{ArchiveCopy, State},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -75,13 +75,13 @@ fn download(config: &Config, copy: &ArchiveCopy, digest: &str, size: u64) -> Res
 
 pub(crate) fn upload(
     config: &Config,
-    policy: &ArchivePolicy,
+    backup: &ArchiveBackup,
     source: &mut File,
     digest: &str,
     size: u64,
 ) -> Result<Vec<ArchiveCopy>> {
-    let mut copies = Vec::new();
-    for name in &policy.targets {
+    let mut uploaded = Vec::new();
+    for name in &backup.targets {
         let copy = ArchiveCopy {
             target: name.clone(),
             key: digest.to_owned(),
@@ -95,15 +95,15 @@ pub(crate) fn upload(
             .set("Content-Length", &size.to_string())
             .send(&mut *source);
         if result.is_ok() && download(config, &copy, digest, size).is_ok() {
-            copies.push(copy);
-            if copies.len() == policy.copies {
-                return Ok(copies);
+            uploaded.push(copy);
+            if uploaded.len() == backup.count {
+                return Ok(uploaded);
             }
         }
     }
     bail!(
-        "archive policy could not create {} verified copies",
-        policy.copies
+        "archive backup could not create {} verified copies",
+        backup.count
     )
 }
 
@@ -131,16 +131,16 @@ pub(crate) fn verify(config: &Config, state: &State) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn satisfied(policy: Option<&ArchivePolicy>, state: &State) -> bool {
-    match policy {
+pub(crate) fn satisfied(backup: Option<&ArchiveBackup>, state: &State) -> bool {
+    match backup {
         None => true,
-        Some(policy) => {
+        Some(backup) => {
             state
                 .archives
                 .iter()
-                .filter(|copy| policy.targets.contains(&copy.target))
+                .filter(|copy| backup.targets.contains(&copy.target))
                 .count()
-                >= policy.copies
+                >= backup.count
         }
     }
 }

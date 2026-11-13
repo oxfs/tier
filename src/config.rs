@@ -11,7 +11,7 @@ use std::{
 pub struct Config {
     pub primary: PathBuf,
     pub replicas: BTreeMap<String, PathBuf>,
-    pub policies: Vec<Policy>,
+    pub backup: Vec<Backup>,
     #[serde(default)]
     pub archives: BTreeMap<String, ArchiveTarget>,
     #[serde(default)]
@@ -43,20 +43,28 @@ pub struct ArchiveTarget {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ArchivePolicy {
+pub struct ArchiveBackup {
     pub targets: Vec<String>,
-    pub copies: usize,
+    pub count: usize,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Policy {
+pub struct Backup {
     pub path: PathBuf,
-    /// Required copies on disks other than the primary.
-    pub copies: usize,
+    /// Required total valid content copies, including primary and archive copies.
+    pub count: usize,
     #[serde(default)]
     pub gc: bool,
-    pub archive: Option<ArchivePolicy>,
+    pub archive: Option<ArchiveBackup>,
+}
+
+impl Backup {
+    pub fn local_replicas(&self) -> usize {
+        self.count
+            .saturating_sub(usize::from(!self.gc))
+            .saturating_sub(self.archive.as_ref().map_or(0, |archive| archive.count))
+    }
 }
 
 impl Config {
@@ -128,15 +136,15 @@ impl Config {
             }
         }
         ensure!(
-            self.policies.iter().any(|p| p.path.as_os_str().is_empty()),
-            "a root policy with path = \"\" is required"
+            self.backup.iter().any(|p| p.path.as_os_str().is_empty()),
+            "a root backup with path = \"\" is required"
         );
-        for (index, policy) in self.policies.iter().enumerate() {
-            if let Some(archive) = &policy.archive {
+        for (index, backup) in self.backup.iter().enumerate() {
+            if let Some(archive) = &backup.archive {
                 let unique: std::collections::BTreeSet<_> = archive.targets.iter().collect();
                 ensure!(
-                    archive.copies > 0
-                        && archive.copies <= unique.len()
+                    archive.count > 0
+                        && archive.count <= unique.len()
                         && unique.len() == archive.targets.len(),
                     "invalid archive replica count or duplicate targets"
                 );
@@ -148,31 +156,34 @@ impl Config {
                     "unknown archive target"
                 );
             }
-            validate_relative(&policy.path)?;
+            validate_relative(&backup.path)?;
             ensure!(
-                policy.copies <= self.replicas.len(),
-                "policy requires more replica disks than configured"
+                backup.count > 0
+                    && backup.count
+                        >= usize::from(!backup.gc)
+                            + backup.archive.as_ref().map_or(0, |archive| archive.count),
+                "backup count must include every retained primary and archive copy"
             );
             ensure!(
-                !policy.gc || policy.copies > 0 || policy.archive.is_some(),
-                "GC requires at least one replica"
+                backup.local_replicas() <= self.replicas.len(),
+                "backup requires more local disks than configured"
             );
             ensure!(
-                !self.policies[..index].iter().any(|p| p.path == policy.path),
-                "duplicate policy path: {}",
-                policy.path.display()
+                !self.backup[..index].iter().any(|p| p.path == backup.path),
+                "duplicate backup path: {}",
+                backup.path.display()
             );
         }
         Ok(())
     }
 
-    pub fn policy_for(&self, path: &Path) -> Result<&Policy> {
+    pub fn backup_for(&self, path: &Path) -> Result<&Backup> {
         validate_relative(path)?;
-        self.policies
+        self.backup
             .iter()
-            .filter(|policy| path.starts_with(&policy.path))
-            .max_by_key(|policy| policy.path.components().count())
-            .context("no matching directory policy")
+            .filter(|backup| path.starts_with(&backup.path))
+            .max_by_key(|backup| backup.path.components().count())
+            .context("no matching directory backup")
     }
 }
 
@@ -196,9 +207,9 @@ mod tests {
             archives: BTreeMap::new(),
             background: Background::default(),
             replicas: BTreeMap::from([("backup".into(), "/backup".into())]),
-            policies: vec![Policy {
+            backup: vec![Backup {
                 path: "".into(),
-                copies: 1,
+                count: 2,
                 gc: false,
                 archive: None,
             }],
@@ -206,23 +217,23 @@ mod tests {
     }
 
     #[test]
-    fn policies_match_components_and_inherit() -> Result<()> {
+    fn backup_match_components_and_inherit() -> Result<()> {
         let mut config = config();
-        config.policies.push(Policy {
+        config.backup.push(Backup {
             path: "photos".into(),
-            copies: 1,
+            count: 1,
             gc: true,
             archive: None,
         });
         config.validate()?;
-        assert!(config.policy_for(Path::new("photos/trip/a.jpg"))?.gc);
-        assert!(!config.policy_for(Path::new("photos-old/a.jpg"))?.gc);
-        assert!(!config.policy_for(Path::new("a.jpg"))?.gc);
+        assert!(config.backup_for(Path::new("photos/trip/a.jpg"))?.gc);
+        assert!(!config.backup_for(Path::new("photos-old/a.jpg"))?.gc);
+        assert!(!config.backup_for(Path::new("a.jpg"))?.gc);
         Ok(())
     }
 
     #[test]
-    fn rejects_unsafe_paths_and_impossible_policies() {
+    fn rejects_unsafe_paths_and_impossible_backup() {
         for path in [
             "/absolute",
             "../escape",
@@ -234,10 +245,10 @@ mod tests {
             assert!(validate_relative(Path::new(path)).is_err(), "{path}");
         }
         let mut config = config();
-        config.policies[0].copies = 2;
+        config.backup[0].count = 3;
         assert!(config.validate().is_err());
-        config.policies[0].copies = 0;
-        config.policies[0].gc = true;
+        config.backup[0].count = 0;
+        config.backup[0].gc = true;
         assert!(config.validate().is_err());
     }
 
@@ -253,18 +264,34 @@ mod tests {
     }
 
     #[test]
-    fn parses_explicit_root_policy_and_rejects_unknown_fields() -> Result<()> {
-        let source = "primary = '/primary'\n[replicas]\nbackup = '/backup'\n[[policies]]\npath = ''\ncopies = 1\n";
+    fn count_includes_primary_and_gc_requires_replacement_capacity() -> Result<()> {
+        let mut config = config();
+        assert_eq!(config.backup[0].local_replicas(), 1);
+        config.backup[0].gc = true;
+        assert_eq!(config.backup[0].local_replicas(), 2);
+        assert!(config.validate().is_err());
+        config.backup[0].gc = false;
+        config.backup[0].count = 1;
+        config.validate()?;
+        assert_eq!(config.backup[0].local_replicas(), 0);
+        config.backup[0].count = 0;
+        assert!(config.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn parses_explicit_root_backup_and_rejects_unknown_fields() -> Result<()> {
+        let source = "primary = '/primary'\n[replicas]\nbackup = '/backup'\n[[backup]]\npath = ''\ncount = 1\n";
         let config: Config = toml::from_str(source)?;
         config.validate()?;
-        assert!(!config.policies[0].gc);
+        assert!(!config.backup[0].gc);
         assert!(toml::from_str::<Config>(&format!("{source}unknown = true\n")).is_err());
         Ok(())
     }
 
     #[test]
-    fn archive_policy_requires_distinct_known_targets_and_safe_urls() -> Result<()> {
-        let source = "primary='/primary'\n[replicas]\n[archives.remote]\nurl='https://example.test/dav/'\n[[policies]]\npath=''\ncopies=0\ngc=true\n[policies.archive]\ntargets=['remote']\ncopies=1\n";
+    fn archive_backup_requires_distinct_known_targets_and_safe_urls() -> Result<()> {
+        let source = "primary='/primary'\n[replicas]\n[archives.remote]\nurl='https://example.test/dav/'\n[[backup]]\npath=''\ncount=1\ngc=true\n[backup.archive]\ntargets=['remote']\ncount=1\n";
         let config: Config = toml::from_str(source)?;
         config.validate()?;
         for invalid in [
@@ -272,7 +299,7 @@ mod tests {
             source.replace("['remote']", "['missing']"),
             source.replace("https://example.test", "https://user:secret@example.test"),
             source.replace("https://example.test", "file:///tmp"),
-            source.replace("copies=1", "copies=2"),
+            source.replace("count=1", "count=2"),
         ] {
             assert!(toml::from_str::<Config>(&invalid)?.validate().is_err());
         }

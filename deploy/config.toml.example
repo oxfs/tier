@@ -4,14 +4,14 @@ primary = "/srv/tier/primary"
 disk1 = "/srv/tier/disk1"
 disk2 = "/srv/tier/disk2"
 
-[[policies]]
+[[backup]]
 path = ""
-copies = 2
+count = 2
 gc = false
 
-[[policies]]
+[[backup]]
 path = "cold"
-copies = 2
+count = 2
 gc = true
 
 [background]

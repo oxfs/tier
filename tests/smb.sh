@@ -19,9 +19,9 @@ cat >"$tmp/config.toml" <<EOF
 primary = "$tmp/primary"
 [replicas]
 backup = "$tmp/replica"
-[[policies]]
+[[backup]]
 path = ""
-copies = 1
+count = 1
 gc = true
 EOF
 runuser -u "$user" -- "$binary" "$tmp/config.toml" init

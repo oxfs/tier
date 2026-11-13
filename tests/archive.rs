@@ -12,7 +12,7 @@ use std::{
 };
 use tier::{
     Store,
-    config::{ArchivePolicy, ArchiveTarget, Background, Config, Policy},
+    config::{ArchiveBackup, ArchiveTarget, Background, Backup, Config},
 };
 
 struct Webdav {
@@ -94,13 +94,13 @@ fn config(root: &Path, servers: &[&Webdav]) -> Config {
                 )
             })
             .collect(),
-        policies: vec![Policy {
+        backup: vec![Backup {
             path: "".into(),
-            copies: 0,
+            count: servers.len(),
             gc: true,
-            archive: Some(ArchivePolicy {
+            archive: Some(ArchiveBackup {
                 targets: (0..servers.len()).map(|i| format!("dav{i}")).collect(),
-                copies: servers.len(),
+                count: servers.len(),
             }),
         }],
     }

@@ -8,7 +8,7 @@ use std::{
 use tempfile::TempDir;
 use tier::{
     Store,
-    config::{Config, Policy},
+    config::{Backup, Config},
 };
 
 struct Fixture {
@@ -44,10 +44,10 @@ impl Fixture {
                 ("a".into(), self.replicas[0].clone()),
                 ("b".into(), self.replicas[1].clone()),
             ]),
-            policies: vec![Policy {
+            backup: vec![Backup {
                 archive: None,
                 path: "".into(),
-                copies: 2,
+                count: 2 + usize::from(!gc),
                 gc,
             }],
         }
@@ -221,18 +221,50 @@ fn roots_cannot_alias_through_a_symlink() -> Result<()> {
 }
 
 #[test]
-fn primary_only_policy_restores_garbage_collected_content() -> Result<()> {
+fn primary_only_backup_restores_garbage_collected_content() -> Result<()> {
     let fixture = Fixture::new()?;
     let store = fixture.store(true)?;
     write(&store, "file", b"retained")?;
     store.reconcile(Path::new("file"))?;
     assert!(!fixture.primary.join("file").exists());
     let mut config = fixture.config(false);
-    config.policies[0].copies = 0;
+    config.backup[0].count = 1;
     let store = Store::new(config)?;
     assert!(store.scan()?.errors.is_empty());
     assert_eq!(fs::read(fixture.primary.join("file"))?, b"retained");
     assert_eq!(read(&store, "file")?, b"retained");
+    assert!(store.check(Path::new("file"))?);
+    Ok(())
+}
+
+#[test]
+fn total_backup_count_includes_primary_before_and_after_gc_changes() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let settings = |gc| {
+        let mut config = fixture.config(gc);
+        config.backup[0].count = 2;
+        config
+    };
+    let store = Store::initialize(settings(false))?;
+    write(&store, "file", b"two copies")?;
+    store.reconcile(Path::new("file"))?;
+    assert!(fixture.primary.join("file").exists());
+    assert!(fixture.replicas[0].join("file").exists());
+    assert!(!fixture.replicas[1].join("file").exists());
+
+    let store = Store::new(settings(true))?;
+    assert!(store.scan()?.errors.is_empty());
+    assert!(!fixture.primary.join("file").exists());
+    assert!(
+        fixture
+            .replicas
+            .iter()
+            .all(|root| root.join("file").exists())
+    );
+
+    let store = Store::new(settings(false))?;
+    assert!(store.scan()?.errors.is_empty());
+    assert_eq!(fs::read(fixture.primary.join("file"))?, b"two copies");
     assert!(store.check(Path::new("file"))?);
     Ok(())
 }
@@ -259,7 +291,7 @@ fn replica_stat_does_not_read_file_contents() -> Result<()> {
 fn inspection_detects_primary_corruption_and_missing_only_copy() -> Result<()> {
     let fixture = Fixture::new()?;
     let mut config = fixture.config(false);
-    config.policies[0].copies = 0;
+    config.backup[0].count = 1;
     let store = Store::initialize(config)?;
     write(&store, "file", b"original")?;
     assert!(store.reconcile(Path::new("file"))?);
@@ -316,7 +348,7 @@ fn cli_writes_truncate_then_scan_read_and_check() -> Result<()> {
     fs::write(
         &config,
         format!(
-            "primary = {:?}\n[replicas]\na = {:?}\nb = {:?}\n[[policies]]\npath = ''\ncopies = 2\ngc = true\n",
+            "primary = {:?}\n[replicas]\na = {:?}\nb = {:?}\n[[backup]]\npath = ''\ncount = 2\ngc = true\n",
             fixture.primary, fixture.replicas[0], fixture.replicas[1]
         ),
     )?;

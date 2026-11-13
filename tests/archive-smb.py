@@ -90,16 +90,16 @@ backup = {json.dumps(str(directory / "replica"))}
 url = "{first.url}"
 [archives.second]
 url = "{second.url}"
-[[policies]]
+[[backup]]
 path = ""
-copies = 1
-[[policies]]
+count = 2
+[[backup]]
 path = "archive"
-copies = 0
+count = 2
 gc = true
-[policies.archive]
+[backup.archive]
 targets = ["first", "second"]
-copies = 2
+count = 2
 """)
     run(binary, str(config), "init")
     with socket.socket() as listener:

@@ -14,7 +14,7 @@ fn missing_replica_does_not_disable_primary_reads_after_restart() -> Result<()> 
     fs::create_dir(&primary)?;
     fs::create_dir(&replica)?;
     let source = format!(
-        "primary={:?}\n[replicas]\nbackup={:?}\n[[policies]]\npath=''\ncopies=1\n",
+        "primary={:?}\n[replicas]\nbackup={:?}\n[[backup]]\npath=''\ncount=2\n",
         primary, replica
     );
     assert!(Store::new(toml::from_str::<Config>(&source)?).is_err());

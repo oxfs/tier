@@ -30,18 +30,21 @@ fn wait_until(mut condition: impl FnMut() -> bool) -> Result<()> {
 }
 
 #[test]
-fn service_skips_busy_files_reloads_policy_and_stops_cleanly() -> Result<()> {
+fn service_skips_busy_files_reloads_backup_and_stops_cleanly() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let primary = directory.path().join("primary");
     let replica = directory.path().join("replica");
+    let second = directory.path().join("second");
     fs::create_dir(&primary)?;
     fs::create_dir(&replica)?;
+    fs::create_dir(&second)?;
     let config = directory.path().join("config.toml");
     let settings = |gc| {
         format!(
-            "primary = '{}'\n[replicas]\nbackup = '{}'\n[[policies]]\npath = ''\ncopies = 1\ngc = {gc}\n[background]\nscan_interval_secs = 1\naudit_interval_secs = 2\n",
+            "primary = '{}'\n[replicas]\nbackup = '{}'\nsecond = '{}'\n[[backup]]\npath = ''\ncount = 2\ngc = {gc}\n[background]\nscan_interval_secs = 1\naudit_interval_secs = 2\n",
             primary.display(),
-            replica.display()
+            replica.display(),
+            second.display()
         )
     };
     fs::write(&config, settings(false))?;
@@ -71,6 +74,7 @@ fn service_skips_busy_files_reloads_policy_and_stops_cleanly() -> Result<()> {
     fs::write(&replacement, settings(true))?;
     fs::rename(replacement, &config)?;
     wait_until(|| !primary.join("file").exists())?;
+    assert_eq!(fs::read(second.join("file"))?, b"durable content");
     // SAFETY: child id is a live child process started above; SIGTERM is valid.
     ensure!(
         unsafe { libc::kill(service.0.id() as libc::pid_t, libc::SIGTERM) } == 0,

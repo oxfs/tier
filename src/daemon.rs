@@ -18,7 +18,7 @@ pub fn run(path: &Path) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
         let mut interval = Duration::from_secs(60);
         let result = (|| -> Result<()> {
-            // A changed policy takes effect on the next pass, without restart.
+            // A changed backup takes effect on the next pass, without restart.
             let config = Config::load(path)?;
             interval = Duration::from_secs(config.background.scan_interval_secs);
             let audit_interval = Duration::from_secs(config.background.audit_interval_secs);

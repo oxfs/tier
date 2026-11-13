@@ -305,22 +305,23 @@ impl Store {
         }
         let current = descriptor::load(&mut lock)?.map(|(_, state)| state);
         let primary = self.content(relative)?;
-        let policy = self.config.policy_for(relative)?;
+        let backup = self.config.backup_for(relative)?;
         let selected: Vec<_> = self
             .config
             .replicas
             .keys()
-            .take(policy.copies)
+            .take(backup.local_replicas())
             .cloned()
             .collect();
         if let Some(state) = &current
             && state.digest.is_some()
             && state.replicas == selected
-            && crate::archive::satisfied(policy.archive.as_ref(), state)
+            && crate::archive::satisfied(backup.archive.as_ref(), state)
+            && (backup.gc || primary.exists())
         {
             self.verify_content(relative, state)?;
             self.mirror(relative, &mut lock)?;
-            if primary.exists() && policy.gc {
+            if primary.exists() && backup.gc {
                 fs::remove_file(&primary)?;
                 sync_parent(&primary)?;
             }
@@ -339,13 +340,14 @@ impl Store {
                 "content changed outside the writer protocol"
             );
         }
-        // Restore the primary before dropping the last recorded replica.
-        if policy.copies == 0 && !primary.exists() {
+        // A retained primary counts toward the total and must exist before
+        // publishing a smaller set of copies on other disks.
+        if !backup.gc && !primary.exists() {
             source.rewind()?;
             copy_file(&mut source, &primary, self.root())?;
         }
         let mut replicas = Vec::new();
-        for (name, root) in self.config.replicas.iter().take(policy.copies) {
+        for (name, root) in self.config.replicas.iter().take(backup.local_replicas()) {
             self.verify_root(root)?;
             let destination = Self::path(root, relative)?;
             let matches = File::open(&destination)
@@ -358,7 +360,7 @@ impl Store {
             }
             replicas.push(name.clone());
         }
-        let archives = if let Some(archive) = &policy.archive {
+        let archives = if let Some(archive) = &backup.archive {
             crate::archive::upload(&self.config, archive, &mut source, &digest, size)?
         } else {
             Vec::new()
@@ -383,7 +385,7 @@ impl Store {
         // Mirror descriptors to every configured disk, even disks without content.
         // A failed mirror aborts GC. Replica descriptors are never active locks.
         self.mirror(relative, &mut lock)?;
-        if policy.gc && primary.exists() {
+        if backup.gc && primary.exists() {
             fs::remove_file(&primary)?;
             sync_parent(&primary)?;
         }
@@ -418,20 +420,20 @@ impl Store {
                 if !try_lock(&lock, true)? {
                     return Ok(None);
                 }
-                let policy = self.config.policy_for(&relative)?;
+                let backup = self.config.backup_for(&relative)?;
                 let selected: Vec<_> = self
                     .config
                     .replicas
                     .keys()
-                    .take(policy.copies)
+                    .take(backup.local_replicas())
                     .cloned()
                     .collect();
                 Ok(Some(descriptor::load(&mut lock)?.is_none_or(
                     |(_, state)| {
                         state.digest.is_none()
                             || state.replicas != selected
-                            || !crate::archive::satisfied(policy.archive.as_ref(), &state)
-                            || (policy.gc && self.config.primary.join(&relative).exists())
+                            || !crate::archive::satisfied(backup.archive.as_ref(), &state)
+                            || (backup.gc == self.config.primary.join(&relative).exists())
                     },
                 )))
             })();

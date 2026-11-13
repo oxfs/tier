@@ -16,7 +16,7 @@ sudo bash tier/deploy/install.sh
 sudo install -m 0640 -o root -g tier tier/deploy/config.toml.example /etc/tier/config.toml
 ```
 
-先挂载各存储盘，再修改 `/etc/tier/config.toml` 中的路径和副本策略。主盘保存权威目录和描述信息，新内容先写入主盘。`copies` 是主盘之外的内容副本数；`gc = true` 允许在副本完成后删除主盘内容。
+先挂载各存储盘，再修改 `/etc/tier/config.toml` 中的路径和 `backup` 规则。`count` 是需要保留的内容总份数：包含未 GC 的主盘内容，以及配置的 WebDAV 归档份数。比如 `count = 2`，不 GC 时是主盘加另一份；开启 `gc = true` 后，主盘内容删除前必须在其他位置保留两份。目录和描述信息不计入内容份数。
 
 让 `tier` 用户能够读写各存储目录，然后初始化磁盘身份：
 
@@ -47,11 +47,11 @@ url = "https://dav.example.com/tier/"
 username_env = "WEBDAV_USER"
 password_env = "WEBDAV_PASSWORD"
 
-[[policies]]
+[[backup]]
 path = "archive"
-copies = 0
+count = 1
 gc = true
-archive = { targets = ["remote"], copies = 1 }
+archive = { targets = ["remote"], count = 1 }
 ```
 
 远端目录需要预先创建。凭据写入 `/etc/tier/secrets`，格式为 `WEBDAV_USER=...`、`WEBDAV_PASSWORD=...`；该文件仅允许管理员读取。Samba 进程也需要这些环境变量才能读取归档，可通过 `systemctl edit smbd` 为其配置同一个 `EnvironmentFile`。凭据变更后重启 `tier` 和 `smbd`。
