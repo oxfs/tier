@@ -1,5 +1,1 @@
 /target/
-/web/node_modules/
-/web/dist/
-__pycache__/
-.ruff_cache/

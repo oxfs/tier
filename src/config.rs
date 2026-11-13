@@ -1,230 +1,281 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use std::{
-    env, fs,
-    io::ErrorKind,
-    net::SocketAddr,
-    path::{Path, PathBuf},
+    collections::BTreeMap,
+    fs,
+    path::{Component, Path, PathBuf},
 };
-use tier::{core::RocksDbOptions, ipc::IpcOptions, service::RuntimeOptions};
 
-#[derive(Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Settings {
-    db: Option<PathBuf>,
-    pub socket: Option<PathBuf>,
-    pub admin: Option<SocketAddr>,
+pub struct Config {
+    pub primary: PathBuf,
+    pub replicas: BTreeMap<String, PathBuf>,
+    pub policies: Vec<Policy>,
     #[serde(default)]
-    pub rocksdb: RocksDbOptions,
+    pub archives: BTreeMap<String, ArchiveTarget>,
     #[serde(default)]
-    pub runtime: RuntimeOptions,
-    #[serde(default)]
-    pub ipc: IpcOptions,
+    pub background: Background,
 }
 
-fn user_dir(variable: &str, fallback: &str) -> Result<PathBuf> {
-    if let Some(path) = env::var_os(variable)
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-    {
-        return Ok(path.join("tier"));
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Background {
+    pub scan_interval_secs: u64,
+    pub audit_interval_secs: u64,
+}
+impl Default for Background {
+    fn default() -> Self {
+        Self {
+            scan_interval_secs: 60,
+            audit_interval_secs: 86400,
+        }
     }
-    Ok(PathBuf::from(env::var_os("HOME").context("HOME is unset")?)
-        .join(fallback)
-        .join("tier"))
 }
 
-impl Settings {
-    pub fn load(explicit: Option<&Path>) -> Result<Self> {
-        let path = match explicit {
-            Some(path) => path.to_owned(),
-            None => user_dir("XDG_CONFIG_HOME", ".config")?.join("tier.toml"),
-        };
-        let contents = match fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(error) if explicit.is_none() && error.kind() == ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
-        };
-        let settings: Self =
-            toml::from_str(&contents).with_context(|| format!("parse {}", path.display()))?;
-        settings.rocksdb.validate()?;
-        settings.runtime.validate()?;
-        settings.ipc.validate()?;
-        for path in settings.db.iter().chain(&settings.socket) {
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveTarget {
+    pub url: String,
+    pub username_env: Option<String>,
+    pub password_env: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchivePolicy {
+    pub targets: Vec<String>,
+    pub copies: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Policy {
+    pub path: PathBuf,
+    /// Required copies on disks other than the primary.
+    pub copies: usize,
+    #[serde(default)]
+    pub gc: bool,
+    pub archive: Option<ArchivePolicy>,
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Self> {
+        let config: Self = toml::from_str(
+            &fs::read_to_string(path)
+                .with_context(|| format!("read configuration {}", path.display()))?,
+        )?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.background.scan_interval_secs > 0
+                && self.background.audit_interval_secs >= self.background.scan_interval_secs,
+            "invalid background intervals"
+        );
+        for target in self.archives.values() {
+            let url = url::Url::parse(&target.url)?;
             ensure!(
-                path.is_absolute(),
-                "configured path must be absolute: {}",
-                path.display()
+                matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
+                "invalid archive URL"
+            );
+            ensure!(
+                url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none(),
+                "archive credentials must use environment variables"
+            );
+            ensure!(
+                target.username_env.is_some() == target.password_env.is_some(),
+                "archive credentials require both environment names"
             );
         }
-        Ok(settings)
+        for name in self.replicas.keys() {
+            ensure!(
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                "invalid replica name: {name}"
+            );
+        }
+        let roots: Vec<_> = std::iter::once(&self.primary)
+            .chain(self.replicas.values())
+            .collect();
+        for (index, root) in roots.iter().enumerate() {
+            ensure!(
+                root.is_absolute(),
+                "storage root must be absolute: {}",
+                root.display()
+            );
+            ensure!(
+                !root
+                    .components()
+                    .any(|c| matches!(c, Component::ParentDir | Component::CurDir)),
+                "storage root must not contain dot components: {}",
+                root.display()
+            );
+            for other in &roots[..index] {
+                ensure!(
+                    !root.starts_with(other) && !other.starts_with(root),
+                    "storage roots overlap: {} and {}",
+                    root.display(),
+                    other.display()
+                );
+            }
+        }
+        ensure!(
+            self.policies.iter().any(|p| p.path.as_os_str().is_empty()),
+            "a root policy with path = \"\" is required"
+        );
+        for (index, policy) in self.policies.iter().enumerate() {
+            if let Some(archive) = &policy.archive {
+                let unique: std::collections::BTreeSet<_> = archive.targets.iter().collect();
+                ensure!(
+                    archive.copies > 0
+                        && archive.copies <= unique.len()
+                        && unique.len() == archive.targets.len(),
+                    "invalid archive replica count or duplicate targets"
+                );
+                ensure!(
+                    archive
+                        .targets
+                        .iter()
+                        .all(|name| self.archives.contains_key(name)),
+                    "unknown archive target"
+                );
+            }
+            validate_relative(&policy.path)?;
+            ensure!(
+                policy.copies <= self.replicas.len(),
+                "policy requires more replica disks than configured"
+            );
+            ensure!(
+                !policy.gc || policy.copies > 0 || policy.archive.is_some(),
+                "GC requires at least one replica"
+            );
+            ensure!(
+                !self.policies[..index].iter().any(|p| p.path == policy.path),
+                "duplicate policy path: {}",
+                policy.path.display()
+            );
+        }
+        Ok(())
     }
 
-    pub fn database(&self, override_path: Option<PathBuf>) -> Result<PathBuf> {
-        if let Some(path) = override_path.or_else(|| self.db.clone()) {
-            return Ok(path);
-        }
-        let dir = user_dir("XDG_STATE_HOME", ".local/state")?;
-        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        Ok(dir.join("metadata"))
+    pub fn policy_for(&self, path: &Path) -> Result<&Policy> {
+        validate_relative(path)?;
+        self.policies
+            .iter()
+            .filter(|policy| path.starts_with(&policy.path))
+            .max_by_key(|policy| policy.path.components().count())
+            .context("no matching directory policy")
     }
+}
+
+pub fn validate_relative(path: &Path) -> Result<()> {
+    for component in path.components() {
+        match component {
+            Component::Normal(name) if name != ".tier" => {}
+            _ => bail!("unsafe relative path: {}", path.display()),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn bootstrap_paths_and_overrides() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tier.toml");
-        assert!(Settings::load(Some(&path)).is_err());
-        fs::write(
-            &path,
-            "db='/srv/catalog'\nsocket='/run/tier/tier.sock'\nadmin='127.0.0.1:9840'",
-        )
-        .unwrap();
-        let config = Settings::load(Some(&path)).unwrap();
-        assert_eq!(config.database(None).unwrap(), Path::new("/srv/catalog"));
-        assert_eq!(
-            config.database(Some("other".into())).unwrap(),
-            Path::new("other")
-        );
-        for invalid in ["db='relative'", "policy='wrong'"] {
-            fs::write(&path, invalid).unwrap();
-            assert!(Settings::load(Some(&path)).is_err());
+
+    fn config() -> Config {
+        Config {
+            primary: "/primary".into(),
+            archives: BTreeMap::new(),
+            background: Background::default(),
+            replicas: BTreeMap::from([("backup".into(), "/backup".into())]),
+            policies: vec![Policy {
+                path: "".into(),
+                copies: 1,
+                gc: false,
+                archive: None,
+            }],
         }
     }
 
     #[test]
-    fn runtime_defaults_overrides_and_invalid_limits() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("tier.toml");
-        fs::write(&path, "")?;
-        let defaults = Settings::load(Some(&path))?;
-        assert_eq!(defaults.runtime.worker_threads, 1);
-        assert_eq!(defaults.runtime.max_blocking_threads, 8);
-        for limit in [1, 2] {
-            fs::write(&path, format!("[runtime]\nmax_blocking_threads={limit}"))?;
-            assert_eq!(
-                Settings::load(Some(&path))?.runtime.max_blocking_threads,
-                limit
-            );
-        }
-        for invalid in [
-            "max_blocking_threads=0",
-            "max_blocking_threads=-1",
-            "max_blocking_threads=9223372036854775807",
-            "worker_threads=0",
-            "worker_threads=9223372036854775807",
-            "admin_request_limit=0",
-            "admin_request_limit=4294967296",
-            "background_task_limit=0",
-            "background_task_limit=9223372036854775807",
-            "workers=4",
-        ] {
-            fs::write(&path, format!("[runtime]\n{invalid}"))?;
-            assert!(Settings::load(Some(&path)).is_err(), "accepted {invalid}");
-        }
-        fs::write(
-            &path,
-            "[runtime]\nworker_threads=2\nadmin_request_limit=3\nbackground_task_limit=2",
-        )?;
-        let settings = Settings::load(Some(&path))?;
-        assert_eq!(settings.runtime.worker_threads, 2);
-        assert_eq!(settings.runtime.admin_request_limit, 3);
-        assert_eq!(settings.runtime.background_task_limit, 2);
-        let defaults: Settings = toml::from_str(include_str!("../deploy/tier.toml"))?;
-        defaults.runtime.validate()?;
-        assert_eq!(defaults.runtime.worker_threads, 1);
-        assert_eq!(defaults.runtime.max_blocking_threads, 8);
-        assert_eq!(
-            defaults.runtime.admin_request_limit,
-            RuntimeOptions::default().admin_request_limit
-        );
-        assert_eq!(
-            defaults.runtime.background_task_limit,
-            RuntimeOptions::default().background_task_limit
-        );
-        assert_eq!(
-            defaults.runtime.max_blocking_threads,
-            RuntimeOptions::default().max_blocking_threads
-        );
+    fn policies_match_components_and_inherit() -> Result<()> {
+        let mut config = config();
+        config.policies.push(Policy {
+            path: "photos".into(),
+            copies: 1,
+            gc: true,
+            archive: None,
+        });
+        config.validate()?;
+        assert!(config.policy_for(Path::new("photos/trip/a.jpg"))?.gc);
+        assert!(!config.policy_for(Path::new("photos-old/a.jpg"))?.gc);
+        assert!(!config.policy_for(Path::new("a.jpg"))?.gc);
         Ok(())
     }
 
     #[test]
-    fn ipc_defaults_overrides_and_invalid_limits() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("tier.toml");
-        fs::write(
-            &path,
-            "[ipc]\nmax_connections=2\nmax_inflight_per_connection=1\nreply_timeout_secs=5",
-        )?;
-        let settings = Settings::load(Some(&path))?;
-        assert_eq!(settings.ipc.max_connections, 2);
-        assert_eq!(settings.ipc.max_inflight_per_connection, 1);
-        assert_eq!(settings.ipc.reply_timeout_secs, 5);
-        assert_eq!(settings.ipc.connection_control_buffer_mib, 16);
-        for invalid in [
-            "max_connections=0",
-            "data_buffer_mib=1",
-            "data_buffer_mib=9223372036854775807",
-            "reply_timeout_secs=0",
-            "connection_data_buffer_mib=256",
-            "connection_control_buffer_mib=0",
-            "connection_control_buffer_mib=6",
-            "control_buffer_mib=4\nconnection_control_buffer_mib=8",
-            "max_requests=10",
+    fn rejects_unsafe_paths_and_impossible_policies() {
+        for path in [
+            "/absolute",
+            "../escape",
+            "a/../b",
+            ".",
+            ".tier/state",
+            "a/.tier/state",
         ] {
-            fs::write(&path, format!("[ipc]\n{invalid}"))?;
-            assert!(Settings::load(Some(&path)).is_err(), "accepted {invalid}");
+            assert!(validate_relative(Path::new(path)).is_err(), "{path}");
         }
-        let defaults: Settings = toml::from_str(include_str!("../deploy/tier.toml"))?;
-        defaults.ipc.validate()?;
-        assert_eq!(
-            defaults.ipc.max_connections,
-            IpcOptions::default().max_connections
-        );
-        assert_eq!(
-            defaults.ipc.max_inflight_per_connection,
-            IpcOptions::default().max_inflight_per_connection
-        );
+        let mut config = config();
+        config.policies[0].copies = 2;
+        assert!(config.validate().is_err());
+        config.policies[0].copies = 0;
+        config.policies[0].gc = true;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_overlapping_roots_and_invalid_names() {
+        let mut config = config();
+        config
+            .replicas
+            .insert("backup".into(), "/primary/nested".into());
+        assert!(config.validate().is_err());
+        config.replicas = BTreeMap::from([("../backup".into(), "/backup".into())]);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn parses_explicit_root_policy_and_rejects_unknown_fields() -> Result<()> {
+        let source = "primary = '/primary'\n[replicas]\nbackup = '/backup'\n[[policies]]\npath = ''\ncopies = 1\n";
+        let config: Config = toml::from_str(source)?;
+        config.validate()?;
+        assert!(!config.policies[0].gc);
+        assert!(toml::from_str::<Config>(&format!("{source}unknown = true\n")).is_err());
         Ok(())
     }
 
     #[test]
-    fn rocksdb_defaults_overrides_and_invalid_limits() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("tier.toml");
-        fs::write(&path, "[rocksdb]\nblock_cache_mib=64\ncompression='none'")?;
-        let settings = Settings::load(Some(&path))?;
-        assert_eq!(settings.rocksdb.block_cache_mib, 64);
-        assert_eq!(settings.rocksdb.write_buffer_mib, 32);
-        assert!(matches!(
-            settings.rocksdb.compression,
-            tier::core::RocksDbCompression::None
-        ));
+    fn archive_policy_requires_distinct_known_targets_and_safe_urls() -> Result<()> {
+        let source = "primary='/primary'\n[replicas]\n[archives.remote]\nurl='https://example.test/dav/'\n[[policies]]\npath=''\ncopies=0\ngc=true\n[policies.archive]\ntargets=['remote']\ncopies=1\n";
+        let config: Config = toml::from_str(source)?;
+        config.validate()?;
         for invalid in [
-            "block_cache_mib=0",
-            "write_buffer_mib=-1",
-            "write_buffer_mib=9223372036854775807",
-            "max_write_buffers=1",
-            "max_background_jobs=0",
-            "compression='unknown'",
-            "disable_wal=true",
-            "block_cahce_mib=64",
+            source.replace("['remote']", "['remote','remote']"),
+            source.replace("['remote']", "['missing']"),
+            source.replace("https://example.test", "https://user:secret@example.test"),
+            source.replace("https://example.test", "file:///tmp"),
+            source.replace("copies=1", "copies=2"),
         ] {
-            fs::write(&path, format!("[rocksdb]\n{invalid}"))?;
-            assert!(Settings::load(Some(&path)).is_err(), "accepted {invalid}");
+            assert!(toml::from_str::<Config>(&invalid)?.validate().is_err());
         }
-        let defaults: Settings = toml::from_str(include_str!("../deploy/tier.toml"))?;
-        defaults.rocksdb.validate()?;
-        assert_eq!(
-            defaults.rocksdb.block_cache_mib,
-            RocksDbOptions::default().block_cache_mib
-        );
         Ok(())
     }
 }

@@ -1,0 +1,16 @@
+[global]
+    server role = standalone server
+
+[tier]
+    path = /srv/tier/primary
+    vfs objects = tier
+    tier:config = /etc/tier/config.toml
+    read only = no
+    force user = tier
+    force group = tier
+    valid users = USERNAME
+    kernel share modes = no
+    posix locking = no
+    store dos attributes = no
+    ea support = no
+    map archive = no

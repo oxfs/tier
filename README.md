@@ -1,60 +1,65 @@
 # Tier
 
-Tier 将 NAS 上的多个存储目录组织成一个 SMB 共享，通过 Web 控制台按目录配置**缓存、持久化存储、归档**，子目录默认继承父级策略。
-
-文件按策略写入缓存盘或持久盘，后台再校验、补齐副本和归档。客户端要求同步落盘时，会同步当前文件及必要元数据，但不等待其他副本；副本补齐前，当前数据盘故障仍可能丢失最新内容。
-
-正文对象以 `UUID--文件名` 命名，逻辑重命名后由后台更新；过长的名称提示会截断，完整名称仍保存在元数据中。
+Tier 通过 Samba 提供文件共享，后台按目录策略维护多盘副本和 WebDAV 归档。文件保留原目录和文件名；目录、描述信息和文件内容共同用于恢复，不需要数据库。
 
 ## 安装
 
 ### Debian 13
 
-使用 x86-64 和 Debian 官方源的 Samba。从 [Releases](https://github.com/RainMark/tier/releases) 下载 `tier-debian13-amd64.tar.gz` 与 `SHA256SUMS` 到同一目录；安装程序会检查架构和完整 Samba 包版本是否匹配。
+从 [Releases](https://github.com/RainMark/tier/releases) 下载适合机器架构的安装包。Samba 模块必须与安装包记录的 Debian Samba 版本一致；安装脚本会检查版本。
 
 ```sh
 sudo apt update
-sudo apt install samba libprotobuf-c1 libjemalloc2
-sha256sum --check SHA256SUMS
+sudo apt install samba
 tar -xzf tier-debian13-amd64.tar.gz
-cd tier-debian13-amd64
-sudo ./install.sh
-sudo systemctl enable --now tier
+sudo bash tier/deploy/install.sh
+sudo install -m 0640 -o root -g tier tier/deploy/config.toml.example /etc/tier/config.toml
 ```
 
-在 NAS 上打开 `http://127.0.0.1:9480`；远程管理可先运行 `ssh -L 9480:127.0.0.1:9480 用户名@NAS地址`。
+先挂载各存储盘，再修改 `/etc/tier/config.toml` 中的路径和副本策略。主盘保存权威目录和描述信息，新内容先写入主盘。`copies` 是主盘之外的内容副本数；`gc = true` 允许在副本完成后删除主盘内容。
 
-先挂载数据盘，再在控制台登记各盘上的专用目录，配置根目录 `/` 的副本策略，并将元数据备份保存到不同设备。正文对象目录由 Tier 管理，不应直接修改。
-
-将包内 `samba-share.conf` 的全局设置和共享配置合并到 `/etc/samba/smb.conf`。其中 `path = /` 表示 Tier 虚拟根目录。为已有 Linux 用户设置 SMB 密码并启动共享：
+让 `tier` 用户能够读写各存储目录，然后初始化磁盘身份：
 
 ```sh
-sudo smbpasswd -a 用户名
-sudo testparm -s
-sudo systemctl enable smbd
+sudo runuser -u tier -- tier /etc/tier/config.toml init
+```
+
+参照安装包的 `deploy/smb.conf.example` 配置 `/etc/samba/smb.conf`，使共享路径与主盘一致，将 `USERNAME` 替换为允许访问共享的本机用户，并设置其 Samba 密码：
+
+```sh
+sudo smbpasswd -a USERNAME
+sudo testparm
+sudo systemctl enable --now tier
 sudo systemctl restart smbd
 ```
 
-Windows 通过 `\\NAS地址\tier` 访问。升级 Samba 后，安装匹配的 Tier 发布包并重启两个服务。
+## 使用
 
-## 配置与恢复
+通过 SMB 访问文件。不要直接修改存储盘中的文件或 `.tier` 内部目录。后台自动补齐闲置文件的副本，完成后按策略释放主盘内容；配置变更在下一轮扫描生效。日志可通过 `journalctl -u tier` 查看。
 
-启动配置为 `/etc/tier/tier.toml`，元数据默认存放在 `/var/lib/tier/metadata`。设备和策略通过控制台管理；「元数据」页分别配置**文件映射导出**和**元数据备份**的启用状态、间隔、保存目录及保留份数。后端日志用 `journalctl -u tier -f` 查看，插件日志位于 Samba 配置的日志目录。
+已有本地副本的文件修改前会恢复到主盘。仍被访问的文件不能重命名或删除；恢复写入也需要等待旧副本读者关闭。归档文件只读，读取时从 WebDAV 下载并校验；目录浏览不会下载文件内容。
 
-文件映射导出为 CSV，记录逻辑路径和各副本的实际位置，用于找回文件或迁移到普通目录，不能用于恢复 Tier 元数据。正式迁移应先停服，再离线导出映射并复制文件，避免迁移期间映射变化：
+WebDAV 配置示例：
 
-```sh
-sudo systemctl stop tier
-sudo tier --config /etc/tier/tier.toml export /mnt/backup/files.csv
+```toml
+[archives.remote]
+url = "https://dav.example.com/tier/"
+username_env = "WEBDAV_USER"
+password_env = "WEBDAV_PASSWORD"
+
+[[policies]]
+path = "archive"
+copies = 0
+gc = true
+archive = { targets = ["remote"], copies = 1 }
 ```
 
-误删文件可从回收站恢复。元数据备份保存完整数据库，不包含正文；元数据丢失时，使用备份和存活设备检查、恢复到新的目录。省略 `--backup-id` 时使用最新一份：
+远端目录需要预先创建。凭据写入 `/etc/tier/secrets`，格式为 `WEBDAV_USER=...`、`WEBDAV_PASSWORD=...`；该文件仅允许管理员读取。Samba 进程也需要这些环境变量才能读取归档，可通过 `systemctl edit smbd` 为其配置同一个 `EnvironmentFile`。凭据变更后重启 `tier` 和 `smbd`。
 
-```sh
-sudo tier backups /mnt/backup/metadata
-sudo systemctl stop tier
-sudo tier inspect /mnt/backup/metadata /mnt/surviving-disk
-sudo tier --db /var/lib/tier/recovered restore /mnt/backup/metadata --target disk1=/mnt/surviving-disk
-```
+## 恢复
 
-示例中的 `disk1` 替换为控制台登记的设备名。确认检查报告后，将 TOML 的 `db` 指向恢复目录，再启动服务。恢复后两个保存计划默认停用，确认目的地后重新启用。只有明确接受不完整恢复时才使用 `--allow-degraded`。Tier 重启后，SMB 客户端需要重新连接。
+遇到副本不一致，先保留各盘内容并查看日志，不要删除描述文件。单个副本盘故障不影响主盘上仍存在的文件；后台会报告未满足的策略。
+
+跨盘重命名或删除中断时，恢复相关磁盘后重启服务，系统会重放已记录的操作。不要手动删除 `.tier/namespace.json`。
+
+主盘故障时先停止 `smbd` 和 `tier`，保护剩余盘。其他盘保留的目录、描述信息及内容用于恢复；系统不会自动选择新主盘。尚未复制的新写入可能丢失。不要对缺失挂载点重新执行初始化。
