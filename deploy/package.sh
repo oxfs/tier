@@ -1,23 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ $# != 3 ]]; then
-    echo "Usage: $0 TIER_BINARY MODULE_DIRECTORY OUTPUT_DIRECTORY" >&2
-    exit 2
-fi
-repo=$(cd "$(dirname "$0")/.." && pwd)
-binary=$(realpath "$1")
-module=$(realpath "$2")
-output=$(realpath -m "$3")
-arch=$(cat "$module/architecture")
-name="tier-debian13-$arch"
-mkdir -p "$output"
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+binary=${1:-"$root/target/release/tier"}
+module=${2:-"$root/target/samba/tier.so"}
+output=${3:-"$root/target/packages"}
+arch=$(dpkg --print-architecture)
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-mkdir "$stage/$name"
-install -m755 "$binary" "$stage/$name/tier"
-install -m755 "$module/tier.so" "$stage/$name/tier.so"
-cp "$module/"{architecture,samba-version} "$stage/$name/"
-cp "$repo/deploy/"{install.sh,tier.toml,tier.service,samba-share.conf} "$stage/$name/"
-cp "$repo/README.md" "$stage/$name/"
-tar -C "$stage" -czf "$output/$name.tar.gz" "$name"
-(cd "$output" && sha256sum "$name.tar.gz" >SHA256SUMS)
+mkdir -p "$output" "$stage/tier/bin" "$stage/tier/lib" "$stage/tier/deploy"
+install -m 0755 "$binary" "$stage/tier/bin/tier"
+install -m 0755 "$module" "$stage/tier/lib/tier.so"
+install -m 0755 "$root/deploy/install.sh" "$stage/tier/deploy/"
+install -m 0644 "$root/deploy/"{tier.service,config.toml.example,smb.conf.example} "$stage/tier/deploy/"
+dpkg-query -W -f='${Version}\n' samba >"$stage/tier/deploy/samba-version"
+tar -C "$stage" -czf "$output/tier-debian13-$arch.tar.gz" tier
+(cd "$output" && sha256sum "tier-debian13-$arch.tar.gz" >SHA256SUMS)
+cat "$output/SHA256SUMS"

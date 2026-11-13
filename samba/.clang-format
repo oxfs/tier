@@ -1,6 +1,0 @@
-BasedOnStyle: LLVM
-UseTab: Always
-IndentWidth: 8
-BreakBeforeBraces: Linux
-ColumnLimit: 90
-SortIncludes: Never

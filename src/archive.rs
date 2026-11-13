@@ -1,418 +1,146 @@
-use crate::core::{objects, schema};
-pub(crate) mod webdav;
-use self::webdav::WebDav;
-use crate::core::{Engine, Record, fingerprint, now};
-use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashSet,
-    fs,
-    io::{self, Seek},
+use crate::{
+    config::{ArchiveBackup, ArchiveTarget, Config},
+    descriptor::{ArchiveCopy, State},
 };
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct ArchivePolicy {
-    pub targets: Vec<String>,
-    pub copies: usize,
-    pub delay_secs: u64,
-    pub retain_local: usize,
+use anyhow::{Context, Result, bail, ensure};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use sha2::{Digest, Sha256};
+use std::{
+    fs::File,
+    io::{Read, Seek},
+    time::Duration,
+};
+
+fn request(target: &ArchiveTarget, method: &str, key: &str) -> Result<ureq::Request> {
+    ensure!(
+        key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid archive object key"
+    );
+    let mut url = url::Url::parse(&target.url)?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("invalid archive base URL"))?
+        .pop_if_empty()
+        .push(key);
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(Duration::from_secs(300))
+        .build();
+    let mut request = agent.request(method, url.as_str());
+    if let (Some(user), Some(password)) = (&target.username_env, &target.password_env) {
+        let credentials = format!(
+            "{}:{}",
+            std::env::var(user).context("archive username environment missing")?,
+            std::env::var(password).context("archive password environment missing")?
+        );
+        request = request.set(
+            "Authorization",
+            &format!("Basic {}", STANDARD.encode(credentials)),
+        );
+    }
+    Ok(request)
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ArchiveTarget {
-    pub name: String,
-    pub url: String,
-    pub user_env: Option<String>,
-    pub pass_env: Option<String>,
+
+fn download(config: &Config, copy: &ArchiveCopy, digest: &str, size: u64) -> Result<File> {
+    let target = config
+        .archives
+        .get(&copy.target)
+        .context("archive target unavailable")?;
+    let response = request(target, "GET", &copy.key)?
+        .call()
+        .map_err(|_| anyhow::anyhow!("archive GET failed on {}", copy.target))?;
+    let mut source = response
+        .into_reader()
+        .take(size.checked_add(1).context("archive size overflow")?);
+    let mut file = tempfile::tempfile()?;
+    let mut hash = Sha256::new();
+    let mut count = 0;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let n = source.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        std::io::Write::write_all(&mut file, &buffer[..n])?;
+        hash.update(&buffer[..n]);
+        count += n as u64;
+    }
+    ensure!(
+        count == size && format!("{:x}", hash.finalize()) == digest,
+        "archive content mismatch on {}",
+        copy.target
+    );
+    file.rewind()?;
+    Ok(file)
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ArchiveCopy {
-    pub node: String,
-    pub target: String,
-    pub key: String,
-    pub hash: String,
-    pub version: u64,
-    pub checked: u64,
-    pub error: Option<String>,
-}
-pub(crate) fn configured_client(
-    url: &str,
-    user: Option<&str>,
-    pass: Option<&str>,
-) -> Result<WebDav> {
-    let credentials = user
-        .zip(pass)
-        .map(|(u, p)| {
-            Ok::<_, anyhow::Error>((
-                std::env::var(u).context("missing WebDAV username environment variable")?,
-                std::env::var(p).context("missing WebDAV password environment variable")?,
-            ))
-        })
-        .transpose()?;
-    WebDav::new(
-        url,
-        credentials.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
+
+pub(crate) fn upload(
+    config: &Config,
+    backup: &ArchiveBackup,
+    source: &mut File,
+    digest: &str,
+    size: u64,
+) -> Result<Vec<ArchiveCopy>> {
+    let mut uploaded = Vec::new();
+    for name in &backup.targets {
+        let copy = ArchiveCopy {
+            target: name.clone(),
+            key: digest.to_owned(),
+        };
+        let target = config
+            .archives
+            .get(name)
+            .context("archive target unavailable")?;
+        source.rewind()?;
+        let result = request(target, "PUT", digest)?
+            .set("Content-Length", &size.to_string())
+            .send(&mut *source);
+        if result.is_ok() && download(config, &copy, digest, size).is_ok() {
+            uploaded.push(copy);
+            if uploaded.len() == backup.count {
+                return Ok(uploaded);
+            }
+        }
+    }
+    bail!(
+        "archive backup could not create {} verified copies",
+        backup.count
     )
 }
-impl Engine {
-    pub(crate) fn archive_client(&self, target: &str) -> Result<WebDav> {
-        let t: ArchiveTarget = self.require(&schema::archive_target(target))?;
-        configured_client(&t.url, t.user_env.as_deref(), t.pass_env.as_deref())
-    }
-    pub(crate) fn archive_policy(&self, id: &str) -> Result<Option<ArchivePolicy>> {
-        let view = self.inner.db.snapshot();
-        let mut id = id.to_owned();
-        let mut seen = HashSet::new();
-        loop {
-            ensure!(seen.insert(id.clone()), "namespace cycle");
-            if let Some(policy) = Self::view_get(&view, &schema::archive_policy(&id))? {
-                return Ok(Some(policy));
-            }
-            let node: Record =
-                Self::view_get(&view, &schema::node(&id))?.context("missing policy node")?;
-            if let Some(parent) = node.parent {
-                id = parent;
-            } else {
-                for item in view.iterator(rocksdb::IteratorMode::From(
-                    schema::TRASH.as_bytes(),
-                    rocksdb::Direction::Forward,
-                )) {
-                    let (key, value) = item?;
-                    if !key.starts_with(schema::TRASH.as_bytes()) {
-                        break;
-                    }
-                    let trash: crate::core::Trash = Self::decode(&value)?;
-                    if trash.node == id {
-                        return Ok(trash.archive_policy);
-                    }
-                }
-                return Ok(None);
-            }
+
+pub(crate) fn read(config: &Config, state: &State) -> Result<File> {
+    let digest = state
+        .digest
+        .as_deref()
+        .context("archive has no content digest")?;
+    for copy in &state.archives {
+        if let Ok(file) = download(config, copy, digest, state.size) {
+            return Ok(file);
         }
     }
-    pub fn add_archive(
-        &self,
-        name: &str,
-        url: &str,
-        user_env: Option<&str>,
-        pass_env: Option<&str>,
-    ) -> Result<()> {
-        ensure!(crate::core::safe_name(name), "invalid archive name");
-        ensure!(
-            user_env.is_some() == pass_env.is_some(),
-            "supply both credential variables"
-        );
-        WebDav::new(url, None)?;
-        let _guard = self.inner.namespace.write();
-        ensure!(
-            self.kv_get::<ArchiveTarget>(&schema::archive_target(name))?
-                .is_none(),
-            "archive already exists"
-        );
-        self.put_record(
-            &schema::archive_target(name),
-            &ArchiveTarget {
-                name: name.into(),
-                url: url.into(),
-                user_env: user_env.map(Into::into),
-                pass_env: pass_env.map(Into::into),
-            },
-            true,
-        )
+    bail!("no verified archive copy available")
+}
+
+pub(crate) fn verify(config: &Config, state: &State) -> Result<()> {
+    let digest = state
+        .digest
+        .as_deref()
+        .context("archive has no content digest")?;
+    for copy in &state.archives {
+        download(config, copy, digest, state.size)?;
     }
-    pub fn set_archive_policy(&self, path: &str, p: &ArchivePolicy) -> Result<()> {
-        let _guard = self.inner.namespace.write();
-        let node = self.lookup_unlocked(path)?;
-        ensure!(
-            node.is_dir
-                && p.copies <= p.targets.len()
-                && p.targets.iter().collect::<HashSet<_>>().len() == p.targets.len(),
-            "invalid archive policy"
-        );
-        for t in &p.targets {
-            let _: ArchiveTarget = self.require(&schema::archive_target(t))?;
-        }
-        self.atomic(
-            vec![
-                Self::encoded(schema::archive_policy(&node.id), p)?,
-                Self::rescan_record(&node.id)?,
-            ],
-            vec![],
-            true,
-        )?;
-        Ok(())
-    }
-    pub(crate) fn archive_copies(&self, id: &str) -> Result<Vec<ArchiveCopy>> {
-        let r = self.record(id)?;
-        Ok(self
-            .scan::<ArchiveCopy>(&schema::archive_copies(id))?
-            .into_iter()
-            .map(|(_, v)| v)
-            .filter(|v| v.version == r.node.version && r.hash.as_ref() == Some(&v.hash))
-            .collect())
-    }
-    pub(crate) fn recall_archive(&self, id: &str, out: &mut fs::File) -> Result<()> {
-        let r = self.record(id)?;
-        let mut errors = vec![];
-        for c in self.archive_copies(id)? {
-            out.set_len(0)?;
-            out.rewind()?;
-            match self
-                .archive_client(&c.target)
-                .and_then(|client| client.read_to(&c.key, &c.hash, r.node.size, out))
-            {
-                Ok(()) => {
-                    out.rewind()?;
-                    return Ok(());
-                }
-                Err(e) => errors.push(format!("{}: {e:#}", c.target)),
-            }
-        }
-        bail!("no readable current copy: {}", errors.join("; "))
-    }
-    pub(crate) fn archive_retained(&self, id: &str, default: usize) -> Result<usize> {
-        let Some(p) = self.archive_policy(id)? else {
-            return Ok(default);
-        };
-        let count = self
-            .archive_copies(id)?
-            .iter()
-            .filter(|c| p.targets.contains(&c.target) && c.error.is_none())
-            .count();
-        Ok(if p.copies > 0 && count >= p.copies {
-            p.retain_local
-        } else {
-            default
-        })
-    }
-    pub fn archive_tick(&self) -> Result<()> {
-        self.run_archive(true)
-    }
-    pub fn automatic_archive(&self) -> Result<()> {
-        self.run_archive(false)
-    }
-    fn run_archive(&self, manual: bool) -> Result<()> {
-        let Some(_maintenance) = self.inner.maintenance.try_lock() else {
-            return Ok(());
-        };
-        self.resume_rescans()?;
-        let mut errors = vec![];
-        for id in self.due_work(schema::WorkKind::Archive, manual)? {
-            if !self.record(&id).is_ok_and(|r| !r.node.is_dir) || !self.live(&id)? {
-                self.reschedule_work(schema::WorkKind::Archive, &id, false)?;
-                continue;
-            }
-            let result = self.archive_one(&id, manual);
-            let failed = result.is_err();
-            if let Err(e) = result {
-                self.put_record(&schema::archive_error(&id), &format!("{e:#}"), false)?;
-                errors.push(format!("{id}: {e:#}"));
-            } else {
-                self.delete_record(&schema::archive_error(&id))?;
-            }
-            self.reschedule_work(schema::WorkKind::Archive, &id, failed)?;
-        }
-        for (k, c) in self.scan::<ArchiveCopy>(schema::ARCHIVE_GC)? {
-            if let Err(e) = self
-                .archive_client(&c.target)
-                .and_then(|client| client.remove(&c.key))
-            {
-                errors.push(format!("archive cleanup: {e:#}"));
-            } else {
-                self.delete_record(&k)?;
-            }
-        }
-        self.collect_garbage()?;
-        ensure!(errors.is_empty(), "{}", errors.join("; "));
-        Ok(())
-    }
-    fn archive_one(&self, id: &str, manual: bool) -> Result<()> {
-        let Some(r) = self.prepare_protected(id)? else {
-            return Ok(());
-        };
-        let configured = self.archive_policy(id)?;
-        let current = self.archive_copies(id)?;
-        let Some(p) = configured.filter(|p| p.copies > 0) else {
-            let current: Vec<_> = self
-                .scan::<ArchiveCopy>(&schema::archive_copies(id))?
-                .into_iter()
-                .map(|(_, c)| c)
-                .collect();
-            if !current.is_empty() {
-                let policy = self.policy(id)?;
-                let (targets, count) = policy.desired();
-                let n = self
-                    .copies(id)?
-                    .iter()
-                    .filter(|c| {
-                        c.version == r.node.version
-                            && targets.contains(&c.target)
-                            && r.hash
-                                .as_ref()
-                                .is_some_and(|h| self.matches_copy(&c.target, &c.object, h))
-                    })
-                    .count();
-                if n >= count {
-                    let lock = self.file_lock(id);
-                    let guard = lock.lock();
-                    let _namespace = self.inner.namespace.read();
-                    if !guard.writer && self.record(id)?.node.version == r.node.version {
-                        let mut puts = vec![];
-                        let mut dels = vec![];
-                        for c in current {
-                            puts.push(Self::encoded(schema::archive_gc(), &c)?);
-                            dels.push(schema::archive_copy(id, &c.target));
-                        }
-                        self.atomic(puts, dels, true)?;
-                    }
-                }
-            }
-            return Ok(());
-        };
-        if now()?.saturating_sub(r.closed_at) < p.delay_secs {
-            return Ok(());
-        }
-        let hash = r.hash.as_deref().context("missing hash")?;
-        let mut verified = vec![];
-        for mut c in current {
-            if !p.targets.contains(&c.target) {
-                continue;
-            }
-            let result = self
-                .archive_client(&c.target)
-                .and_then(|client| client.read_to(&c.key, hash, r.node.size, &mut io::sink()));
-            match result {
-                Ok(()) => {
-                    c.checked = now()?;
-                    c.error = None;
-                    // A renamed file keeps its old usable copy until the new
-                    // name is uploaded, verified and atomically published.
-                    if objects::matches_name(&c.key, &r.name) {
-                        verified.push(c);
-                    }
-                }
-                Err(e) => {
-                    if c.error.is_none() {
-                        c.checked = now()?;
-                    }
-                    c.error = Some(format!("{e:#}"));
-                    self.put_record(&schema::archive_copy(id, &c.target), &c, false)?;
-                    let policy = self.policy(id)?;
-                    if !manual
-                        && (policy.manual_repair
-                            || now()?.saturating_sub(c.checked) < policy.repair_grace_secs)
-                    {
-                        return Err(e.context("archive requires manual repair"));
-                    }
-                }
-            }
-        }
-        for name in &p.targets {
-            if verified.len() >= p.copies {
-                break;
-            }
-            if verified.iter().any(|c| &c.target == name) {
-                continue;
-            }
-            let mut source = tempfile::tempfile()?;
-            let local = self.copies(id)?.into_iter().find(|c| {
-                c.version == r.node.version && self.matches_copy(&c.target, &c.object, hash)
-            });
-            if let Some(c) = local {
-                io::copy(
-                    &mut self.target(&c.target)?.open_object(&c.object)?,
-                    &mut source,
-                )?;
-            } else {
-                self.recall_archive(id, &mut source)?;
-            }
-            ensure!(
-                fingerprint(&mut source)?.1 == hash,
-                "archive source changed"
-            );
-            source.rewind()?;
-            let client = self.archive_client(name)?;
-            let object = client.upload(&mut source, hash, &r.name)?;
-            let lock = self.file_lock(id);
-            let guard = lock.lock();
-            let namespace = self.inner.namespace.read();
-            let latest = self.record(id)?;
-            if guard.writer
-                || latest.node.version != r.node.version
-                || latest.name != r.name
-                || self.archive_policy(id)?.as_ref() != Some(&p)
-            {
-                drop(namespace);
-                drop(guard);
-                client.remove(&object)?;
-                return Ok(());
-            }
-            let c = ArchiveCopy {
-                node: id.into(),
-                target: name.clone(),
-                key: object,
-                hash: hash.into(),
-                version: r.node.version,
-                checked: now()?,
-                error: None,
-            };
-            let mut puts = vec![Self::encoded(schema::archive_copy(id, name), &c)?];
-            if let Some(old) = self.kv_get::<ArchiveCopy>(&schema::archive_copy(id, name))? {
-                puts.push(Self::encoded(schema::archive_gc(), &old)?);
-            }
-            self.atomic(puts, vec![], true)?;
-            verified.push(c);
-        }
-        ensure!(verified.len() >= p.copies, "archive placement incomplete");
-        let verified_local: HashSet<String> = self
-            .copies(id)?
-            .into_iter()
-            .filter(|c| {
-                c.version == r.node.version && self.matches_copy(&c.target, &c.object, hash)
-            })
-            .map(|c| c.object)
-            .collect();
-        ensure!(
-            verified_local.len() >= p.retain_local,
-            "archive local retention is not satisfied"
-        );
-        // Each selected remote was read back immediately above, before local eviction.
-        let lock = self.file_lock(id);
-        let mut guard = lock.lock();
-        let _namespace = self.inner.namespace.read();
-        let mut latest = self.record(id)?;
-        if guard.writer
-            || latest.node.version != r.node.version
-            || latest.name != r.name
-            || self.archive_policy(id)?.as_ref() != Some(&p)
-        {
-            return Ok(());
-        }
-        let policy = self.policy(id)?;
-        let mut locals = self.copies(id)?;
-        locals.sort_by_key(|c| !policy.persistent_storage.contains(&c.target));
-        let mut keep = vec![];
-        let mut puts = vec![];
-        let mut deletes = vec![];
-        for c in locals {
-            if c.version == r.node.version
-                && verified_local.contains(&c.object)
-                && keep.len() < p.retain_local
-            {
-                keep.push(c);
-                continue;
-            }
-            puts.push(Self::encoded(schema::garbage(&c.target), &c)?);
-            deletes.push(schema::copy(id, &c.target));
-        }
-        latest.primary = keep.first().map(|c| c.target.clone());
-        puts.push(Self::encoded(schema::node(id), &latest)?);
-        self.atomic(puts, deletes, true)?;
-        if guard.body.as_ref().is_some_and(|b| {
-            !keep
+    Ok(())
+}
+
+pub(crate) fn satisfied(backup: Option<&ArchiveBackup>, state: &State) -> bool {
+    match backup {
+        None => true,
+        Some(backup) => {
+            state
+                .archives
                 .iter()
-                .any(|c| c.object == b.copy.object && c.target == b.copy.target)
-        }) {
-            guard.body = None;
+                .filter(|copy| backup.targets.contains(&copy.target))
+                .count()
+                >= backup.count
         }
-        Ok(())
     }
 }

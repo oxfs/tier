@@ -1,0 +1,22 @@
+from waflib.TaskGen import after_method, feature
+from waflib.Utils import to_list
+
+
+@feature('tier_archive')
+@after_method('apply_link')
+def tier_archive_dependency(module):
+    module.link_task.dep_nodes.append(module.rust_archive)
+
+
+bld.SAMBA3_MODULE('vfs_tier', subsystem='vfs',
+    source='vfs_tier.c', deps='samba-util',
+    cflags='-fvisibility=hidden',
+    init_function='', internal_module=False, enabled=True)
+module = bld.get_tgen_by_name('vfs_tier')
+module.env = module.env.derive()
+module.rust_archive = bld.srcnode.find_node('bin/libtier.a')
+module.features = to_list(module.features) + ['tier_archive']
+module.env.append_value('LINKFLAGS', [
+    '-Wl,--whole-archive', module.rust_archive.abspath(),
+    '-Wl,--no-whole-archive', '-Wl,--exclude-libs,ALL',
+    '-ldl', '-lpthread', '-lm'])

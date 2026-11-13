@@ -1,24 +1,14 @@
-.PHONY: web build check scripts model
+.PHONY: build check
 
-web:
-	cd web && npm ci --no-audit --no-fund && npm run build
-
-build: web
+build:
 	cargo build --release --locked
 
-scripts:
-	shellcheck samba/*.sh deploy/*.sh ci/*.sh tests/*.sh tests/smb/*.sh tests/model/*.sh
-	shfmt -d -i 4 -ci samba/*.sh deploy/*.sh ci/*.sh tests/*.sh tests/smb/*.sh tests/model/*.sh
-	ruff check tests/smb
-	ruff format --check tests/smb
-
-model:
-	tests/model/check.sh
-
-check: web scripts
-	cd web && npm run fmt:check
-	cd web && npm test
-	clang-format --dry-run --Werror samba/*.c samba/*.h
+check:
 	cargo fmt --check
 	cargo clippy --locked --all-targets -- -D warnings
 	cargo test --locked
+	shellcheck samba/*.sh deploy/*.sh tests/*.sh ci/*.sh
+	shfmt -d -i 4 -ci samba/*.sh deploy/*.sh tests/*.sh ci/*.sh
+	clang-format --dry-run --Werror samba/*.c
+	ruff check --isolated tests/*.py
+	ruff format --check --isolated tests/*.py

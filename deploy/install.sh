@@ -1,45 +1,44 @@
-#!/bin/sh
-set -eu
-cd "$(dirname "$0")"
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+binary=${1:-"$root/bin/tier"}
+module=${2:-"$root/lib/tier.so"}
+[[ $EUID == 0 ]] || {
+    echo "Run as root." >&2
+    exit 1
+}
 # shellcheck source=/dev/null
-. /etc/os-release
-if [ "$ID" != debian ] || [ "$VERSION_ID" != 13 ]; then
-    echo 'This package requires Debian 13.' >&2
-    exit 1
-fi
-[ "$(dpkg --print-architecture)" = "$(cat architecture)" ] || {
-    echo 'Package architecture does not match this host.' >&2
+source /etc/os-release
+[[ $ID == debian && $VERSION_ID == 13 ]] || {
+    echo "Debian 13 is required." >&2
     exit 1
 }
-[ "$(dpkg-query -W -f='${Version}' samba)" = "$(cat samba-version)" ] || {
-    echo 'Samba package version does not match tier.so; install a matching Tier package.' >&2
+[[ -f $binary && -f $module ]] || {
+    echo "Build the daemon and Samba module first." >&2
     exit 1
 }
-for dependency in libprotobuf-c1 libjemalloc2; do
-    [ "$(dpkg-query -W -f='${Status}' "$dependency" 2>/dev/null)" = 'install ok installed' ] || {
-        echo "Tier requires $dependency; install it with apt install $dependency." >&2
+if [[ -f "$root/deploy/samba-version" ]]; then
+    [[ $(dpkg-query -W -f='${Version}' samba) == "$(cat "$root/deploy/samba-version")" ]] || {
+        echo 'Samba package version differs from this module build; rebuild the module for the installed package.' >&2
         exit 1
     }
-done
-getent group tier >/dev/null || groupadd --system tier
-module_dir=$(smbd -b | awk '$1 == "MODULESDIR:" {print $2}')
-[ -n "$module_dir" ] || {
-    echo 'Cannot locate Samba modules.' >&2
-    exit 1
-}
-install -d /usr/local/bin "$module_dir/vfs"
-staged=$(mktemp /usr/local/bin/.tier.XXXXXX)
-module=$(mktemp "$module_dir/vfs/.tier.XXXXXX")
-trap 'rm -f "$staged" "$module"' EXIT
-install -m755 tier "$staged"
-install -m755 tier.so "$module"
-mv -f "$staged" /usr/local/bin/tier
-mv -f "$module" "$module_dir/vfs/tier.so"
-install -d -m755 /etc/tier
-install -d -m700 /var/lib/tier
-if [ ! -e /etc/tier/tier.toml ]; then
-    install -m640 tier.toml /etc/tier/tier.toml
 fi
-install -Dm644 tier.service /etc/systemd/system/tier.service
-if [ -d /run/systemd/system ]; then systemctl daemon-reload; fi
-printf '%s\n' 'Review /etc/tier/tier.toml, merge samba-share.conf, then start tier and smbd.'
+modules=$(smbd -b | awk '$1 == "MODULESDIR:" { print $2 }')
+[[ -d "$modules/vfs" ]]
+if ! id tier >/dev/null 2>&1; then
+    if ! getent group tier >/dev/null; then
+        groupadd --system tier
+    fi
+    useradd --system --gid tier --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin tier
+fi
+install -m 0755 "$binary" /usr/local/bin/tier
+install -m 0755 "$module" "$modules/vfs/tier.so"
+install -m 0644 "$root/deploy/tier.service" /etc/systemd/system/tier.service
+install -d -m 0750 -o root -g tier /etc/tier
+if [[ -d /run/systemd/system ]]; then
+    systemctl daemon-reload
+fi
+echo 'Installed. Configure /etc/tier/config.toml (readable by tier), make storage roots writable by tier, then run:'
+echo '  runuser -u tier -- tier /etc/tier/config.toml init'
+echo 'Configure the Samba share before starting tier and restarting smbd.'

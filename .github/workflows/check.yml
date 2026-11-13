@@ -10,116 +10,53 @@ concurrency:
 permissions:
   contents: read
 jobs:
-  model:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - name: Check storage invariants and counterexamples
-        run: |
-          jar="$RUNNER_TEMP/tla2tools.jar"
-          curl --fail --location --retry 3 --output "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
-          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum --check
-          TLA2TOOLS_JAR="$jar" make model
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: 4
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - run: sudo apt-get update -qq && sudo apt-get install -y clang clang-format libclang-dev cmake pkg-config shellcheck shfmt
-      - run: |
-          python3 -m venv "$RUNNER_TEMP/lint"
-          "$RUNNER_TEMP/lint/bin/pip" install -r tests/requirements-dev.txt
-          echo "$RUNNER_TEMP/lint/bin" >> "$GITHUB_PATH"
-      - run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-      - run: rustup default stable
-      - name: Install rust-analyzer
-        run: |
-          tools="$RUNNER_TEMP/tier-tools"
-          mkdir -p "$tools"
-          curl --fail --location --retry 3 \
-            --output "$tools/rust-analyzer.gz" \
-            https://github.com/rust-lang/rust-analyzer/releases/download/2026-11-09/rust-analyzer-x86_64-unknown-linux-gnu.gz
-          echo "8c039b25cb338b3970c731646677a4c9d4e9dd7a92c9ab9ae459c71467fbf4a9  $tools/rust-analyzer.gz" | sha256sum --check
-          gzip -dc "$tools/rust-analyzer.gz" > "$tools/rust-analyzer"
-          chmod +x "$tools/rust-analyzer"
-          "$tools/rust-analyzer" --version
-          echo "$tools" >> "$GITHUB_PATH"
-      - id: rust-version
-        run: echo "version=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache/restore@v4
-        id: rust-cache
+          components: rustfmt, clippy, rust-analyzer
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ubuntu-amd64-rust-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}-${{ github.sha }}
-          restore-keys: |
-            ubuntu-amd64-rust-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}-
-            ubuntu-amd64-rust-${{ steps.rust-version.outputs.version }}-
+          key: rust-native-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: rust-native-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang-format shellcheck shfmt
+          python3 -m venv "$RUNNER_TEMP/lint"
+          "$RUNNER_TEMP/lint/bin/pip" install ruff
+          echo "$RUNNER_TEMP/lint/bin" >> "$GITHUB_PATH"
       - run: make check
       - run: rust-analyzer diagnostics . --severity error
-      - run: tests/capacity-smoke.sh
-      - id: rust-build
-        run: cargo build --release --locked
-      - uses: actions/cache/save@v4
-        if: ${{ !cancelled() && steps.rust-build.outcome == 'success' && steps.rust-cache.outputs.cache-primary-key != '' && steps.rust-cache.outputs.cache-hit != 'true' }}
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+      - run: make build
       - name: Verify release version
         if: startsWith(github.ref, 'refs/tags/v')
         run: test "v$(target/release/tier --version | cut -d' ' -f2)" = "$GITHUB_REF_NAME"
-      - name: Prepare Debian build environment
-        id: samba-environment
+      - name: Prepare Debian
+        id: debian
         run: |
-          mkdir -p "$RUNNER_TEMP/tier-debian"
-          docker run -d --name tier-builder \
-            -v "$PWD:/workspace" \
-            -v "$RUNNER_TEMP/tier-debian:/build" \
-            -e TIER_BIN=/workspace/target/release/tier \
-            -w /workspace debian:13-slim sleep infinity
-          docker exec tier-builder /workspace/ci/build-debian.sh prepare
-          echo "key=$(cat "$RUNNER_TEMP/tier-debian/environment-key")" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache/restore@v4
-        id: samba-cache
+          mkdir -p "$RUNNER_TEMP/debian"
+          docker run -d --name tier-builder -v "$PWD:/workspace" -v "$RUNNER_TEMP/debian:/build" -w /workspace debian:13-slim sleep infinity
+          docker exec tier-builder bash ci/debian.sh prepare
+          echo "key=$(cat "$RUNNER_TEMP/debian/environment-key")" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/tier-debian/ccache
-          key: samba-${{ steps.samba-environment.outputs.key }}-${{ hashFiles('samba/build.sh', 'ci/build-debian.sh') }}-${{ github.sha }}
-          restore-keys: |
-            samba-${{ steps.samba-environment.outputs.key }}-${{ hashFiles('samba/build.sh', 'ci/build-debian.sh') }}-
-      - name: Build Debian Samba package
-        id: samba-build
-        run: docker exec tier-builder /workspace/ci/build-debian.sh
-      - uses: actions/cache/save@v4
-        if: ${{ !cancelled() && steps.samba-build.outcome == 'success' && steps.samba-cache.outputs.cache-primary-key != '' && steps.samba-cache.outputs.cache-hit != 'true' }}
-        with:
-          path: ${{ runner.temp }}/tier-debian/ccache
-          key: ${{ steps.samba-cache.outputs.cache-primary-key }}
-      - name: Test package in clean Debian runtime
-        run: |
-          docker run --rm \
-            -v "$PWD:/workspace:ro" \
-            -v "$RUNNER_TEMP/tier-debian/artifacts:/artifacts" \
-            -e TIER_PACKAGE=/artifacts/tier-debian13-amd64.tar.gz \
-            -w /workspace debian:13-slim /workspace/ci/test-debian.sh
+          path: ${{ runner.temp }}/debian/samba
+          key: samba-native-${{ steps.debian.outputs.key }}-${{ hashFiles('samba/build.sh', 'samba/wscript_build') }}
+      - name: Build, install and test Samba package
+        run: docker exec tier-builder bash ci/debian.sh
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: tier-debian13-amd64
-          path: ${{ runner.temp }}/tier-debian/artifacts/*
-          if-no-files-found: warn
-      - name: Remove build container
+          path: ${{ runner.temp }}/debian/artifacts/*
+      - name: Remove test container
         if: always()
         run: docker rm -f tier-builder || true
