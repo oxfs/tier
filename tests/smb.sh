@@ -108,6 +108,7 @@ if [[ ${TIER_TEST_CIFS:-0} == 1 ]]; then
     mkdir "$tmp/mount"
     mount -t cifs //127.0.0.1/tier "$tmp/mount" -o port=14447,username=root,password=test-password,vers=3.0,cache=none,actimeo=0
     mounted=1
+    findmnt --mountpoint "$tmp/mount"
     mkdir "$tmp/mount/mounted"
     cp "$tmp/input" "$tmp/mount/mounted/file.txt"
     cmp "$tmp/input" "$tmp/mount/mounted/file.txt"
@@ -121,5 +122,6 @@ if [[ ${TIER_TEST_CIFS:-0} == 1 ]]; then
     rmdir "$tmp/mount/moved"
     umount "$tmp/mount"
     mounted=0
+    echo 'PASS: CIFS mount, directory and file lifecycle, read after primary GC'
 fi
 python3 "$root/tests/detach-smb.py" "$tmp/replica"

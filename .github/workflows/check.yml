@@ -48,7 +48,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/debian"
           sudo modprobe cifs
-          docker run -d --name tier-builder --cap-add SYS_ADMIN --security-opt apparmor=unconfined -v "$PWD:/workspace" -v "$RUNNER_TEMP/debian:/build" -w /workspace debian:13-slim sleep infinity
+          docker run -d --name tier-builder --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH --security-opt apparmor=unconfined -v "$PWD:/workspace" -v "$RUNNER_TEMP/debian:/build" -w /workspace debian:13-slim sleep infinity
           docker exec tier-builder bash ci/debian.sh prepare
           echo "key=$(cat "$RUNNER_TEMP/debian/environment-key")" >> "$GITHUB_OUTPUT"
       - uses: actions/cache/restore@v4
