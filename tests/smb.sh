@@ -106,7 +106,7 @@ test ! -d "$tmp/replica/documents"
 test ! -d "$tmp/replica/renamed"
 if [[ ${TIER_TEST_CIFS:-0} == 1 ]]; then
     mkdir "$tmp/mount"
-    mount -t cifs //127.0.0.1/tier "$tmp/mount" -o port=14447,username=root,password=test-password,vers=3.0,cache=none,actimeo=0
+    mount -t cifs //127.0.0.1/tier "$tmp/mount" -o port=14447,username=root,password=test-password,vers=3.0,cache=none,actimeo=0,closetimeo=0
     mounted=1
     findmnt --mountpoint "$tmp/mount"
     mkdir "$tmp/mount/mounted"
