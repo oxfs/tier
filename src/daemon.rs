@@ -27,28 +27,36 @@ pub fn run(path: &Path) -> Result<()> {
             let archive_audit_interval =
                 Duration::from_secs(config.background.archive_audit_interval_secs);
             let store = Store::new(config)?;
-            let report = store.scan_pending()?;
-            crate::web::record(&health, "replicate", &serde_json::to_value(&report)?);
-            log("replicate", &serde_json::to_value(report)?);
             let remote = last_archive_audit
                 .is_none_or(|instant: Instant| instant.elapsed() >= archive_audit_interval);
-            if remote
-                || last_audit.is_none_or(|instant: Instant| instant.elapsed() >= audit_interval)
-            {
-                let report = if remote {
-                    store.scan()?
-                } else {
-                    store.scan_local_audit()?
-                };
+            let audit = remote
+                || last_audit.is_none_or(|instant: Instant| instant.elapsed() >= audit_interval);
+            // Audit scans also reconcile pending files. Choose one pass rather
+            // than rereading files that were just replicated in this iteration.
+            let report = if remote {
+                store.scan()?
+            } else if audit {
+                store.scan_local_audit()?
+            } else {
+                store.scan_pending()?
+            };
+            if report.changed > 0 && report.errors.is_empty() {
+                interval = Duration::ZERO;
+            }
+            let mut details = serde_json::to_value(&report)?;
+            if audit {
                 if remote {
                     last_archive_audit = Some(Instant::now());
-                    crate::web::record(&health, "audit", &serde_json::to_value(&report)?);
+                    crate::web::record(&health, "audit", &details);
                 }
                 let event = if remote { "archive_audit" } else { "audit" };
-                crate::web::record(&health, event, &serde_json::to_value(&report)?);
-                log(event, &serde_json::to_value(report)?);
+                crate::web::record(&health, event, &details);
+                log(event, &details);
                 last_audit = Some(Instant::now());
             }
+            details["completed"] = report.changed.into();
+            crate::web::record(&health, "replicate", &details);
+            log("replicate", &details);
             Ok(())
         })();
         if let Err(error) = result {

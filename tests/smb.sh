@@ -137,3 +137,44 @@ if [[ ${TIER_TEST_CIFS:-0} == 1 ]]; then
     echo 'PASS: CIFS mount, directory and file lifecycle, read after primary GC'
 fi
 python3 "$root/tests/detach-smb.py" "$tmp/replica"
+
+# Moving protected content into a GC policy retains its existing copy and only
+# creates the missing one. Exercise this through the real SMB rename path.
+mkdir "$tmp/replica2"
+chown "$user" "$tmp/replica2"
+cat >"$tmp/config.toml" <<EOF
+primary = "$tmp/primary"
+[replicas]
+backup = "$tmp/replica"
+second = "$tmp/replica2"
+[[backup]]
+path = ""
+count = 2
+gc = false
+[[backup]]
+path = "cold"
+count = 2
+gc = true
+EOF
+api init
+smb "mkdir warm; mkdir cold; put $tmp/input warm/file.txt"
+api scan
+test -f "$tmp/primary/warm/file.txt"
+existing="$tmp/replica"
+[[ -f "$existing/warm/file.txt" ]] || existing="$tmp/replica2"
+inode=$(stat -c %i "$existing/warm/file.txt")
+smb 'rename warm cold/warm'
+api scan
+test ! -f "$tmp/primary/cold/warm/file.txt"
+test "$(stat -c %i "$existing/cold/warm/file.txt")" = "$inode"
+cmp "$tmp/input" "$tmp/replica/cold/warm/file.txt"
+cmp "$tmp/input" "$tmp/replica2/cold/warm/file.txt"
+printf 'modified after moving into cold\n' >"$tmp/input"
+smb "put $tmp/input cold/warm/file.txt"
+api scan
+test ! -f "$tmp/primary/cold/warm/file.txt"
+cmp "$tmp/input" "$tmp/replica/cold/warm/file.txt"
+cmp "$tmp/input" "$tmp/replica2/cold/warm/file.txt"
+smb "get cold/warm/file.txt $tmp/cold-readback; del cold/warm/file.txt; rmdir cold/warm; rmdir cold"
+cmp "$tmp/input" "$tmp/cold-readback"
+echo 'PASS: move into cold reuses existing copy, verifies both copies, and supports further writes'

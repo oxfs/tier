@@ -77,8 +77,16 @@ impl Writer {
 #[derive(Debug, Default, serde::Serialize)]
 pub struct Report {
     pub completed: usize,
+    pub changed: usize,
     pub busy: usize,
     pub errors: Vec<String>,
+}
+
+enum MaintenanceOutcome {
+    Changed,
+    Checked,
+    Unchanged,
+    Busy,
 }
 
 struct MaintenancePlan {
@@ -428,13 +436,12 @@ impl Store {
         if source_path.exists() {
             sync_parent(&source_path)?;
         }
-        let (digest, size) = checksum(&mut source)?;
-        if let Some(expected) = current.as_ref().and_then(|state| state.digest.as_ref()) {
-            ensure!(
-                *expected == digest,
-                "content changed outside the writer protocol"
-            );
-        }
+        // Opening for write clears the digest. Policy changes and renames do
+        // not change content, so reuse its committed checksum.
+        let (digest, size) = match current.as_ref() {
+            Some(state) if state.digest.is_some() => (state.digest.clone().unwrap(), state.size),
+            _ => checksum(&mut source)?,
+        };
         // A retained primary counts toward the total and must exist before
         // publishing a smaller set of copies on other disks.
         if !gc && current.as_ref().is_none_or(|s| s.local_primary.is_none()) && !primary.exists() {
@@ -447,11 +454,11 @@ impl Store {
             let root = &self.config.replicas[name];
             self.verify_root(root)?;
             let destination = Self::path(root, relative)?;
-            let matches = File::open(&destination)
-                .ok()
-                .and_then(|mut file| checksum(&mut file).ok())
-                .is_some_and(|value| value == (digest.clone(), size));
-            if !matches {
+            let retained = destination == source_path
+                || current.as_ref().is_some_and(|state| {
+                    state.digest.is_some() && state.replicas.contains(name) && destination.is_file()
+                });
+            if !retained {
                 source.rewind()?;
                 copy_file(&mut source, &destination, root)?;
             }
@@ -645,8 +652,13 @@ impl Store {
                         let result = self.maintain_file(&relative, audit, remote);
                         let mut report = report.lock().unwrap();
                         match result {
-                            Ok(true) => report.completed += 1,
-                            Ok(false) => report.busy += 1,
+                            Ok(MaintenanceOutcome::Changed) => {
+                                report.completed += 1;
+                                report.changed += 1;
+                            }
+                            Ok(MaintenanceOutcome::Checked) => report.completed += 1,
+                            Ok(MaintenanceOutcome::Unchanged) => {}
+                            Ok(MaintenanceOutcome::Busy) => report.busy += 1,
                             Err(error) => report
                                 .errors
                                 .push(format!("{}: {error:#}", relative.display())),
@@ -658,19 +670,24 @@ impl Store {
         Ok(report.into_inner().unwrap())
     }
 
-    fn maintain_file(&self, relative: &Path, audit: bool, remote: bool) -> Result<bool> {
+    fn maintain_file(
+        &self,
+        relative: &Path,
+        audit: bool,
+        remote: bool,
+    ) -> Result<MaintenanceOutcome> {
         let pending = {
             let _namespace = self.namespace(false)?;
             let primary_exists = self.content(relative)?.exists();
             if !primary_exists && !Self::metadata(self.root(), relative)?.exists() {
-                return Ok(false);
+                return Ok(MaintenanceOutcome::Unchanged);
             }
             let Some(_state) = self.try_state_lock(relative)? else {
-                return Ok(false);
+                return Ok(MaintenanceOutcome::Busy);
             };
             let mut lock = self.lock(relative)?;
             if !try_lock(&lock, true)? {
-                return Ok(false);
+                return Ok(MaintenanceOutcome::Busy);
             }
             let current = descriptor::load(&mut lock)?.map(|(_, state)| state);
             let policy = self.config.backup_for(relative)?;
@@ -679,13 +696,21 @@ impl Store {
                 .as_ref()
                 .is_none_or(|state| plan.needs_work(&self.config, state, primary_exists))
         };
-        if pending {
-            self.reconcile(relative)
+        let (completed, outcome) = if pending {
+            (self.reconcile(relative)?, MaintenanceOutcome::Changed)
         } else if audit {
-            self.check_with_remote(relative, remote)
+            (
+                self.check_with_remote(relative, remote)?,
+                MaintenanceOutcome::Checked,
+            )
         } else {
-            Ok(true)
-        }
+            return Ok(MaintenanceOutcome::Unchanged);
+        };
+        Ok(if completed {
+            outcome
+        } else {
+            MaintenanceOutcome::Busy
+        })
     }
 
     fn walk(
