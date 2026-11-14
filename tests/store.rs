@@ -180,6 +180,100 @@ fn active_readers_and_writers_make_background_skip() -> Result<()> {
 }
 
 #[test]
+fn pending_scan_counts_changes_instead_of_unchanged_files() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let store = fixture.store(false)?;
+    write(&store, "file", b"contents")?;
+    let held = store.read(Path::new("file"))?;
+    let busy = store.scan_pending()?;
+    assert_eq!((busy.completed, busy.changed, busy.busy), (0, 0, 1));
+    drop(held);
+    let copied = store.scan_pending()?;
+    assert!(copied.errors.is_empty());
+    assert_eq!((copied.completed, copied.changed, copied.busy), (1, 1, 0));
+    let idle = store.scan_pending()?;
+    assert!(idle.errors.is_empty());
+    assert_eq!((idle.completed, idle.changed, idle.busy), (0, 0, 0));
+    let audited = store.scan()?;
+    assert!(audited.errors.is_empty());
+    assert_eq!((audited.completed, audited.changed), (1, 0));
+    write(&store, "file", b"modified")?;
+    let changed = store.scan_pending()?;
+    assert!(changed.errors.is_empty());
+    assert_eq!((changed.completed, changed.changed), (1, 1));
+    assert!(store.check(Path::new("file"))?);
+    Ok(())
+}
+
+#[test]
+fn move_to_cold_reuses_existing_copy_and_updates_both_after_write() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let fixture = Fixture::new()?;
+    let mut config = fixture.config(false);
+    config.backup[0].count = 2;
+    config.backup.push(Backup {
+        path: "cold".into(),
+        count: 2,
+        gc: true,
+        archive: None,
+    });
+    let store = Store::initialize(config)?;
+    write(&store, "photos/file", b"original")?;
+    assert!(store.scan_pending()?.errors.is_empty());
+    let existing = fixture
+        .replicas
+        .iter()
+        .find(|root| root.join("photos/file").exists())
+        .unwrap();
+    let inode = fs::metadata(existing.join("photos/file"))?.ino();
+    store.mkdir(Path::new("cold"))?;
+    store.rename(Path::new("photos"), Path::new("cold/photos"))?;
+    let report = store.scan_pending()?;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.changed, 1);
+    assert!(!fixture.primary.join("cold/photos/file").exists());
+    assert_eq!(
+        fs::metadata(existing.join("cold/photos/file"))?.ino(),
+        inode
+    );
+    for root in &fixture.replicas {
+        assert_eq!(fs::read(root.join("cold/photos/file"))?, b"original");
+    }
+    write(&store, "cold/photos/file", b"modified")?;
+    assert!(store.scan_pending()?.errors.is_empty());
+    for root in &fixture.replicas {
+        assert_eq!(fs::read(root.join("cold/photos/file"))?, b"modified");
+    }
+    assert!(store.check(Path::new("cold/photos/file"))?);
+    Ok(())
+}
+
+#[test]
+fn gc_checks_retained_copy_before_removing_primary() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut config = fixture.config(false);
+    config.backup[0].count = 2;
+    let store = Store::initialize(config)?;
+    write(&store, "file", b"original")?;
+    store.reconcile(Path::new("file"))?;
+    let existing = fixture
+        .replicas
+        .iter()
+        .find(|root| root.join("file").exists())
+        .unwrap();
+    fs::write(existing.join("file"), b"corrupt!")?;
+    let store = Store::new(fixture.config(true))?;
+    assert!(store.reconcile(Path::new("file")).is_err());
+    assert_eq!(fs::read(fixture.primary.join("file"))?, b"original");
+    // A missing old copy can be recreated; no state was published after failure.
+    fs::remove_file(existing.join("file"))?;
+    assert!(store.reconcile(Path::new("file"))?);
+    assert!(!fixture.primary.join("file").exists());
+    assert!(store.check(Path::new("file"))?);
+    Ok(())
+}
+
+#[test]
 fn inspection_detects_corruption_but_normal_reads_do_not_hash_content() -> Result<()> {
     let fixture = Fixture::new()?;
     let store = fixture.store(true)?;
