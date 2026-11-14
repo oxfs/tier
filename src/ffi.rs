@@ -148,11 +148,11 @@ unsafe extern "C" fn tier_stat(
     out: *mut libc::stat,
 ) -> i32 {
     call(|| {
-        let (m, archived) = unsafe { &*store }.stat(unsafe { path(name) })?;
+        let (m, archived, identity) = unsafe { &*store }.stat_identity(unsafe { path(name) })?;
         let s = unsafe { &mut *out };
         *s = unsafe { std::mem::zeroed() };
-        s.st_dev = m.dev();
-        s.st_ino = m.ino();
+        s.st_dev = 0x54494552;
+        s.st_ino = identity;
         s.st_mode = m.mode();
         s.st_nlink = m.nlink() as _;
         s.st_uid = m.uid();
@@ -298,6 +298,44 @@ unsafe extern "C" fn tier_setattr(
 mod tests {
     use super::*;
     use std::{ffi::CString, fs, io::Write, os::fd::FromRawFd};
+
+    #[test]
+    fn stat_identity_survives_gc_and_rejects_missing_storage() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let primary = temporary.path().join("primary");
+        let replica = temporary.path().join("replica");
+        fs::create_dir(&primary)?;
+        fs::create_dir(&replica)?;
+        let store = Store::initialize(toml::from_str(&format!(
+            "primary={primary:?}\n[replicas]\na={replica:?}\n[[backup]]\npath=''\ncount=1\ngc=true\n"
+        ))?)?;
+        // An imported file first gets an empty descriptor; publication must keep
+        // that inode when the first tracked write makes the descriptor nonempty.
+        fs::write(primary.join("image"), b"photo")?;
+        let name = CString::new("image")?;
+        let mut before = unsafe { std::mem::zeroed::<libc::stat>() };
+        assert_eq!(unsafe { tier_stat(&store, name.as_ptr(), &mut before) }, 0);
+        assert_eq!(fs::metadata(primary.join(".tier/meta/image"))?.len(), 0);
+        store.write(Path::new("image"))?.write_all(b"photo")?;
+        assert!(fs::metadata(primary.join(".tier/meta/image"))?.len() > 0);
+        assert_eq!(before.st_ino, store.logical_id(Path::new("image"))?);
+        store.reconcile(Path::new("image"))?;
+        assert!(!primary.join("image").exists());
+        let mut after = unsafe { std::mem::zeroed::<libc::stat>() };
+        assert_eq!(unsafe { tier_stat(&store, name.as_ptr(), &mut after) }, 0);
+        assert_eq!(
+            (before.st_dev, before.st_ino, before.st_size),
+            (after.st_dev, after.st_ino, after.st_size)
+        );
+        store.mkdir(Path::new("album"))?;
+        store.rename(Path::new("image"), Path::new("album/image"))?;
+        let name = CString::new("album/image")?;
+        assert_eq!(unsafe { tier_stat(&store, name.as_ptr(), &mut after) }, 0);
+        assert_eq!(before.st_ino, after.st_ino);
+        fs::rename(&replica, temporary.path().join("detached"))?;
+        assert_eq!(unsafe { tier_stat(&store, name.as_ptr(), &mut after) }, -1);
+        Ok(())
+    }
 
     #[test]
     fn directory_open_without_directory_flag_preserves_child_namespace() -> Result<()> {

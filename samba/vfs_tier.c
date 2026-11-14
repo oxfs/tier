@@ -118,11 +118,6 @@ static int stat_at(struct vfs_handle_struct *h, const struct files_struct *dir,
   if (!path || tier_stat(connection(h)->store, path, &s) != 0)
     return -1;
   convert(&s, out);
-  uint64_t id;
-  if (tier_identity(connection(h)->store, path, &id) != 0)
-    return -1;
-  out->st_ex_dev = 0x54494552;
-  out->st_ex_ino = id;
   return 0;
 }
 static int stat_path(struct vfs_handle_struct *h, struct smb_filename *name) {
@@ -138,6 +133,7 @@ static int stat_fd(struct vfs_handle_struct *h, struct files_struct *fsp,
     if (tier_stat(connection(h)->store, opened->path, &s) != 0)
       return -1;
     convert(&s, out);
+    return 0;
   } else if (SMB_VFS_NEXT_FSTAT(h, fsp, out) != 0)
     return -1;
   uint64_t id;

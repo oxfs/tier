@@ -229,8 +229,13 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(&path)?;
-        // Another process may have created this inode without syncing its directory yet.
-        sync_parent(&path)?;
+        // Primary descriptors are written only after this creation barrier.
+        // Recovery publishes the storage registry only after syncing restored entries;
+        // namespace moves sync both parents before releasing their namespace lock.
+        // An empty inode may still belong to a concurrent creator: never skip its barrier.
+        if file.metadata()?.len() == 0 {
+            sync_parent(&path)?;
+        }
         Ok(file)
     }
 

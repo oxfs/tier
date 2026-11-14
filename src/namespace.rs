@@ -215,11 +215,21 @@ impl Store {
     /// Archive-only attributes come from the descriptor without recalling data.
     /// Archived attributes override the descriptor file's physical attributes.
     pub fn stat(&self, relative: &Path) -> Result<(Metadata, Option<crate::FileAttributes>)> {
+        self.stat_identity(relative)
+            .map(|(metadata, attributes, _)| (metadata, attributes))
+    }
+
+    pub(crate) fn stat_identity(
+        &self,
+        relative: &Path,
+    ) -> Result<(Metadata, Option<crate::FileAttributes>, u64)> {
         validate_relative(relative)?;
         let _namespace = self.namespace(false)?;
         let content = Self::path(self.root(), relative)?;
         if content.is_dir() {
-            return Ok((fs::metadata(content)?, None));
+            let metadata = fs::metadata(content)?;
+            let identity = metadata.ino();
+            return Ok((metadata, None, identity));
         }
         if !content.exists() && !Self::metadata(self.root(), relative)?.is_file() {
             return Err(io::Error::from(io::ErrorKind::NotFound).into());
@@ -227,8 +237,9 @@ impl Store {
         let mut lock = self.lock(relative)?;
         FileExt::try_lock_shared(&lock)?;
         let _state = self.state_lock(relative, false)?;
+        let identity = lock.metadata()?.ino();
         if content.exists() {
-            return Ok((fs::metadata(content)?, None));
+            return Ok((fs::metadata(content)?, None, identity));
         }
         let state = descriptor::load(&mut lock)?
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?
@@ -241,6 +252,7 @@ impl Store {
                         .attributes
                         .ok_or_else(|| anyhow::anyhow!("archive attributes missing"))?,
                 ),
+                identity,
             ));
         }
         // Attribute queries must not read file contents or recall remote data.
@@ -258,7 +270,7 @@ impl Store {
                 Ok(metadata)
             })();
             if let Ok(metadata) = candidate {
-                return Ok((metadata, None));
+                return Ok((metadata, None, identity));
             }
         }
         Err(io::Error::from_raw_os_error(libc::EIO).into())
