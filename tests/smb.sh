@@ -95,7 +95,7 @@ cmp "$tmp/input" "$tmp/rewritten"
 test ! -f "$tmp/primary/documents/file.txt"
 cmp "$tmp/input" "$tmp/replica/documents/file.txt"
 # Reconnect while the descriptor is pending: the designated local copy is current.
-smb "allinfo documents/file.txt; get documents/file.txt $tmp/reconnected"
+smb "ls documents/file.txt; get documents/file.txt $tmp/reconnected"
 cmp "$tmp/input" "$tmp/reconnected"
 api scan
 test ! -f "$tmp/primary/documents/file.txt"
