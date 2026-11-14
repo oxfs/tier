@@ -144,7 +144,7 @@ fn scan_copies_content_descriptors_and_empty_directories() -> Result<()> {
 }
 
 #[test]
-fn gc_preserves_reads_and_later_writes_restore_primary() -> Result<()> {
+fn gc_preserves_reads_and_later_writes_modify_designated_replica() -> Result<()> {
     let fixture = Fixture::new()?;
     let store = fixture.store(true)?;
     write(&store, "file", b"before")?;
@@ -152,7 +152,8 @@ fn gc_preserves_reads_and_later_writes_restore_primary() -> Result<()> {
     assert!(!fixture.primary.join("file").exists());
     assert_eq!(read(&store, "file")?, b"before");
     write(&store, "file", b"after!")?;
-    assert!(fixture.primary.join("file").is_file());
+    assert!(!fixture.primary.join("file").exists());
+    assert_eq!(fs::read(fixture.replicas[0].join("file"))?, b"after!");
     assert_eq!(read(&store, "file")?, b"after!");
     assert!(store.check(Path::new("file")).is_err());
     assert!(store.reconcile(Path::new("file"))?);
@@ -179,15 +180,17 @@ fn active_readers_and_writers_make_background_skip() -> Result<()> {
 }
 
 #[test]
-fn corrupt_replica_is_reported_and_reads_use_a_verified_copy() -> Result<()> {
+fn inspection_detects_corruption_but_normal_reads_do_not_hash_content() -> Result<()> {
     let fixture = Fixture::new()?;
     let store = fixture.store(true)?;
     write(&store, "file", b"verified")?;
     assert!(store.reconcile(Path::new("file"))?);
     fs::write(fixture.replicas[0].join("file"), b"corrupt!")?;
     assert!(store.check(Path::new("file")).is_err());
+    assert_eq!(read(&store, "file")?, b"corrupt!");
+    fs::remove_file(fixture.replicas[0].join("file"))?;
     assert_eq!(read(&store, "file")?, b"verified");
-    fs::write(fixture.replicas[1].join("file"), b"corrupt!")?;
+    fs::remove_file(fixture.replicas[1].join("file"))?;
     assert!(store.read(Path::new("file")).is_err());
     Ok(())
 }
@@ -221,7 +224,7 @@ fn roots_cannot_alias_through_a_symlink() -> Result<()> {
 }
 
 #[test]
-fn primary_only_backup_restores_garbage_collected_content() -> Result<()> {
+fn reducing_copy_count_retains_designated_local_primary() -> Result<()> {
     let fixture = Fixture::new()?;
     let store = fixture.store(true)?;
     write(&store, "file", b"retained")?;
@@ -231,7 +234,8 @@ fn primary_only_backup_restores_garbage_collected_content() -> Result<()> {
     config.backup[0].count = 1;
     let store = Store::new(config)?;
     assert!(store.scan()?.errors.is_empty());
-    assert_eq!(fs::read(fixture.primary.join("file"))?, b"retained");
+    assert!(!fixture.primary.join("file").exists());
+    assert_eq!(fs::read(fixture.replicas[0].join("file"))?, b"retained");
     assert_eq!(read(&store, "file")?, b"retained");
     assert!(store.check(Path::new("file"))?);
     Ok(())
@@ -270,7 +274,8 @@ fn total_backup_count_includes_primary_before_and_after_gc_changes() -> Result<(
 
     let store = Store::new(settings(false))?;
     assert!(store.scan()?.errors.is_empty());
-    assert_eq!(fs::read(fixture.primary.join("file"))?, b"two copies");
+    assert!(!fixture.primary.join("file").exists());
+    assert_eq!(read(&store, "file")?, b"two copies");
     assert!(store.check(Path::new("file"))?);
     Ok(())
 }
@@ -474,17 +479,20 @@ fn replica_and_primary_restore_preserve_permissions_and_modified_time() -> Resul
 }
 
 #[test]
-fn primary_restore_waits_for_existing_replica_readers() -> Result<()> {
+fn designated_replica_readers_and_writers_share_the_same_inode() -> Result<()> {
     let fixture = Fixture::new()?;
     let store = fixture.store(true)?;
     write(&store, "file", b"contents")?;
     store.reconcile(Path::new("file"))?;
-    let reader = store.read(Path::new("file"))?;
-    assert!(store.write(Path::new("file")).is_err());
+    let mut reader = store.read(Path::new("file"))?;
+    write(&store, "file", b"changed!")?;
+    assert!(!store.reconcile(Path::new("file"))?);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    assert_eq!(bytes, b"changed!");
     assert!(!fixture.primary.join("file").exists());
     drop(reader);
-    store.write(Path::new("file"))?;
-    assert!(fixture.primary.join("file").is_file());
+    assert!(store.reconcile(Path::new("file"))?);
     Ok(())
 }
 
@@ -561,5 +569,26 @@ fn already_open_primary_handles_survive_unrelated_replica_detach() -> Result<()>
     writer.write_all(b"available")?;
     writer.set_len(4)?;
     assert_eq!(fs::read(fixture.primary.join("write"))?, b"avai");
+    Ok(())
+}
+
+#[test]
+fn pending_designated_replica_never_falls_back_to_stale_copies() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let store = fixture.store(true)?;
+    write(&store, "file", b"before")?;
+    store.reconcile(Path::new("file"))?;
+    write(&store, "file", b"after!")?;
+    assert!(!fixture.primary.join("file").exists());
+    assert_eq!(store.stat(Path::new("file"))?.0.len(), 6);
+    let detached = fixture.replicas[0].with_extension("detached");
+    fs::rename(&fixture.replicas[0], &detached)?;
+    assert!(store.read(Path::new("file")).is_err());
+    assert!(store.stat(Path::new("file")).is_err());
+    assert!(store.write(Path::new("file")).is_err());
+    fs::rename(&detached, &fixture.replicas[0])?;
+    store.reconcile(Path::new("file"))?;
+    assert_eq!(fs::read(fixture.replicas[1].join("file"))?, b"after!");
+    assert!(!fixture.primary.join("file").exists());
     Ok(())
 }

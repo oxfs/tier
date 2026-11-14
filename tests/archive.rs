@@ -126,6 +126,78 @@ fn config(root: &Path, servers: &[&Webdav]) -> Config {
 }
 
 #[test]
+fn daemon_reloads_archive_delay_and_retention_without_restart() -> Result<()> {
+    use std::{fs, process::Command, time::Instant};
+    struct Service(std::process::Child);
+    impl Drop for Service {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn wait_until(mut condition: impl FnMut() -> bool) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "daemon did not apply archive policy"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+    let server = Webdav::start(false);
+    let root = tempfile::tempdir()?;
+    let config_path = root.path().join("config.toml");
+    let settings = |after, ttl| {
+        format!(
+            "primary={:?}\n[replicas]\ndisk1={:?}\n[archives.dav0]\nurl={:?}\n[[backup]]\npath=''\ncount=1\ngc=true\narchive={{count=1,after_secs={after},local_ttl_secs={ttl}}}\n[background]\nscan_interval_secs=1\naudit_interval_secs=1\narchive_audit_interval_secs=1\n",
+            root.path().join("primary"),
+            root.path().join("replica-1"),
+            server.url
+        )
+    };
+    let store = Store::initialize(config(root.path(), &[&server]))?;
+    {
+        let mut writer = store.write(Path::new("photo"))?;
+        writer.write_all(b"hot reload content")?;
+    }
+    fs::write(&config_path, settings(3600, 3600))?;
+    let log_path = root.path().join("daemon.log");
+    let mut service = Service(
+        Command::new(env!("CARGO_BIN_EXE_tier"))
+            .arg(&config_path)
+            .env_remove("TIER_WEB_LISTEN")
+            .stderr(fs::File::create(&log_path)?)
+            .spawn()?,
+    );
+    wait_until(|| fs::read_to_string(&log_path).is_ok_and(|log| log.contains("archive_audit")))?;
+    assert_eq!(server.puts.load(Ordering::Relaxed), 0);
+    let replacement = root.path().join("next.toml");
+    fs::write(&replacement, settings(0, 3600))?;
+    fs::rename(&replacement, &config_path)?;
+    wait_until(|| server.puts.load(Ordering::Relaxed) > 0)?;
+    assert!(root.path().join("primary/photo").exists());
+    fs::write(&replacement, settings(0, 0))?;
+    fs::rename(&replacement, &config_path)?;
+    wait_until(|| !root.path().join("primary/photo").exists())?;
+    assert!(
+        service.0.try_wait()?.is_none(),
+        "same daemon must remain running"
+    );
+    let restored = Store::new(Config::load(&config_path)?)?;
+    let mut reader = None;
+    wait_until(|| {
+        reader = restored.read(Path::new("photo")).ok();
+        reader.is_some()
+    })?;
+    let mut bytes = Vec::new();
+    reader.unwrap().read_to_end(&mut bytes)?;
+    assert_eq!(bytes, b"hot reload content");
+    Ok(())
+}
+
+#[test]
 fn multiple_webdav_copies_are_verified_before_local_gc() -> Result<()> {
     let first = Webdav::start(false);
     let second = Webdav::start(false);

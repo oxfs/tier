@@ -92,7 +92,13 @@ cmp "$tmp/input" "$tmp/after"
 printf 'rewritten after primary GC\n' >"$tmp/input"
 smb "put $tmp/input documents/file.txt; get documents/file.txt $tmp/rewritten"
 cmp "$tmp/input" "$tmp/rewritten"
+test ! -f "$tmp/primary/documents/file.txt"
+cmp "$tmp/input" "$tmp/replica/documents/file.txt"
+# Reconnect while the descriptor is pending: the designated local copy is current.
+smb "ls documents/file.txt; get documents/file.txt $tmp/reconnected"
+cmp "$tmp/input" "$tmp/reconnected"
 api scan
+test ! -f "$tmp/primary/documents/file.txt"
 smb "get documents/file.txt $tmp/replicated"
 cmp "$tmp/input" "$tmp/replicated"
 smb "rename documents/file.txt documents/renamed.txt; get documents/renamed.txt $tmp/renamed"
@@ -114,6 +120,12 @@ if [[ ${TIER_TEST_CIFS:-0} == 1 ]]; then
     cmp "$tmp/input" "$tmp/mount/mounted/file.txt"
     api scan
     test ! -f "$tmp/primary/mounted/file.txt"
+    cmp "$tmp/input" "$tmp/mount/mounted/file.txt"
+    printf 'updated on the designated replica\n' >"$tmp/input"
+    cp "$tmp/input" "$tmp/mount/mounted/file.txt"
+    test ! -f "$tmp/primary/mounted/file.txt"
+    cmp "$tmp/input" "$tmp/replica/mounted/file.txt"
+    api scan
     cmp "$tmp/input" "$tmp/mount/mounted/file.txt"
     mv "$tmp/mount/mounted/file.txt" "$tmp/mount/mounted/renamed.txt"
     mv "$tmp/mount/mounted" "$tmp/mount/moved"
