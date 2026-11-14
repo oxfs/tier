@@ -16,6 +16,7 @@ enum Handle {
     Read(Reader),
     Write(Writer),
 }
+
 fn error(error: anyhow::Error) -> i32 {
     let number = error
         .chain()
@@ -99,7 +100,11 @@ unsafe extern "C" fn tier_open(
         unsafe {
             *owner = ptr::null_mut();
         }
-        if metadata || flags & libc::O_DIRECTORY != 0 || relative.as_os_str().is_empty() {
+        if metadata
+            || flags & libc::O_DIRECTORY != 0
+            || relative.as_os_str().is_empty()
+            || store.stat(relative).is_ok_and(|(entry, _)| entry.is_dir())
+        {
             // O_PATH descriptors cannot accidentally receive content mutations.
             return Ok(store.metadata_fd(relative)?.into_raw_fd());
         }
@@ -287,4 +292,35 @@ unsafe extern "C" fn tier_setattr(
         }
         Ok(0)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{ffi::CString, fs, io::Write, os::fd::FromRawFd};
+
+    #[test]
+    fn directory_open_without_directory_flag_preserves_child_namespace() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let primary = temporary.path().join("primary");
+        fs::create_dir(&primary)?;
+        let config = toml::from_str(&format!(
+            "primary={primary:?}\n[replicas]\n[[backup]]\npath=''\ncount=1\n"
+        ))?;
+        let store = Store::initialize(config)?;
+        store.mkdir(Path::new("photos"))?;
+        let path = CString::new("photos")?;
+        let mut owner = ptr::null_mut();
+        let fd = unsafe { tier_open(&store, path.as_ptr(), libc::O_RDONLY, false, &mut owner) };
+        assert!(fd >= 0);
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        assert!(file.metadata()?.is_dir());
+        assert!(owner.is_null());
+        assert!(!primary.join(".tier/meta/photos").is_file());
+        store
+            .write(Path::new("photos/image"))?
+            .write_all(b"photo")?;
+        assert_eq!(fs::read(primary.join("photos/image"))?, b"photo");
+        Ok(())
+    }
 }

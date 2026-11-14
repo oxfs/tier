@@ -357,14 +357,19 @@ static int unlink_at(struct vfs_handle_struct *h, struct files_struct *dir,
 }
 static int rename_at(struct vfs_handle_struct *h, struct files_struct *srcdir,
                      const struct smb_filename *src,
-                     struct files_struct *dstdir,
-                     const struct smb_filename *dst,
-                     const struct vfs_rename_how *how) {
+                     struct files_struct *dstdir, const struct smb_filename *dst
+#if SAMBA_VERSION_MINOR >= 22
+                     ,
+                     const struct vfs_rename_how *how
+#endif
+) {
   char *old = relative(h, srcdir, src), *new = relative(h, dstdir, dst);
+#if SAMBA_VERSION_MINOR >= 22
   if (how->flags) {
     errno = ENOTSUP;
     return -1;
   }
+#endif
   return old && new ? tier_rename(connection(h)->store, old, new) : -1;
 }
 static int change_directory(struct vfs_handle_struct *h,
@@ -377,6 +382,9 @@ static int change_directory(struct vfs_handle_struct *h,
     errno = ENOTDIR;
     return -1;
   }
+  /* Samba's realpath containment checks also use the process cwd. */
+  if (SMB_VFS_NEXT_CHDIR(h, name) != 0)
+    return -1;
   TALLOC_FREE(connection(h)->cwd);
   connection(h)->cwd = talloc_strdup(connection(h), path);
   return 0;
