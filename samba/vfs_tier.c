@@ -4,6 +4,11 @@
 #include "smbd/globals.h"
 #include "smbd/smbd.h"
 #include <dirent.h>
+#include <samba/version.h>
+
+#ifndef SAMBA_VERSION_MINOR
+#error "Samba version header must define SAMBA_VERSION_MINOR"
+#endif
 
 extern int tier_connect(const char *, void **);
 extern void tier_disconnect(void *);
