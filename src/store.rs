@@ -120,12 +120,15 @@ impl MaintenancePlan {
         state.digest.is_none()
             || !state.retiring.is_empty()
             || self.archive_due
-            || state.replicas.len() != self.local_replicas
+            || state.replicas.len()
+                != self.local_replicas
+                    + usize::from(!self.remove_primary && state.local_primary.is_some())
             || state
                 .replicas
                 .iter()
                 .any(|name| !config.replicas.contains_key(name))
-            || primary_exists == self.remove_primary
+            || (state.local_primary.is_none() && primary_exists == self.remove_primary)
+            || (state.local_primary.is_some() && primary_exists)
     }
 }
 
@@ -236,13 +239,9 @@ impl Store {
         let state = descriptor::load(&mut lock)?.map(|(_, state)| state);
         drop(_namespace);
         let primary = self.content(relative)?;
-        let file = if primary.exists() {
-            File::open(primary)?
-        } else {
-            self.replica(
-                relative,
-                state.as_ref().context("missing content and descriptor")?,
-            )?
+        let file = match state.as_ref() {
+            Some(state) => self.read_content(relative, state)?,
+            None => File::open(primary)?,
         };
         Ok(Reader { file, _lock: lock })
     }
@@ -272,7 +271,7 @@ impl Store {
         let _state = self.state_lock(relative, true)?;
         let state = descriptor::load(&mut lock)?.map(|(_, state)| state);
         drop(_namespace);
-        let primary = self.content(relative)?;
+        let primary = self.local_content(relative, state.as_ref())?;
         let exists = primary.exists() || state.is_some();
         if state
             .as_ref()
@@ -286,21 +285,18 @@ impl Store {
         if !exists && !create {
             return Err(io::Error::from(io::ErrorKind::NotFound).into());
         }
-        if !primary.exists()
-            && let Some(state) = &state
-        {
-            // Existing replica readers must finish before changing the writable
-            // inode; otherwise a reader would silently stay on stale content.
-            FileExt::try_lock_exclusive(&lock)?;
-            let mut source = self.replica(relative, state)?;
-            copy_file(&mut source, &primary, self.root())?;
+        if state.is_some() && !primary.exists() {
+            bail!("designated local primary is unavailable");
         }
         if state.as_ref().is_some_and(|state| state.digest.is_some()) {
             let mut pending = State::pending();
             if let Some(old) = state {
+                pending.local_primary = old.local_primary;
                 pending.retiring = old.retiring;
                 for name in old.replicas {
-                    if !pending.retiring.contains(&name) {
+                    if pending.local_primary.as_ref() != Some(&name)
+                        && !pending.retiring.contains(&name)
+                    {
                         pending.retiring.push(name);
                     }
                 }
@@ -318,7 +314,39 @@ impl Store {
         Ok(Writer { file, _lock: lock })
     }
 
+    pub(crate) fn local_content(&self, relative: &Path, state: Option<&State>) -> Result<PathBuf> {
+        let root = match state.and_then(|state| state.local_primary.as_ref()) {
+            Some(name) => self
+                .config
+                .replicas
+                .get(name)
+                .context("unknown local primary")?,
+            None => self.root(),
+        };
+        self.verify_root(root)?;
+        Self::path(root, relative)
+    }
+
+    fn read_content(&self, relative: &Path, state: &State) -> Result<File> {
+        let candidate = self
+            .local_content(relative, Some(state))
+            .and_then(|path| Ok(File::open(path)?));
+        match candidate {
+            Ok(file) => Ok(file),
+            Err(error) if state.digest.is_none() => Err(error),
+            Err(_) => self.replica(relative, state),
+        }
+    }
+
     pub(crate) fn replica(&self, relative: &Path, state: &State) -> Result<File> {
+        self.find_replica(relative, state, false)
+    }
+
+    pub(crate) fn verified_replica(&self, relative: &Path, state: &State) -> Result<File> {
+        self.find_replica(relative, state, true)
+    }
+
+    fn find_replica(&self, relative: &Path, state: &State, verify: bool) -> Result<File> {
         let digest = state
             .digest
             .as_ref()
@@ -330,11 +358,13 @@ impl Store {
             let candidate = (|| -> Result<File> {
                 self.verify_root(root)?;
                 let mut file = File::open(Self::path(root, relative)?)?;
-                ensure!(
-                    checksum(&mut file)? == (digest.clone(), state.size),
-                    "replica content mismatch"
-                );
-                file.rewind()?;
+                if verify {
+                    ensure!(
+                        checksum(&mut file)? == (digest.clone(), state.size),
+                        "replica content mismatch"
+                    );
+                    file.rewind()?;
+                }
                 Ok(file)
             })();
             if let Ok(file) = candidate {
@@ -344,7 +374,7 @@ impl Store {
         if !state.archives.is_empty() {
             return crate::archive::read(&self.config, state);
         }
-        bail!("no verified replica for {}", relative.display())
+        bail!("no available replica for {}", relative.display())
     }
 
     pub fn reconcile(&self, relative: &Path) -> Result<bool> {
@@ -365,7 +395,10 @@ impl Store {
         let backup = self.config.backup_for(relative)?;
         let now = now_secs();
         let plan = MaintenancePlan::new(&self.config, backup, current.as_ref(), now);
-        let local_count = plan.local_replicas;
+        let local_count = plan.local_replicas
+            + usize::from(
+                !plan.remove_primary && current.as_ref().is_some_and(|s| s.local_primary.is_some()),
+            );
         let gc = plan.remove_primary;
         if let Some(state) = &current
             && state.digest.is_some()
@@ -375,7 +408,8 @@ impl Store {
                 .iter()
                 .all(|name| self.config.replicas.contains_key(name))
             && crate::archive::satisfied(&self.config, backup.archive.as_ref(), state)
-            && (gc || primary.exists())
+            && (!gc || state.local_primary.is_some() || state.replicas.is_empty())
+            && (gc || self.local_content(relative, current.as_ref())?.exists())
             && (backup.archive.is_none() || state.archived_at.is_some())
         {
             self.verify_content(relative, state)?;
@@ -383,14 +417,15 @@ impl Store {
             self.cleanup_verified(relative, &mut lock, state.clone(), gc)?;
             return Ok(true);
         }
-        let mut source = if primary.exists() {
-            File::open(&primary)?
+        let source_path = self.local_content(relative, current.as_ref())?;
+        let mut source = if source_path.exists() {
+            File::open(&source_path)?
         } else {
-            self.replica(relative, current.as_ref().context("missing primary")?)?
+            self.verified_replica(relative, current.as_ref().context("missing primary")?)?
         };
         source.sync_all()?;
-        if primary.exists() {
-            sync_parent(&primary)?;
+        if source_path.exists() {
+            sync_parent(&source_path)?;
         }
         let (digest, size) = checksum(&mut source)?;
         if let Some(expected) = current.as_ref().and_then(|state| state.digest.as_ref()) {
@@ -401,7 +436,7 @@ impl Store {
         }
         // A retained primary counts toward the total and must exist before
         // publishing a smaller set of copies on other disks.
-        if !gc && !primary.exists() {
+        if !gc && current.as_ref().is_none_or(|s| s.local_primary.is_none()) && !primary.exists() {
             source.rewind()?;
             copy_file(&mut source, &primary, self.root())?;
         }
@@ -421,7 +456,17 @@ impl Store {
             }
             replicas.push(name.clone());
         }
+        let local_primary = if gc {
+            current
+                .as_ref()
+                .and_then(|s| s.local_primary.clone())
+                .filter(|name| replicas.contains(name))
+                .or_else(|| replicas.first().cloned())
+        } else {
+            current.as_ref().and_then(|s| s.local_primary.clone())
+        };
         let mut state = State {
+            local_primary,
             replicas,
             digest: Some(digest),
             size,
@@ -500,7 +545,7 @@ impl Store {
         remove_primary: bool,
     ) -> Result<()> {
         let primary = self.content(relative)?;
-        if remove_primary && primary.exists() {
+        if (remove_primary || state.local_primary.is_some()) && primary.exists() {
             fs::remove_file(&primary)?;
             sync_parent(&primary)?;
         }
@@ -535,13 +580,16 @@ impl Store {
         let mut candidates = Vec::new();
         for (name, root) in &self.config.replicas {
             self.verify_root(root)?;
+            let designated =
+                current.is_some_and(|state| state.local_primary.as_ref() == Some(name));
             let retained = current.is_some_and(|state| state.replicas.contains(name));
             let available = fs2::available_space(root)?;
-            if retained || available >= size {
+            if designated || retained || available >= size {
                 let mut hash = Sha256::new();
                 hash.update(relative.as_os_str().as_encoded_bytes());
                 hash.update(name.as_bytes());
                 candidates.push((
+                    designated,
                     retained,
                     available / (1024 * 1024 * 1024),
                     hash.finalize().to_vec(),
@@ -557,7 +605,7 @@ impl Store {
         let mut selected: Vec<_> = candidates
             .into_iter()
             .take(count)
-            .map(|(_, _, _, name)| name)
+            .map(|(_, _, _, _, name)| name)
             .collect();
         selected.sort();
         Ok(selected)
@@ -731,7 +779,7 @@ impl Store {
             primary.exists() || !state.replicas.is_empty() || !state.archives.is_empty(),
             "no content locations remain"
         );
-        if primary.exists() {
+        if state.local_primary.is_none() && primary.exists() {
             let mut file = File::open(primary)?;
             ensure!(
                 checksum(&mut file)? == (digest.clone(), state.size),

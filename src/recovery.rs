@@ -123,9 +123,9 @@ pub fn recover_primary(mut config: Config) -> anyhow::Result<usize> {
         create_parent(&Store::path(store.root(), &directory)?.join("placeholder"))?;
     }
     for (path, bytes) in &files {
-        let state: descriptor::State = serde_json::from_slice(bytes)?;
+        let mut state: descriptor::State = serde_json::from_slice(bytes)?;
         let mut source = store
-            .replica(path, &state)
+            .verified_replica(path, &state)
             .with_context(|| format!("recover {}", path.display()))?;
         copy_file(&mut source, &Store::path(store.root(), path)?, store.root())?;
         if let Some(attributes) = state.attributes {
@@ -149,8 +149,12 @@ pub fn recover_primary(mut config: Config) -> anyhow::Result<usize> {
             .write(true)
             .create_new(true)
             .open(&metadata)?;
+        state.local_primary = None;
         descriptor::save(&mut file, &state)?;
         crate::store::sync_parent(&metadata)?;
+        for root in store.config.replicas.values() {
+            copy_atomic(fs::File::open(&metadata)?, &Store::metadata(root, path)?)?;
+        }
     }
     let mut random = [0; 32];
     fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
@@ -227,6 +231,10 @@ pub fn replace_replica(config: Config, name: &str) -> anyhow::Result<()> {
                     copy_atomic(&[][..], &Store::metadata(destination, &path)?)?;
                     continue;
                 };
+                ensure!(
+                    state.digest.is_some() || state.local_primary.as_deref() != Some(name),
+                    "cannot replace the only pending content source"
+                );
                 if state.replicas.iter().any(|replica| replica == name) {
                     let digest = state.digest.as_ref().context("file awaits replication")?;
                     let primary = Store::path(store.root(), &path)?;
@@ -236,7 +244,7 @@ pub fn replace_replica(config: Config, name: &str) -> anyhow::Result<()> {
                     });
                     let mut source = match candidate {
                         Some(file) => file,
-                        None => store.replica(&path, &state)?,
+                        None => store.verified_replica(&path, &state)?,
                     };
                     source.rewind()?;
                     copy_file(&mut source, &Store::path(destination, &path)?, destination)?;

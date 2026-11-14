@@ -12,6 +12,8 @@ const HEADER: usize = 44;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct State {
     pub replicas: Vec<String>,
+    #[serde(default)]
+    pub local_primary: Option<String>,
     pub digest: Option<String>,
     pub size: u64,
     #[serde(default)]
@@ -43,6 +45,7 @@ impl State {
     pub fn pending() -> Self {
         Self {
             replicas: Vec::new(),
+            local_primary: None,
             digest: None,
             size: 0,
             attributes: None,

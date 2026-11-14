@@ -238,12 +238,18 @@ impl Store {
         FileExt::try_lock_shared(&lock)?;
         let _state = self.state_lock(relative, false)?;
         let identity = lock.metadata()?.ino();
-        if content.exists() {
-            return Ok((fs::metadata(content)?, None, identity));
+        let state = descriptor::load(&mut lock)?.map(|(_, state)| state);
+        let local = self
+            .local_content(relative, state.as_ref())
+            .and_then(|path| Ok(fs::metadata(path)?));
+        match local {
+            Ok(metadata) => return Ok((metadata, None, identity)),
+            Err(error) if state.as_ref().is_none_or(|state| state.digest.is_none()) => {
+                return Err(error);
+            }
+            Err(_) => {}
         }
-        let state = descriptor::load(&mut lock)?
-            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?
-            .1;
+        let state = state.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
         if !state.archives.is_empty() {
             return Ok((
                 lock.metadata()?,
