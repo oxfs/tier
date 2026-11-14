@@ -249,8 +249,14 @@ fn total_backup_count_includes_primary_before_and_after_gc_changes() -> Result<(
     write(&store, "file", b"two copies")?;
     store.reconcile(Path::new("file"))?;
     assert!(fixture.primary.join("file").exists());
-    assert!(fixture.replicas[0].join("file").exists());
-    assert!(!fixture.replicas[1].join("file").exists());
+    assert_eq!(
+        fixture
+            .replicas
+            .iter()
+            .filter(|root| root.join("file").exists())
+            .count(),
+        1
+    );
 
     let store = Store::new(settings(true))?;
     assert!(store.scan()?.errors.is_empty());
@@ -340,58 +346,18 @@ fn failed_descriptor_mirror_prevents_gc_and_can_be_retried() -> Result<()> {
 }
 
 #[test]
-fn cli_writes_truncate_then_scan_read_and_check() -> Result<()> {
-    use std::process::{Command, Stdio};
+fn writes_truncate_then_scan_read_and_check() -> Result<()> {
     let fixture = Fixture::new()?;
-    fixture.store(true)?;
-    let config = fixture._directory.path().join("config.toml");
-    fs::write(
-        &config,
-        format!(
-            "primary = {:?}\n[replicas]\na = {:?}\nb = {:?}\n[[backup]]\npath = ''\ncount = 2\ngc = true\n",
-            fixture.primary, fixture.replicas[0], fixture.replicas[1]
-        ),
-    )?;
-    let command = |operation: &str| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tier"));
-        command.arg(&config).arg(operation);
-        command
-    };
+    let store = fixture.store(true)?;
     for bytes in [b"long contents".as_slice(), b"short".as_slice()] {
-        let mut child = command("write")
-            .arg("file")
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        child.stdin.take().unwrap().write_all(bytes)?;
-        let output = child.wait_with_output()?;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let mut writer = store.open_write(Path::new("file"), true, false, true)?;
+        writer.write_all(bytes)?;
+        writer.sync_all()?;
     }
-    let scan = command("scan").output()?;
-    assert!(
-        scan.status.success(),
-        "{}",
-        String::from_utf8_lossy(&scan.stderr)
-    );
-    let report: serde_json::Value = serde_json::from_slice(&scan.stdout)?;
-    assert_eq!(report["completed"], 1);
-    let output = command("read").arg("file").output()?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(output.stdout, b"short");
-    let check = command("check").arg("file").output()?;
-    assert!(
-        check.status.success(),
-        "{}",
-        String::from_utf8_lossy(&check.stderr)
-    );
+    let report = store.scan()?;
+    assert!(report.errors.is_empty());
+    assert_eq!(read(&store, "file")?, b"short");
+    assert!(store.check(Path::new("file"))?);
     Ok(())
 }
 
@@ -465,7 +431,7 @@ fn interrupted_rename_rolls_forward_without_deleting_already_moved_content() -> 
 }
 
 #[test]
-fn offline_replica_rename_does_not_poison_primary_access() -> Result<()> {
+fn offline_replica_blocks_cross_disk_rename_but_not_primary_reads() -> Result<()> {
     let fixture = Fixture::new()?;
     let store = fixture.store(false)?;
     write(&store, "source", b"readable")?;
@@ -561,4 +527,39 @@ fn staging_content_is_never_visible_in_business_directories() -> Result<()> {
     finished.store(true, Ordering::Release);
     observer.join().expect("directory observer")?;
     result
+}
+
+#[test]
+fn busy_file_does_not_starve_other_content_audits() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let store = fixture.store(false)?;
+    write(&store, "busy", b"open")?;
+    write(&store, "damaged", b"original")?;
+    store.scan()?;
+    let _reader = store.read(Path::new("busy"))?;
+    fs::write(fixture.replicas[0].join("damaged"), b"corruption")?;
+    let report = store.scan_local_audit()?;
+    assert!(report.busy > 0);
+    assert!(report.errors.iter().any(|error| error.contains("damaged")));
+    Ok(())
+}
+
+#[test]
+fn already_open_primary_handles_survive_unrelated_replica_detach() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let store = fixture.store(false)?;
+    write(&store, "read", b"content")?;
+    let mut reader = store.read(Path::new("read"))?;
+    let mut writer = store.write(Path::new("write"))?;
+    fs::rename(
+        &fixture.replicas[0],
+        fixture._directory.path().join("offline"),
+    )?;
+    let mut content = Vec::new();
+    reader.read_to_end(&mut content)?;
+    assert_eq!(content, b"content");
+    writer.write_all(b"available")?;
+    writer.set_len(4)?;
+    assert_eq!(fs::read(fixture.primary.join("write"))?, b"avai");
+    Ok(())
 }

@@ -3,6 +3,11 @@
 #include "smbd/globals.h"
 #include "smbd/smbd.h"
 #include <dirent.h>
+#include <samba/version.h>
+
+#ifndef SAMBA_VERSION_MINOR
+#error "Samba version header must define SAMBA_VERSION_MINOR"
+#endif
 
 extern int tier_connect(const char *, void **);
 extern void tier_disconnect(void *);
@@ -27,6 +32,7 @@ struct opened {
   void *owner;
   char *path;
   bool metadata;
+  uint64_t identity;
 };
 struct listing {
   void *entries;
@@ -111,11 +117,6 @@ static int stat_at(struct vfs_handle_struct *h, const struct files_struct *dir,
   if (!path || tier_stat(connection(h)->store, path, &s) != 0)
     return -1;
   convert(&s, out);
-  uint64_t id;
-  if (tier_identity(connection(h)->store, path, &id) != 0)
-    return -1;
-  out->st_ex_dev = 0x54494552;
-  out->st_ex_ino = id;
   return 0;
 }
 static int stat_path(struct vfs_handle_struct *h, struct smb_filename *name) {
@@ -131,13 +132,11 @@ static int stat_fd(struct vfs_handle_struct *h, struct files_struct *fsp,
     if (tier_stat(connection(h)->store, opened->path, &s) != 0)
       return -1;
     convert(&s, out);
+    return 0;
   } else if (SMB_VFS_NEXT_FSTAT(h, fsp, out) != 0)
     return -1;
-  uint64_t id;
-  if (tier_identity(connection(h)->store, opened->path, &id) != 0)
-    return -1;
   out->st_ex_dev = 0x54494552;
-  out->st_ex_ino = id;
+  out->st_ex_ino = opened->identity;
   return 0;
 }
 static int open_at(struct vfs_handle_struct *h, const struct files_struct *dir,
@@ -162,6 +161,14 @@ static int open_at(struct vfs_handle_struct *h, const struct files_struct *dir,
        !(how->flags & (O_CREAT | O_TRUNC)));
   fd = tier_open(connection(h)->store, path, how->flags, opened->metadata,
                  &opened->owner);
+  if (fd >= 0 &&
+      tier_identity(connection(h)->store, path, &opened->identity) != 0) {
+    int saved = errno;
+    close(fd);
+    tier_release(opened->owner);
+    errno = saved;
+    fd = -1;
+  }
   if (fd < 0)
     VFS_REMOVE_FSP_EXTENSION(h, fsp);
   fsp->fsp_flags.have_proc_fds = false;
@@ -230,14 +237,19 @@ static int unlink_at(struct vfs_handle_struct *h, struct files_struct *dir,
 }
 static int rename_at(struct vfs_handle_struct *h, struct files_struct *srcdir,
                      const struct smb_filename *src,
-                     struct files_struct *dstdir,
-                     const struct smb_filename *dst,
-                     const struct vfs_rename_how *how) {
+                     struct files_struct *dstdir, const struct smb_filename *dst
+#if SAMBA_VERSION_MINOR >= 22
+                     ,
+                     const struct vfs_rename_how *how
+#endif
+) {
   char *old = relative(h, srcdir, src), *new = relative(h, dstdir, dst);
+#if SAMBA_VERSION_MINOR >= 22
   if (how->flags) {
     errno = ENOTSUP;
     return -1;
   }
+#endif
   return old && new ? tier_rename(connection(h)->store, old, new) : -1;
 }
 static int change_directory(struct vfs_handle_struct *h,
@@ -250,6 +262,9 @@ static int change_directory(struct vfs_handle_struct *h,
     errno = ENOTDIR;
     return -1;
   }
+  /* Samba's realpath containment checks also use the process cwd. */
+  if (SMB_VFS_NEXT_CHDIR(h, name) != 0)
+    return -1;
   TALLOC_FREE(connection(h)->cwd);
   connection(h)->cwd = talloc_strdup(connection(h), path);
   return 0;
@@ -294,6 +309,10 @@ static struct vfs_fn_pointers operations = {
     .disconnect_fn = disconnect_share,
     .openat_fn = open_at,
     .close_fn = close_file,
+    .offload_read_send_fn = vfs_not_implemented_offload_read_send,
+    .offload_read_recv_fn = vfs_not_implemented_offload_read_recv,
+    .offload_write_send_fn = vfs_not_implemented_offload_write_send,
+    .offload_write_recv_fn = vfs_not_implemented_offload_write_recv,
     .stat_fn = stat_path,
     .lstat_fn = stat_path,
     .fstat_fn = stat_fd,

@@ -34,11 +34,17 @@ if ! id tier >/dev/null 2>&1; then
 fi
 install -m 0755 "$binary" /usr/local/bin/tier
 install -m 0755 "$module" "$modules/vfs/tier.so"
+install -d -m 0755 /usr/local/share/tier/web
+cp -r "$root/web/." /usr/local/share/tier/web/
 install -m 0644 "$root/deploy/tier.service" /etc/systemd/system/tier.service
-install -d -m 0750 -o root -g tier /etc/tier
+install -d -m 1770 -o root -g tier /etc/tier
+if [[ -f /etc/tier/config.toml ]]; then
+    chown tier:tier /etc/tier/config.toml
+fi
 if [[ -d /run/systemd/system ]]; then
     systemctl daemon-reload
 fi
 echo 'Installed. Configure /etc/tier/config.toml (readable by tier), make storage roots writable by tier, then run:'
-echo '  runuser -u tier -- tier /etc/tier/config.toml init'
+echo '  systemctl enable --now tier'
+echo 'Initialize storage in the Web management page at http://127.0.0.1:8739.'
 echo 'Configure the Samba share before starting tier and restarting smbd.'

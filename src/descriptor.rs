@@ -11,7 +11,6 @@ const HEADER: usize = 44;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct State {
-    pub generation: u64,
     pub replicas: Vec<String>,
     pub digest: Option<String>,
     pub size: u64,
@@ -19,6 +18,10 @@ pub(crate) struct State {
     pub attributes: Option<FileAttributes>,
     #[serde(default)]
     pub archives: Vec<ArchiveCopy>,
+    #[serde(default)]
+    pub archived_at: Option<u64>,
+    #[serde(default)]
+    pub retiring: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -32,18 +35,20 @@ pub struct FileAttributes {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ArchiveCopy {
     pub target: String,
+    pub endpoint: String,
     pub key: String,
 }
 
 impl State {
-    pub fn pending(generation: u64) -> Self {
+    pub fn pending() -> Self {
         Self {
-            generation,
             replicas: Vec::new(),
             digest: None,
             size: 0,
             attributes: None,
             archives: Vec::new(),
+            archived_at: None,
+            retiring: Vec::new(),
         }
     }
 }
@@ -117,13 +122,17 @@ mod tests {
     #[test]
     fn torn_update_preserves_previous_commit() -> Result<()> {
         let mut file = tempfile::tempfile()?;
-        save(&mut file, &State::pending(1))?;
-        save(&mut file, &State::pending(2))?;
+        let mut state = State::pending();
+        state.retiring.push("first".into());
+        save(&mut file, &state)?;
+        state.retiring.push("second".into());
+        save(&mut file, &state)?;
         file.seek(SeekFrom::Start(SLOT as u64 + HEADER as u64))?;
         file.write_all(b"broken")?;
-        assert_eq!(load(&mut file)?.unwrap().1.generation, 1);
-        save(&mut file, &State::pending(3))?;
-        assert_eq!(load(&mut file)?.unwrap().1.generation, 3);
+        assert_eq!(load(&mut file)?.unwrap().1.retiring, ["first"]);
+        state.retiring = vec!["replacement".into()];
+        save(&mut file, &state)?;
+        assert_eq!(load(&mut file)?.unwrap().1.retiring, ["replacement"]);
         Ok(())
     }
 

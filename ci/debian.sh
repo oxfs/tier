@@ -6,7 +6,7 @@ if [[ ${1:-} == prepare ]]; then
     export DEBIAN_FRONTEND=noninteractive
     sed -i 's/Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources
     apt-get update -qq
-    apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates python3 samba samba-dev smbclient
+    apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates python3 python3-samba samba samba-dev smbclient cifs-utils
     apt-get build-dep -y samba
     dpkg-query -W | sha256sum | cut -d' ' -f1 >/build/environment-key
     exit 0
@@ -20,5 +20,8 @@ export TIER_BIN="$root/target/release/tier"
 mkdir -p /build/runtime
 tar -xzf "/build/artifacts/tier-debian13-$(dpkg --print-architecture).tar.gz" -C /build/runtime
 bash /build/runtime/tier/deploy/install.sh
-TIER_USER=tier "$root/tests/smb.sh"
+export TIER_BIN=/usr/local/bin/tier
+"$TIER_BIN" --version
+test -s /usr/local/share/tier/web/index.html
+TIER_USER=tier TIER_TEST_CIFS=1 "$root/tests/smb.sh"
 python3 "$root/tests/archive-smb.py"

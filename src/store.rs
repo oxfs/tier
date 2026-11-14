@@ -1,5 +1,5 @@
 use crate::{
-    config::{Config, validate_relative},
+    config::{Backup, Config, validate_relative},
     descriptor::{self, FileAttributes, State},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -79,6 +79,54 @@ pub struct Report {
     pub completed: usize,
     pub busy: usize,
     pub errors: Vec<String>,
+}
+
+struct MaintenancePlan {
+    local_replicas: usize,
+    remove_primary: bool,
+    archive_due: bool,
+}
+
+impl MaintenancePlan {
+    fn new(config: &Config, backup: &Backup, state: Option<&State>, now: u64) -> Self {
+        let archive_ready = state.is_some_and(|state| {
+            state.archived_at.is_some()
+                && crate::archive::satisfied(config, backup.archive.as_ref(), state)
+        });
+        let retention_elapsed = backup.archive.as_ref().is_none_or(|archive| {
+            archive_ready
+                && state
+                    .and_then(|state| state.archived_at)
+                    .is_some_and(|at| now >= at && now - at >= archive.local_ttl_secs)
+        });
+        let archive_due = backup.archive.as_ref().is_some_and(|archive| {
+            let modified = state
+                .and_then(|state| state.attributes)
+                .map_or(now, |attributes| attributes.modified_secs.max(0) as u64);
+            !archive_ready && now >= modified.saturating_add(archive.after_secs)
+        });
+        Self {
+            local_replicas: if retention_elapsed {
+                backup.local_replicas()
+            } else {
+                backup.count.saturating_sub(1)
+            },
+            remove_primary: backup.gc && retention_elapsed,
+            archive_due,
+        }
+    }
+
+    fn needs_work(&self, config: &Config, state: &State, primary_exists: bool) -> bool {
+        state.digest.is_none()
+            || !state.retiring.is_empty()
+            || self.archive_due
+            || state.replicas.len() != self.local_replicas
+            || state
+                .replicas
+                .iter()
+                .any(|name| !config.replicas.contains_key(name))
+            || primary_exists == self.remove_primary
+    }
 }
 
 impl Store {
@@ -174,7 +222,6 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(&path)?;
-        sync_parent(&path)?;
         Ok(file)
     }
 
@@ -187,6 +234,7 @@ impl Store {
         FileExt::try_lock_shared(&lock)?;
         let _state = self.state_lock(relative, false)?;
         let state = descriptor::load(&mut lock)?.map(|(_, state)| state);
+        drop(_namespace);
         let primary = self.content(relative)?;
         let file = if primary.exists() {
             File::open(primary)?
@@ -223,6 +271,7 @@ impl Store {
         FileExt::try_lock_shared(&lock)?;
         let _state = self.state_lock(relative, true)?;
         let state = descriptor::load(&mut lock)?.map(|(_, state)| state);
+        drop(_namespace);
         let primary = self.content(relative)?;
         let exists = primary.exists() || state.is_some();
         if state
@@ -246,13 +295,18 @@ impl Store {
             let mut source = self.replica(relative, state)?;
             copy_file(&mut source, &primary, self.root())?;
         }
-        let generation = state.map_or(Ok(1), |state| {
-            state
-                .generation
-                .checked_add(1)
-                .context("generation exhausted")
-        })?;
-        descriptor::save(&mut lock, &State::pending(generation))?;
+        if state.as_ref().is_some_and(|state| state.digest.is_some()) {
+            let mut pending = State::pending();
+            if let Some(old) = state {
+                pending.retiring = old.retiring;
+                for name in old.replicas {
+                    if !pending.retiring.contains(&name) {
+                        pending.retiring.push(name);
+                    }
+                }
+            }
+            descriptor::save(&mut lock, &pending)?;
+        }
         create_parent(&primary)?;
         let file = OpenOptions::new()
             .read(true)
@@ -260,7 +314,6 @@ impl Store {
             .create(true)
             .truncate(truncate)
             .open(&primary)?;
-        sync_parent(&primary)?;
         FileExt::lock_shared(&lock)?;
         Ok(Writer { file, _lock: lock })
     }
@@ -296,6 +349,9 @@ impl Store {
 
     pub fn reconcile(&self, relative: &Path) -> Result<bool> {
         let _namespace = self.namespace(false)?;
+        if !self.content(relative)?.exists() && !Self::metadata(self.root(), relative)?.exists() {
+            return Ok(false);
+        }
         let Some(_state) = self.try_state_lock(relative)? else {
             return Ok(false);
         };
@@ -303,28 +359,28 @@ impl Store {
         if !try_lock(&lock, true)? {
             return Ok(false);
         }
+        drop(_namespace);
         let current = descriptor::load(&mut lock)?.map(|(_, state)| state);
         let primary = self.content(relative)?;
         let backup = self.config.backup_for(relative)?;
-        let selected: Vec<_> = self
-            .config
-            .replicas
-            .keys()
-            .take(backup.local_replicas())
-            .cloned()
-            .collect();
+        let now = now_secs();
+        let plan = MaintenancePlan::new(&self.config, backup, current.as_ref(), now);
+        let local_count = plan.local_replicas;
+        let gc = plan.remove_primary;
         if let Some(state) = &current
             && state.digest.is_some()
-            && state.replicas == selected
-            && crate::archive::satisfied(backup.archive.as_ref(), state)
-            && (backup.gc || primary.exists())
+            && state.replicas.len() == local_count
+            && state
+                .replicas
+                .iter()
+                .all(|name| self.config.replicas.contains_key(name))
+            && crate::archive::satisfied(&self.config, backup.archive.as_ref(), state)
+            && (gc || primary.exists())
+            && (backup.archive.is_none() || state.archived_at.is_some())
         {
             self.verify_content(relative, state)?;
             self.mirror(relative, &mut lock)?;
-            if primary.exists() && backup.gc {
-                fs::remove_file(&primary)?;
-                sync_parent(&primary)?;
-            }
+            self.cleanup_verified(relative, &mut lock, state.clone(), gc)?;
             return Ok(true);
         }
         let mut source = if primary.exists() {
@@ -333,6 +389,9 @@ impl Store {
             self.replica(relative, current.as_ref().context("missing primary")?)?
         };
         source.sync_all()?;
+        if primary.exists() {
+            sync_parent(&primary)?;
+        }
         let (digest, size) = checksum(&mut source)?;
         if let Some(expected) = current.as_ref().and_then(|state| state.digest.as_ref()) {
             ensure!(
@@ -342,12 +401,14 @@ impl Store {
         }
         // A retained primary counts toward the total and must exist before
         // publishing a smaller set of copies on other disks.
-        if !backup.gc && !primary.exists() {
+        if !gc && !primary.exists() {
             source.rewind()?;
             copy_file(&mut source, &primary, self.root())?;
         }
         let mut replicas = Vec::new();
-        for (name, root) in self.config.replicas.iter().take(backup.local_replicas()) {
+        let selected = self.select_replicas(relative, current.as_ref(), local_count, size)?;
+        for name in &selected {
+            let root = &self.config.replicas[name];
             self.verify_root(root)?;
             let destination = Self::path(root, relative)?;
             let matches = File::open(&destination)
@@ -360,17 +421,17 @@ impl Store {
             }
             replicas.push(name.clone());
         }
-        let archives = if let Some(archive) = &backup.archive {
-            crate::archive::upload(&self.config, archive, &mut source, &digest, size)?
-        } else {
-            Vec::new()
-        };
-        let state = State {
-            generation: current.map_or(1, |state| state.generation),
+        let mut state = State {
             replicas,
             digest: Some(digest),
             size,
-            archives,
+            archives: current
+                .as_ref()
+                .map_or_else(Vec::new, |s| s.archives.clone()),
+            archived_at: current.as_ref().and_then(|s| s.archived_at),
+            retiring: current
+                .as_ref()
+                .map_or_else(Vec::new, |s| s.retiring.clone()),
             attributes: Some({
                 let metadata = source.metadata()?;
                 FileAttributes {
@@ -381,93 +442,201 @@ impl Store {
                 }
             }),
         };
+        if let Some(attributes) = current.as_ref().and_then(|old| old.attributes) {
+            state.attributes = Some(attributes);
+        }
+        if let Some(old) = &current {
+            for name in old
+                .replicas
+                .iter()
+                .filter(|name| !state.replicas.contains(name))
+            {
+                if !state.retiring.contains(name) {
+                    state.retiring.push(name.clone());
+                }
+            }
+        }
+        state.retiring.retain(|name| !state.replicas.contains(name));
+        if gc || !state.retiring.is_empty() {
+            self.verify_local_content(relative, &state)?;
+            if !plan.archive_due {
+                crate::archive::verify(&self.config, &state)?;
+            }
+        }
+        // Publish local protection before any remote I/O. A failed upload must
+        // leave independently recoverable local copies and descriptors.
         descriptor::save(&mut lock, &state)?;
+        // Publish the mapping durably before mirrors or GC can rely on it.
+        sync_parent(&Self::metadata(self.root(), relative)?)?;
         // Mirror descriptors to every configured disk, even disks without content.
         // A failed mirror aborts GC. Replica descriptors are never active locks.
         self.mirror(relative, &mut lock)?;
-        if backup.gc && primary.exists() {
-            fs::remove_file(&primary)?;
-            sync_parent(&primary)?;
+        if let Some(policy) = &backup.archive
+            && MaintenancePlan::new(&self.config, backup, Some(&state), now).archive_due
+        {
+            state.archives = crate::archive::upload(
+                &self.config,
+                policy,
+                &mut source,
+                state.digest.as_ref().unwrap(),
+                size,
+            )?;
+            state.archived_at = Some(now_secs());
+            descriptor::save(&mut lock, &state)?;
+            self.mirror(relative, &mut lock)?;
         }
+        // Only retire old local copies after the newly published set is durable.
+        self.cleanup_verified(relative, &mut lock, state, gc)?;
         Ok(true)
     }
 
+    // Caller has verified the retained content while holding the exclusive file
+    // lock and mirrored the new state. No second full local/remote read is needed.
+    fn cleanup_verified(
+        &self,
+        relative: &Path,
+        lock: &mut File,
+        mut state: State,
+        remove_primary: bool,
+    ) -> Result<()> {
+        let primary = self.content(relative)?;
+        if remove_primary && primary.exists() {
+            fs::remove_file(&primary)?;
+            sync_parent(&primary)?;
+        }
+        if state.retiring.is_empty() {
+            return Ok(());
+        }
+        for name in &state.retiring {
+            let root = self
+                .config
+                .replicas
+                .get(name)
+                .context("retiring disk removed from configuration")?;
+            self.verify_root(root)?;
+            let path = Self::path(root, relative)?;
+            if path.exists() {
+                fs::remove_file(&path)?;
+                sync_parent(&path)?;
+            }
+        }
+        state.retiring.clear();
+        descriptor::save(lock, &state)?;
+        self.mirror(relative, lock)
+    }
+
+    fn select_replicas(
+        &self,
+        relative: &Path,
+        current: Option<&State>,
+        count: usize,
+        size: u64,
+    ) -> Result<Vec<String>> {
+        let mut candidates = Vec::new();
+        for (name, root) in &self.config.replicas {
+            self.verify_root(root)?;
+            let retained = current.is_some_and(|state| state.replicas.contains(name));
+            let available = fs2::available_space(root)?;
+            if retained || available >= size {
+                let mut hash = Sha256::new();
+                hash.update(relative.as_os_str().as_encoded_bytes());
+                hash.update(name.as_bytes());
+                candidates.push((
+                    retained,
+                    available / (1024 * 1024 * 1024),
+                    hash.finalize().to_vec(),
+                    name.clone(),
+                ));
+            }
+        }
+        candidates.sort_by(|a, b| b.cmp(a));
+        ensure!(
+            candidates.len() >= count,
+            "not enough local space for required copies"
+        );
+        let mut selected: Vec<_> = candidates
+            .into_iter()
+            .take(count)
+            .map(|(_, _, _, name)| name)
+            .collect();
+        selected.sort();
+        Ok(selected)
+    }
+
     pub fn scan(&self) -> Result<Report> {
-        self.scan_with_audit(true)
+        self.scan_with_audit(true, true)
+    }
+
+    pub fn scan_local_audit(&self) -> Result<Report> {
+        self.scan_with_audit(true, false)
     }
 
     pub fn scan_pending(&self) -> Result<Report> {
-        self.scan_with_audit(false)
+        self.scan_with_audit(false, false)
     }
 
-    fn scan_with_audit(&self, audit: bool) -> Result<Report> {
-        let _namespace = self.namespace(false)?;
+    fn scan_with_audit(&self, audit: bool, remote: bool) -> Result<Report> {
+        let namespace = self.namespace(false)?;
         let mut files = BTreeSet::new();
         self.walk(&self.config.primary, Path::new(""), &mut files, true)?;
         let metadata = Self::path(&self.config.primary, Path::new(".tier/meta"))?;
         if metadata.exists() {
             self.walk(&metadata, Path::new(""), &mut files, false)?;
         }
-        let mut report = Report::default();
-        let mut pending = Vec::new();
-        let mut ready = Vec::new();
-        for relative in files {
-            let classification = (|| -> Result<Option<bool>> {
-                let Some(_state) = self.try_state_lock(&relative)? else {
-                    return Ok(None);
-                };
-                let mut lock = self.lock(&relative)?;
-                if !try_lock(&lock, true)? {
-                    return Ok(None);
-                }
-                let backup = self.config.backup_for(&relative)?;
-                let selected: Vec<_> = self
-                    .config
-                    .replicas
-                    .keys()
-                    .take(backup.local_replicas())
-                    .cloned()
-                    .collect();
-                Ok(Some(descriptor::load(&mut lock)?.is_none_or(
-                    |(_, state)| {
-                        state.digest.is_none()
-                            || state.replicas != selected
-                            || !crate::archive::satisfied(backup.archive.as_ref(), &state)
-                            || (backup.gc == self.config.primary.join(&relative).exists())
-                    },
-                )))
-            })();
-            match classification {
-                Ok(Some(true)) => pending.push(relative),
-                Ok(Some(false)) => ready.push(relative),
-                Ok(None) => report.busy += 1,
-                Err(error) => report
-                    .errors
-                    .push(format!("{}: {error:#}", relative.display())),
+        drop(namespace);
+        let queue = std::sync::Mutex::new(files.into_iter());
+        let report = std::sync::Mutex::new(Report::default());
+        std::thread::scope(|scope| {
+            for _ in 0..self.config.background.workers {
+                scope.spawn(|| {
+                    loop {
+                        let Some(relative) = queue.lock().unwrap().next() else {
+                            break;
+                        };
+                        let result = self.maintain_file(&relative, audit, remote);
+                        let mut report = report.lock().unwrap();
+                        match result {
+                            Ok(true) => report.completed += 1,
+                            Ok(false) => report.busy += 1,
+                            Err(error) => report
+                                .errors
+                                .push(format!("{}: {error:#}", relative.display())),
+                        }
+                    }
+                });
             }
-        }
-        for relative in pending {
-            match self.reconcile(&relative) {
-                Ok(true) => report.completed += 1,
-                Ok(false) => report.busy += 1,
-                Err(error) => report
-                    .errors
-                    .push(format!("{}: {error:#}", relative.display())),
+        });
+        Ok(report.into_inner().unwrap())
+    }
+
+    fn maintain_file(&self, relative: &Path, audit: bool, remote: bool) -> Result<bool> {
+        let pending = {
+            let _namespace = self.namespace(false)?;
+            let primary_exists = self.content(relative)?.exists();
+            if !primary_exists && !Self::metadata(self.root(), relative)?.exists() {
+                return Ok(false);
             }
-        }
-        // Only inspect old copies once foreground replication has caught up.
-        if audit && report.errors.is_empty() && report.busy == 0 {
-            for relative in ready {
-                match self.check(&relative) {
-                    Ok(true) => report.completed += 1,
-                    Ok(false) => report.busy += 1,
-                    Err(error) => report
-                        .errors
-                        .push(format!("{}: {error:#}", relative.display())),
-                }
+            let Some(_state) = self.try_state_lock(relative)? else {
+                return Ok(false);
+            };
+            let mut lock = self.lock(relative)?;
+            if !try_lock(&lock, true)? {
+                return Ok(false);
             }
+            let current = descriptor::load(&mut lock)?.map(|(_, state)| state);
+            let policy = self.config.backup_for(relative)?;
+            let plan = MaintenancePlan::new(&self.config, policy, current.as_ref(), now_secs());
+            current
+                .as_ref()
+                .is_none_or(|state| plan.needs_work(&self.config, state, primary_exists))
+        };
+        if pending {
+            self.reconcile(relative)
+        } else if audit {
+            self.check_with_remote(relative, remote)
+        } else {
+            Ok(true)
         }
-        Ok(report)
     }
 
     fn walk(
@@ -508,7 +677,14 @@ impl Store {
 
     // Inspection never repairs or deletes: inconsistencies are explicit alerts.
     pub fn check(&self, relative: &Path) -> Result<bool> {
+        self.check_with_remote(relative, true)
+    }
+
+    fn check_with_remote(&self, relative: &Path, remote: bool) -> Result<bool> {
         let _namespace = self.namespace(false)?;
+        if !self.content(relative)?.exists() && !Self::metadata(self.root(), relative)?.exists() {
+            return Ok(false);
+        }
         let Some(_state) = self.try_state_lock(relative)? else {
             return Ok(false);
         };
@@ -519,12 +695,16 @@ impl Store {
         let state = descriptor::load(&mut lock)?
             .context("file has not been replicated")?
             .1;
-        self.verify(relative, &state)?;
+        drop(_namespace);
+        self.verify(relative, &state, remote)?;
         Ok(true)
     }
 
-    fn verify(&self, relative: &Path, state: &State) -> Result<()> {
-        self.verify_content(relative, state)?;
+    fn verify(&self, relative: &Path, state: &State, remote: bool) -> Result<()> {
+        self.verify_local_content(relative, state)?;
+        if remote {
+            crate::archive::verify(&self.config, state)?;
+        }
         for (name, root) in &self.config.replicas {
             self.verify_root(root)?;
             let mut file = File::open(Self::metadata(root, relative)?)?;
@@ -540,6 +720,11 @@ impl Store {
     }
 
     fn verify_content(&self, relative: &Path, state: &State) -> Result<()> {
+        self.verify_local_content(relative, state)?;
+        crate::archive::verify(&self.config, state)
+    }
+
+    fn verify_local_content(&self, relative: &Path, state: &State) -> Result<()> {
         let digest = state.digest.as_ref().context("file awaits replication")?;
         let primary = self.content(relative)?;
         ensure!(
@@ -566,7 +751,6 @@ impl Store {
                 "content mismatch on {name}"
             );
         }
-        crate::archive::verify(&self.config, state)?;
         Ok(())
     }
 
@@ -593,7 +777,14 @@ fn try_lock(file: &File, exclusive: bool) -> Result<bool> {
     }
 }
 
-fn checksum(file: &mut File) -> Result<(String, u64)> {
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+pub(crate) fn checksum(file: &mut File) -> Result<(String, u64)> {
     file.rewind()?;
     let mut digest = Sha256::new();
     let mut buffer = [0; 64 * 1024];
@@ -637,7 +828,7 @@ pub(crate) fn copy_atomic(mut source: impl Read, destination: &Path) -> Result<(
     sync_parent(destination)
 }
 
-fn copy_file(source: &mut File, destination: &Path, root: &Path) -> Result<()> {
+pub(crate) fn copy_file(source: &mut File, destination: &Path, root: &Path) -> Result<()> {
     let metadata = source.metadata()?;
     create_parent(destination)?;
     let staging = Store::path(root, Path::new(".tier/tmp"))?;

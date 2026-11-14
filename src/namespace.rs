@@ -53,6 +53,14 @@ impl Store {
         Ok(file)
     }
 
+    pub fn verify_storage(&self) -> Result<()> {
+        self.verify_root(self.root())?;
+        for root in self.config.replicas.values() {
+            self.verify_root(root)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn initialize_roots(&mut self) -> Result<()> {
         use std::io::Read;
         let path = self.root().join(".tier/storage.json");
@@ -180,16 +188,19 @@ impl Store {
         Ok(file)
     }
 
-    fn affected_locks(&self, relative: &Path) -> Result<Vec<File>> {
+    pub(crate) fn affected_locks(&self, relative: &Path) -> Result<Vec<File>> {
         fn collect(path: &Path, locks: &mut Vec<File>) -> Result<()> {
             if !path.exists() {
                 return Ok(());
             }
-            if path.is_dir() {
+            let kind = fs::symlink_metadata(path)?.file_type();
+            ensure!(!kind.is_symlink(), "symlink in affected metadata");
+            if kind.is_dir() {
                 for entry in fs::read_dir(path)? {
                     collect(&entry?.path(), locks)?;
                 }
             } else {
+                ensure!(kind.is_file(), "non-file affected metadata");
                 let file = OpenOptions::new().read(true).write(true).open(path)?;
                 FileExt::try_lock_exclusive(&file)?;
                 locks.push(file);
@@ -204,11 +215,21 @@ impl Store {
     /// Archive-only attributes come from the descriptor without recalling data.
     /// Archived attributes override the descriptor file's physical attributes.
     pub fn stat(&self, relative: &Path) -> Result<(Metadata, Option<crate::FileAttributes>)> {
+        self.stat_identity(relative)
+            .map(|(metadata, attributes, _)| (metadata, attributes))
+    }
+
+    pub(crate) fn stat_identity(
+        &self,
+        relative: &Path,
+    ) -> Result<(Metadata, Option<crate::FileAttributes>, u64)> {
         validate_relative(relative)?;
         let _namespace = self.namespace(false)?;
         let content = Self::path(self.root(), relative)?;
         if content.is_dir() {
-            return Ok((fs::metadata(content)?, None));
+            let metadata = fs::metadata(content)?;
+            let identity = metadata.ino();
+            return Ok((metadata, None, identity));
         }
         if !content.exists() && !Self::metadata(self.root(), relative)?.is_file() {
             return Err(io::Error::from(io::ErrorKind::NotFound).into());
@@ -216,8 +237,9 @@ impl Store {
         let mut lock = self.lock(relative)?;
         FileExt::try_lock_shared(&lock)?;
         let _state = self.state_lock(relative, false)?;
+        let identity = lock.metadata()?.ino();
         if content.exists() {
-            return Ok((fs::metadata(content)?, None));
+            return Ok((fs::metadata(content)?, None, identity));
         }
         let state = descriptor::load(&mut lock)?
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?
@@ -230,6 +252,7 @@ impl Store {
                         .attributes
                         .ok_or_else(|| anyhow::anyhow!("archive attributes missing"))?,
                 ),
+                identity,
             ));
         }
         // Attribute queries must not read file contents or recall remote data.
@@ -247,7 +270,7 @@ impl Store {
                 Ok(metadata)
             })();
             if let Ok(metadata) = candidate {
-                return Ok((metadata, None));
+                return Ok((metadata, None, identity));
             }
         }
         Err(io::Error::from_raw_os_error(libc::EIO).into())
@@ -307,6 +330,7 @@ impl Store {
         let _namespace = self.namespace(true)?;
         self.recover_namespace()?;
         let _files = self.affected_locks(source)?;
+        self.verify_storage()?;
         let _destination_files = self.affected_locks(destination)?;
         let source_content = self.content(source)?;
         let source_meta = Self::metadata(self.root(), source)?;
@@ -347,6 +371,7 @@ impl Store {
     }
 
     pub fn remove(&self, relative: &Path, directory: bool) -> Result<()> {
+        self.verify_storage()?;
         validate_relative(relative)?;
         ensure!(!relative.as_os_str().is_empty(), "cannot remove root");
         let _namespace = self.namespace(true)?;
@@ -403,6 +428,15 @@ impl Store {
         validate_relative(&change.source)?;
         if let Some(destination) = &change.destination {
             validate_relative(destination)?;
+        }
+        // Survivors must retain evidence of an unfinished cross-disk mutation
+        // even when the primary and its authoritative journal are lost.
+        for root in self.config.replicas.values() {
+            self.verify_root(root)?;
+            copy_atomic(
+                bytes.as_slice(),
+                &Self::path(root, Path::new(".tier/namespace.json"))?,
+            )?;
         }
         if !change.prepared {
             let destination = change
@@ -467,6 +501,11 @@ impl Store {
                 }
                 sync_parent(&source)?;
             }
+        }
+        for root in self.config.replicas.values() {
+            let mirrored = Self::path(root, Path::new(".tier/namespace.json"))?;
+            fs::remove_file(&mirrored)?;
+            sync_parent(&mirrored)?;
         }
         fs::remove_file(&journal)?;
         sync_parent(&journal)

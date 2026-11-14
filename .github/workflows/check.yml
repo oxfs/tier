@@ -17,6 +17,9 @@ jobs:
       CARGO_BUILD_JOBS: 4
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy, rust-analyzer
@@ -44,15 +47,22 @@ jobs:
         id: debian
         run: |
           mkdir -p "$RUNNER_TEMP/debian"
-          docker run -d --name tier-builder -v "$PWD:/workspace" -v "$RUNNER_TEMP/debian:/build" -w /workspace debian:13-slim sleep infinity
+          sudo modprobe cifs
+          docker run -d --name tier-builder --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH --security-opt apparmor=unconfined -v "$PWD:/workspace" -v "$RUNNER_TEMP/debian:/build" -w /workspace debian:13-slim sleep infinity
           docker exec tier-builder bash ci/debian.sh prepare
           echo "key=$(cat "$RUNNER_TEMP/debian/environment-key")" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: samba-cache
         with:
           path: ${{ runner.temp }}/debian/samba
           key: samba-native-${{ steps.debian.outputs.key }}-${{ hashFiles('samba/build.sh', 'samba/wscript_build') }}
       - name: Build, install and test Samba package
         run: docker exec tier-builder bash ci/debian.sh
+      - uses: actions/cache/save@v4
+        if: always() && steps.samba-cache.outcome == 'success' && steps.samba-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/debian/samba
+          key: ${{ steps.samba-cache.outputs.cache-primary-key }}
       - uses: actions/upload-artifact@v4
         with:
           name: tier-debian13-amd64

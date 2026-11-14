@@ -16,6 +16,7 @@ enum Handle {
     Read(Reader),
     Write(Writer),
 }
+
 fn error(error: anyhow::Error) -> i32 {
     let number = error
         .chain()
@@ -63,6 +64,7 @@ unsafe fn path<'a>(value: *const libc::c_char) -> &'a Path {
 unsafe extern "C" fn tier_connect(config: *const libc::c_char, out: *mut *mut Store) -> i32 {
     call(|| {
         let store = Store::new(Config::load(unsafe { path(config) })?)?;
+        store.verify_root(store.root())?;
         unsafe {
             *out = Box::into_raw(Box::new(store));
         }
@@ -90,7 +92,11 @@ unsafe extern "C" fn tier_open(
         unsafe {
             *owner = ptr::null_mut();
         }
-        if metadata || flags & libc::O_DIRECTORY != 0 || relative.as_os_str().is_empty() {
+        if metadata
+            || flags & libc::O_DIRECTORY != 0
+            || relative.as_os_str().is_empty()
+            || store.stat(relative).is_ok_and(|(entry, _)| entry.is_dir())
+        {
             // O_PATH descriptors cannot accidentally receive content mutations.
             return Ok(store.metadata_fd(relative)?.into_raw_fd());
         }
@@ -134,11 +140,11 @@ unsafe extern "C" fn tier_stat(
     out: *mut libc::stat,
 ) -> i32 {
     call(|| {
-        let (m, archived) = unsafe { &*store }.stat(unsafe { path(name) })?;
+        let (m, archived, identity) = unsafe { &*store }.stat_identity(unsafe { path(name) })?;
         let s = unsafe { &mut *out };
         *s = unsafe { std::mem::zeroed() };
-        s.st_dev = m.dev();
-        s.st_ino = m.ino();
+        s.st_dev = 0x54494552;
+        s.st_ino = identity;
         s.st_mode = m.mode();
         s.st_nlink = m.nlink() as _;
         s.st_uid = m.uid();
@@ -278,4 +284,109 @@ unsafe extern "C" fn tier_setattr(
         }
         Ok(0)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{ffi::CString, fs, io::Write, os::fd::FromRawFd};
+
+    #[test]
+    fn writes_invalidate_a_committed_copy_only_once_until_maintenance() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let primary = temporary.path().join("primary");
+        fs::create_dir(&primary)?;
+        let store = Store::initialize(toml::from_str(&format!(
+            "primary={primary:?}\n[replicas]\n[[backup]]\npath=''\ncount=1\n"
+        ))?)?;
+        let path = Path::new("image");
+        store.write(path)?.write_all(b"first")?;
+        let descriptor = primary.join(".tier/meta/image");
+        assert!(fs::read(&descriptor)?.is_empty());
+        store.reconcile(path)?;
+        store.write(path)?.write_all(b"next!")?;
+        let pending = fs::read(&descriptor)?;
+        assert!(
+            crate::descriptor::load(&mut fs::File::open(&descriptor)?)?
+                .unwrap()
+                .1
+                .digest
+                .is_none()
+        );
+        store.write(path)?.write_all(b"last!")?;
+        assert_eq!(fs::read(&descriptor)?, pending);
+        store.reconcile(path)?;
+        assert!(
+            crate::descriptor::load(&mut fs::File::open(&descriptor)?)?
+                .unwrap()
+                .1
+                .digest
+                .is_some()
+        );
+        assert_eq!(fs::read(primary.join(path))?, b"last!");
+        Ok(())
+    }
+
+    #[test]
+    fn stat_identity_survives_gc_and_rejects_missing_storage() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let primary = temporary.path().join("primary");
+        let replica = temporary.path().join("replica");
+        fs::create_dir(&primary)?;
+        fs::create_dir(&replica)?;
+        let store = Store::initialize(toml::from_str(&format!(
+            "primary={primary:?}\n[replicas]\na={replica:?}\n[[backup]]\npath=''\ncount=1\ngc=true\n"
+        ))?)?;
+        // Foreground writes leave a new descriptor empty until maintenance.
+        fs::write(primary.join("image"), b"photo")?;
+        let name = CString::new("image")?;
+        let mut before = unsafe { std::mem::zeroed::<libc::stat>() };
+        assert_eq!(unsafe { tier_stat(&store, name.as_ptr(), &mut before) }, 0);
+        assert_eq!(fs::metadata(primary.join(".tier/meta/image"))?.len(), 0);
+        store.write(Path::new("image"))?.write_all(b"photo")?;
+        assert_eq!(fs::metadata(primary.join(".tier/meta/image"))?.len(), 0);
+        assert_eq!(before.st_ino, store.logical_id(Path::new("image"))?);
+        store.reconcile(Path::new("image"))?;
+        assert!(fs::metadata(primary.join(".tier/meta/image"))?.len() > 0);
+        assert!(!primary.join("image").exists());
+        let mut after = unsafe { std::mem::zeroed::<libc::stat>() };
+        assert_eq!(unsafe { tier_stat(&store, name.as_ptr(), &mut after) }, 0);
+        assert_eq!(
+            (before.st_dev, before.st_ino, before.st_size),
+            (after.st_dev, after.st_ino, after.st_size)
+        );
+        store.mkdir(Path::new("album"))?;
+        store.rename(Path::new("image"), Path::new("album/image"))?;
+        let name = CString::new("album/image")?;
+        assert_eq!(unsafe { tier_stat(&store, name.as_ptr(), &mut after) }, 0);
+        assert_eq!(before.st_ino, after.st_ino);
+        fs::rename(&replica, temporary.path().join("detached"))?;
+        assert_eq!(unsafe { tier_stat(&store, name.as_ptr(), &mut after) }, -1);
+        Ok(())
+    }
+
+    #[test]
+    fn directory_open_without_directory_flag_preserves_child_namespace() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let primary = temporary.path().join("primary");
+        fs::create_dir(&primary)?;
+        let config = toml::from_str(&format!(
+            "primary={primary:?}\n[replicas]\n[[backup]]\npath=''\ncount=1\n"
+        ))?;
+        let store = Store::initialize(config)?;
+        store.mkdir(Path::new("photos"))?;
+        let path = CString::new("photos")?;
+        let mut owner = ptr::null_mut();
+        let fd = unsafe { tier_open(&store, path.as_ptr(), libc::O_RDONLY, false, &mut owner) };
+        assert!(fd >= 0);
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        assert!(file.metadata()?.is_dir());
+        assert!(owner.is_null());
+        assert!(!primary.join(".tier/meta/photos").is_file());
+        store
+            .write(Path::new("photos/image"))?
+            .write_all(b"photo")?;
+        assert_eq!(fs::read(primary.join("photos/image"))?, b"photo");
+        Ok(())
+    }
 }

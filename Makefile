@@ -1,6 +1,7 @@
 .PHONY: build check
 
 build:
+	cd web && npm ci && npm run build
 	cargo build --release --locked
 
 check:

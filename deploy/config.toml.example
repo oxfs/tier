@@ -17,3 +17,19 @@ gc = true
 [background]
 scan_interval_secs = 60
 audit_interval_secs = 86400
+archive_audit_interval_secs = 604800
+workers = 2
+archive_concurrency = 2
+
+# Optional WebDAV pool. Tier chooses targets automatically.
+# [archives.remote]
+# url = "https://dav.example.com/tier/"
+# username_env = "WEBDAV_USER"
+# password_env = "WEBDAV_PASSWORD"
+# concurrency = 2
+#
+# [[backup]]
+# path = "photos"
+# count = 2
+# gc = false
+# archive = { count = 1, after_secs = 604800, local_ttl_secs = 2592000 }
