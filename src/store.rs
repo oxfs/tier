@@ -454,10 +454,11 @@ impl Store {
             let root = &self.config.replicas[name];
             self.verify_root(root)?;
             let destination = Self::path(root, relative)?;
-            let retained = destination == source_path
-                || current.as_ref().is_some_and(|state| {
-                    state.digest.is_some() && state.replicas.contains(name) && destination.is_file()
-                });
+            let retained = destination.is_file()
+                && (destination == source_path
+                    || current.as_ref().is_some_and(|state| {
+                        state.digest.is_some() && state.replicas.contains(name)
+                    }));
             if !retained {
                 source.rewind()?;
                 copy_file(&mut source, &destination, root)?;
