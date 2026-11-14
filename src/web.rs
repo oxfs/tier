@@ -132,7 +132,9 @@ async fn api(
             .unwrap_or("");
         let socket: std::net::SocketAddr = state.address.parse()?;
         ensure!(
-            host == state.address || host == format!("localhost:{}", socket.port()),
+            socket.ip().is_unspecified()
+                || host == state.address
+                || host == format!("localhost:{}", socket.port()),
             "invalid Host"
         );
         ensure!(
@@ -272,10 +274,6 @@ pub fn start(path: &Path, stop: Arc<AtomicBool>) -> Result<Service> {
         });
     };
     let socket: std::net::SocketAddr = address.parse().context("invalid TIER_WEB_LISTEN")?;
-    ensure!(
-        socket.ip().is_loopback(),
-        "Web management must bind to loopback; use an authenticated reverse proxy for remote access"
-    );
     let listener = std::net::TcpListener::bind(socket)?;
     listener.set_nonblocking(true)?;
     let state = WebState {
