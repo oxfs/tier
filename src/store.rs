@@ -23,12 +23,10 @@ pub struct Store {
 pub struct Reader {
     file: File,
     _lock: File,
-    disks: Vec<(PathBuf, String)>,
 }
 pub struct Writer {
     file: File,
     _lock: File,
-    disks: Vec<(PathBuf, String)>,
 }
 
 impl AsRawFd for Reader {
@@ -43,7 +41,6 @@ impl AsRawFd for Writer {
 }
 impl Read for Reader {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        check_disks(&self.disks)?;
         self.file.read(bytes)
     }
 }
@@ -54,11 +51,9 @@ impl Seek for Reader {
 }
 impl Write for Writer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        check_disks(&self.disks)?;
         self.file.write(bytes)
     }
     fn flush(&mut self) -> io::Result<()> {
-        check_disks(&self.disks)?;
         self.file.flush()
     }
 }
@@ -72,11 +67,9 @@ impl Writer {
         self.file.metadata()
     }
     pub fn sync_all(&self) -> io::Result<()> {
-        check_disks(&self.disks)?;
         self.file.sync_all()
     }
     pub fn set_len(&self, size: u64) -> io::Result<()> {
-        check_disks(&self.disks)?;
         self.file.set_len(size)
     }
 }
@@ -229,13 +222,6 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(&path)?;
-        // Primary descriptors are written only after this creation barrier.
-        // Recovery publishes the storage registry only after syncing restored entries;
-        // namespace moves sync both parents before releasing their namespace lock.
-        // An empty inode may still belong to a concurrent creator: never skip its barrier.
-        if file.metadata()?.len() == 0 {
-            sync_parent(&path)?;
-        }
         Ok(file)
     }
 
@@ -258,11 +244,7 @@ impl Store {
                 state.as_ref().context("missing content and descriptor")?,
             )?
         };
-        Ok(Reader {
-            file,
-            _lock: lock,
-            disks: self.disk_snapshot(),
-        })
+        Ok(Reader { file, _lock: lock })
     }
 
     // All modifications must go through this entry, including after primary GC.
@@ -313,22 +295,18 @@ impl Store {
             let mut source = self.replica(relative, state)?;
             copy_file(&mut source, &primary, self.root())?;
         }
-        let generation = state.as_ref().map_or(Ok(1), |state| {
-            state
-                .generation
-                .checked_add(1)
-                .context("generation exhausted")
-        })?;
-        let mut pending = State::pending(generation);
-        if let Some(old) = state {
-            pending.retiring = old.retiring;
-            for name in old.replicas {
-                if !pending.retiring.contains(&name) {
-                    pending.retiring.push(name);
+        if state.as_ref().is_some_and(|state| state.digest.is_some()) {
+            let mut pending = State::pending();
+            if let Some(old) = state {
+                pending.retiring = old.retiring;
+                for name in old.replicas {
+                    if !pending.retiring.contains(&name) {
+                        pending.retiring.push(name);
+                    }
                 }
             }
+            descriptor::save(&mut lock, &pending)?;
         }
-        descriptor::save(&mut lock, &pending)?;
         create_parent(&primary)?;
         let file = OpenOptions::new()
             .read(true)
@@ -336,13 +314,8 @@ impl Store {
             .create(true)
             .truncate(truncate)
             .open(&primary)?;
-        sync_parent(&primary)?;
         FileExt::lock_shared(&lock)?;
-        Ok(Writer {
-            file,
-            _lock: lock,
-            disks: self.disk_snapshot(),
-        })
+        Ok(Writer { file, _lock: lock })
     }
 
     pub(crate) fn replica(&self, relative: &Path, state: &State) -> Result<File> {
@@ -372,17 +345,6 @@ impl Store {
             return crate::archive::read(&self.config, state);
         }
         bail!("no verified replica for {}", relative.display())
-    }
-
-    fn disk_snapshot(&self) -> Vec<(PathBuf, String)> {
-        std::iter::once(&self.config.primary)
-            .chain(self.config.replicas.values())
-            .filter_map(|root| {
-                self.identities
-                    .get(root)
-                    .map(|id| (root.clone(), id.clone()))
-            })
-            .collect()
     }
 
     pub fn reconcile(&self, relative: &Path) -> Result<bool> {
@@ -427,6 +389,9 @@ impl Store {
             self.replica(relative, current.as_ref().context("missing primary")?)?
         };
         source.sync_all()?;
+        if primary.exists() {
+            sync_parent(&primary)?;
+        }
         let (digest, size) = checksum(&mut source)?;
         if let Some(expected) = current.as_ref().and_then(|state| state.digest.as_ref()) {
             ensure!(
@@ -457,7 +422,6 @@ impl Store {
             replicas.push(name.clone());
         }
         let mut state = State {
-            generation: current.as_ref().map_or(1, |state| state.generation),
             replicas,
             digest: Some(digest),
             size,
@@ -502,6 +466,8 @@ impl Store {
         // Publish local protection before any remote I/O. A failed upload must
         // leave independently recoverable local copies and descriptors.
         descriptor::save(&mut lock, &state)?;
+        // Publish the mapping durably before mirrors or GC can rely on it.
+        sync_parent(&Self::metadata(self.root(), relative)?)?;
         // Mirror descriptors to every configured disk, even disks without content.
         // A failed mirror aborts GC. Replica descriptors are never active locks.
         self.mirror(relative, &mut lock)?;
@@ -816,18 +782,6 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn check_disks(disks: &[(PathBuf, String)]) -> io::Result<()> {
-    for (root, expected) in disks {
-        if fs::read_to_string(root.join(".tier/disk-id"))? != *expected {
-            return Err(io::Error::other(format!(
-                "storage identity changed: {}",
-                root.display()
-            )));
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn checksum(file: &mut File) -> Result<(String, u64)> {

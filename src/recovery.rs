@@ -1,6 +1,5 @@
-//! Read-only diagnosis remains available when ordinary storage access fails closed.
+//! Manual reconstruction from surviving content and directory metadata.
 use crate::config::Config;
-use serde::Serialize;
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 /// Recover only the last agreed, committed mirrored state into an empty primary.
@@ -224,9 +223,10 @@ pub fn replace_replica(config: Config, name: &str) -> anyhow::Result<()> {
             } else {
                 ensure!(entry.file_type()?.is_file(), "non-file replica descriptor");
                 let mut metadata = fs::File::open(entry.path())?;
-                let state = descriptor::load(&mut metadata)?
-                    .context("file has no committed descriptor; reconcile before replacement")?
-                    .1;
+                let Some((_, state)) = descriptor::load(&mut metadata)? else {
+                    copy_atomic(&[][..], &Store::metadata(destination, &path)?)?;
+                    continue;
+                };
                 if state.replicas.iter().any(|replica| replica == name) {
                     let digest = state.digest.as_ref().context("file awaits replication")?;
                     let primary = Store::path(store.root(), &path)?;
@@ -277,60 +277,4 @@ pub fn replace_replica(config: Config, name: &str) -> anyhow::Result<()> {
         &store.root().join(".tier/storage.json"),
     )?;
     Ok(())
-}
-
-#[derive(Debug, Serialize)]
-pub struct DiskStatus {
-    pub name: String,
-    pub path: PathBuf,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Diagnosis {
-    pub disks: Vec<DiskStatus>,
-    pub registry_error: Option<String>,
-    pub unfinished_namespace_change: bool,
-}
-
-pub fn diagnose(config: &Config) -> Diagnosis {
-    let registry = fs::read(config.primary.join(".tier/storage.json"))
-        .map_err(|error| error.to_string())
-        .and_then(|bytes| {
-            serde_json::from_slice::<BTreeMap<PathBuf, String>>(&bytes)
-                .map_err(|error| error.to_string())
-        });
-    let disks = std::iter::once(("primary", &config.primary))
-        .chain(
-            config
-                .replicas
-                .iter()
-                .map(|(name, path)| (name.as_str(), path)),
-        )
-        .map(|(name, path)| {
-            let check = (|| -> Result<(), String> {
-                let identities = registry.as_ref().map_err(Clone::clone)?;
-                let canonical = fs::canonicalize(path).map_err(|error| error.to_string())?;
-                let expected = identities
-                    .get(&canonical)
-                    .ok_or("unregistered storage root")?;
-                let actual = fs::read_to_string(path.join(".tier/disk-id"))
-                    .map_err(|error| error.to_string())?;
-                if &actual != expected {
-                    return Err("storage identity changed".into());
-                }
-                Ok(())
-            })();
-            DiskStatus {
-                name: name.into(),
-                path: path.clone(),
-                error: check.err(),
-            }
-        })
-        .collect();
-    Diagnosis {
-        disks,
-        registry_error: registry.err(),
-        unfinished_namespace_change: config.primary.join(".tier/namespace.json").exists(),
-    }
 }

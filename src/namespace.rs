@@ -32,7 +32,7 @@ impl Store {
     // Namespace lookup/open holds SH briefly. Mutations hold EX and lock only
     // affected descriptors, leaving unrelated open files completely independent.
     pub(crate) fn namespace(&self, exclusive: bool) -> Result<File> {
-        self.verify_storage()?;
+        self.verify_root(self.root())?;
         let path = Self::path(self.root(), Path::new(".tier/namespace.lock"))?;
         create_parent(&path)?;
         let file = OpenOptions::new()
@@ -330,6 +330,7 @@ impl Store {
         let _namespace = self.namespace(true)?;
         self.recover_namespace()?;
         let _files = self.affected_locks(source)?;
+        self.verify_storage()?;
         let _destination_files = self.affected_locks(destination)?;
         let source_content = self.content(source)?;
         let source_meta = Self::metadata(self.root(), source)?;
@@ -370,6 +371,7 @@ impl Store {
     }
 
     pub fn remove(&self, relative: &Path, directory: bool) -> Result<()> {
+        self.verify_storage()?;
         validate_relative(relative)?;
         ensure!(!relative.as_os_str().is_empty(), "cannot remove root");
         let _namespace = self.namespace(true)?;

@@ -431,7 +431,7 @@ fn interrupted_rename_rolls_forward_without_deleting_already_moved_content() -> 
 }
 
 #[test]
-fn offline_replica_blocks_access_without_creating_namespace_intent() -> Result<()> {
+fn offline_replica_blocks_cross_disk_rename_but_not_primary_reads() -> Result<()> {
     let fixture = Fixture::new()?;
     let store = fixture.store(false)?;
     write(&store, "source", b"readable")?;
@@ -445,7 +445,7 @@ fn offline_replica_blocks_access_without_creating_namespace_intent() -> Result<(
             .is_err()
     );
     assert!(!fixture.primary.join(".tier/namespace.json").exists());
-    assert!(read(&store, "source").is_err());
+    assert_eq!(read(&store, "source")?, b"readable");
     Ok(())
 }
 
@@ -545,7 +545,7 @@ fn busy_file_does_not_starve_other_content_audits() -> Result<()> {
 }
 
 #[test]
-fn already_open_rust_handles_stop_after_disk_detaches() -> Result<()> {
+fn already_open_primary_handles_survive_unrelated_replica_detach() -> Result<()> {
     let fixture = Fixture::new()?;
     let store = fixture.store(false)?;
     write(&store, "read", b"content")?;
@@ -555,8 +555,11 @@ fn already_open_rust_handles_stop_after_disk_detaches() -> Result<()> {
         &fixture.replicas[0],
         fixture._directory.path().join("offline"),
     )?;
-    assert!(reader.read(&mut [0; 1]).is_err());
-    assert!(writer.write_all(b"blocked").is_err());
-    assert!(writer.set_len(0).is_err());
+    let mut content = Vec::new();
+    reader.read_to_end(&mut content)?;
+    assert_eq!(content, b"content");
+    writer.write_all(b"available")?;
+    writer.set_len(4)?;
+    assert_eq!(fs::read(fixture.primary.join("write"))?, b"avai");
     Ok(())
 }

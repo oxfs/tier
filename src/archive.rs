@@ -316,7 +316,7 @@ mod tests {
         let config: Config = toml::from_str(
             "primary='/primary'\n[replicas]\n[archives.remote]\nurl='https://example.test/dav/'\n[[backup]]\npath=''\ncount=1\n",
         )?;
-        let mut state = State::pending(1);
+        let mut state = State::pending();
         let copy = ArchiveCopy {
             target: "remote".into(),
             endpoint: config.archives["remote"].endpoint()?,

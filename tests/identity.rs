@@ -3,14 +3,14 @@ use std::{fs, io::Write, path::Path};
 use tier::{Store, config::Config};
 
 #[test]
-fn missing_replica_blocks_foreground_access_after_restart() -> Result<()> {
+fn missing_replica_preserves_primary_access_but_blocks_replication() -> Result<()> {
     let root = tempfile::tempdir()?;
     let primary = root.path().join("primary");
     let replica = root.path().join("replica");
     fs::create_dir(&primary)?;
     fs::create_dir(&replica)?;
     let source = format!(
-        "primary={:?}\n[replicas]\nbackup={:?}\n[[backup]]\npath=''\ncount=2\n",
+        "primary={:?}\n[replicas]\nbackup={:?}\n[[backup]]\npath=''\ncount=1\ngc=true\n",
         primary, replica
     );
     assert!(Store::new(toml::from_str::<Config>(&source)?).is_err());
@@ -22,10 +22,12 @@ fn missing_replica_blocks_foreground_access_after_restart() -> Result<()> {
     }
     fs::rename(&replica, root.path().join("unplugged"))?;
     let store = Store::new(toml::from_str::<Config>(&source)?)?;
-    assert!(store.read(Path::new("file")).is_err());
-    assert!(store.write(Path::new("file")).is_err());
-    assert!(store.list(Path::new("")).is_err());
+    assert!(store.read(Path::new("file")).is_ok());
+    assert!(store.write(Path::new("file")).is_ok());
+    assert!(store.list(Path::new("")).is_ok());
+    assert!(store.mkdir(Path::new("new-directory")).is_ok());
     assert!(store.reconcile(Path::new("file")).is_err());
+    assert_eq!(fs::read(primary.join("file"))?, b"content");
     // A different disk at the same mount path must not receive writes.
     fs::create_dir(&replica)?;
     assert!(store.reconcile(Path::new("file")).is_err());

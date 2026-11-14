@@ -64,7 +64,7 @@ unsafe fn path<'a>(value: *const libc::c_char) -> &'a Path {
 unsafe extern "C" fn tier_connect(config: *const libc::c_char, out: *mut *mut Store) -> i32 {
     call(|| {
         let store = Store::new(Config::load(unsafe { path(config) })?)?;
-        store.verify_storage()?;
+        store.verify_root(store.root())?;
         unsafe {
             *out = Box::into_raw(Box::new(store));
         }
@@ -76,14 +76,6 @@ unsafe extern "C" fn tier_disconnect(store: *mut Store) {
     if !store.is_null() {
         drop(unsafe { Box::from_raw(store) });
     }
-}
-
-#[unsafe(no_mangle)]
-unsafe extern "C" fn tier_verify_storage(store: *const Store) -> i32 {
-    call(|| {
-        unsafe { &*store }.verify_storage()?;
-        Ok(0)
-    })
 }
 
 #[unsafe(no_mangle)]
@@ -300,6 +292,42 @@ mod tests {
     use std::{ffi::CString, fs, io::Write, os::fd::FromRawFd};
 
     #[test]
+    fn writes_invalidate_a_committed_copy_only_once_until_maintenance() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let primary = temporary.path().join("primary");
+        fs::create_dir(&primary)?;
+        let store = Store::initialize(toml::from_str(&format!(
+            "primary={primary:?}\n[replicas]\n[[backup]]\npath=''\ncount=1\n"
+        ))?)?;
+        let path = Path::new("image");
+        store.write(path)?.write_all(b"first")?;
+        let descriptor = primary.join(".tier/meta/image");
+        assert!(fs::read(&descriptor)?.is_empty());
+        store.reconcile(path)?;
+        store.write(path)?.write_all(b"next!")?;
+        let pending = fs::read(&descriptor)?;
+        assert!(
+            crate::descriptor::load(&mut fs::File::open(&descriptor)?)?
+                .unwrap()
+                .1
+                .digest
+                .is_none()
+        );
+        store.write(path)?.write_all(b"last!")?;
+        assert_eq!(fs::read(&descriptor)?, pending);
+        store.reconcile(path)?;
+        assert!(
+            crate::descriptor::load(&mut fs::File::open(&descriptor)?)?
+                .unwrap()
+                .1
+                .digest
+                .is_some()
+        );
+        assert_eq!(fs::read(primary.join(path))?, b"last!");
+        Ok(())
+    }
+
+    #[test]
     fn stat_identity_survives_gc_and_rejects_missing_storage() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let primary = temporary.path().join("primary");
@@ -309,17 +337,17 @@ mod tests {
         let store = Store::initialize(toml::from_str(&format!(
             "primary={primary:?}\n[replicas]\na={replica:?}\n[[backup]]\npath=''\ncount=1\ngc=true\n"
         ))?)?;
-        // An imported file first gets an empty descriptor; publication must keep
-        // that inode when the first tracked write makes the descriptor nonempty.
+        // Foreground writes leave a new descriptor empty until maintenance.
         fs::write(primary.join("image"), b"photo")?;
         let name = CString::new("image")?;
         let mut before = unsafe { std::mem::zeroed::<libc::stat>() };
         assert_eq!(unsafe { tier_stat(&store, name.as_ptr(), &mut before) }, 0);
         assert_eq!(fs::metadata(primary.join(".tier/meta/image"))?.len(), 0);
         store.write(Path::new("image"))?.write_all(b"photo")?;
-        assert!(fs::metadata(primary.join(".tier/meta/image"))?.len() > 0);
+        assert_eq!(fs::metadata(primary.join(".tier/meta/image"))?.len(), 0);
         assert_eq!(before.st_ino, store.logical_id(Path::new("image"))?);
         store.reconcile(Path::new("image"))?;
+        assert!(fs::metadata(primary.join(".tier/meta/image"))?.len() > 0);
         assert!(!primary.join("image").exists());
         let mut after = unsafe { std::mem::zeroed::<libc::stat>() };
         assert_eq!(unsafe { tier_stat(&store, name.as_ptr(), &mut after) }, 0);

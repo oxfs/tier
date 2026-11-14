@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify an existing SMB handle stops reading/writing after disk removal."""
+"""A missing replica must not interrupt healthy primary SMB access."""
 
 import multiprocessing
 import select
@@ -11,8 +11,6 @@ from pathlib import Path
 from samba.credentials import Credentials
 from samba.samba3 import libsmb_samba_internal as libsmb
 from samba.samba3 import param
-
-from samba import NTSTATUSError
 
 
 class Forward(socketserver.BaseRequestHandler):
@@ -59,23 +57,20 @@ def main():
             assert connection.read(handle, 0, 8) == b"original"
             replica.rename(disconnected)
             try:
-                for operation in (
-                    lambda: connection.read(handle, 0, 8),
-                    lambda: connection.write(handle, b"changed!", 0),
-                ):
-                    try:
-                        operation()
-                    except NTSTATUSError:
-                        pass
-                    else:
-                        raise AssertionError(
-                            "existing SMB handle bypassed missing disk"
-                        )
+                assert connection.read(handle, 0, 8) == b"original"
+                connection.write(handle, b"changed!", 0)
+                fresh = connection.create(
+                    "detach-new", DesiredAccess=0x0012019F, CreateDisposition=3
+                )
+                connection.write(fresh, b"new", 0)
+                assert connection.read(fresh, 0, 3) == b"new"
+                connection.close(fresh)
             finally:
                 disconnected.rename(replica)
-            assert connection.read(handle, 0, 8) == b"original"
+            assert connection.read(handle, 0, 8) == b"changed!"
             connection.close(handle)
             connection.unlink("detach-test")
+            connection.unlink("detach-new")
         finally:
             process.terminate()
             process.join(timeout=5)
