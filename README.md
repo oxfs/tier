@@ -6,7 +6,7 @@ Tier 通过 Samba 提供文件共享，后台按目录策略维护多盘副本�
 
 ### Debian 13
 
-从 [Releases](https://github.com/oxfs/tier/releases) 下载适合机器架构的安装包。Samba 模块必须与安装包记录的 Debian Samba 版本一致；安装脚本会检查版本。
+当前安装包支持 Debian 13 的 amd64（x86-64）机器。从 [Releases](https://github.com/oxfs/tier/releases) 下载安装包；Samba 必须与包内 `deploy/samba-version` 记录的 Debian 软件包版本一致，安装脚本会检查版本。
 
 ```sh
 sudo apt update
@@ -32,6 +32,22 @@ sudo testparm
 sudo systemctl enable --now tier
 sudo systemctl restart smbd
 ```
+
+## 升级
+
+升级前阅读对应版本的发布说明，确认配置和磁盘格式兼容。本次首次发布不提供旧开发版本的数据格式迁移；不要直接在旧开发数据上升级，也不要依靠替换旧二进制回滚磁盘格式。
+
+停止客户端访问，执行 `sudo systemctl stop smbd tier`，备份 `/etc/tier` 和 Samba 配置，保留所有存储盘内容（包括 `.tier`）。将新安装包解压到单独目录，在该目录执行：
+
+```sh
+sudo bash tier/deploy/install.sh
+sudo testparm
+sudo systemctl start tier
+```
+
+升级无需复制示例配置或重新初始化磁盘。先在 Web 检查配置、磁盘身份和扫描结果，确认正常后执行 `sudo systemctl start smbd`，通过 SMB 检查已有文件读取和新文件写入。
+
+系统更新若改变了 Samba 软件包版本，也需要安装与新版本匹配的 Tier 模块，或针对该版本重新构建。更新前停止共享，在匹配模块安装完成后再启动 `smbd`；没有匹配包时先保留原 Samba 版本。
 
 ## 使用
 
@@ -76,8 +92,11 @@ archive = { count = 1, after_secs = 604800, local_ttl_secs = 2592000 }
 
 跨盘重命名或删除中断时，恢复相关磁盘后重启服务，系统会重放已记录的操作。不要手动删除 `.tier/namespace.json`。
 
-主盘故障时先停止 `smbd`，保护剩余盘，保留 Tier 运行以使用 Web 管理。其他盘保留的目录、描述信息及内容用于恢复；系统不会自动选择新主盘。尚未复制的新写入可能丢失。不要对缺失挂载点重新执行初始化。
+主盘或副本盘故障时，先执行 `sudo systemctl stop smbd`，保留 Tier 运行以使用 Web 管理，并保护剩余盘。用 `findmnt -T /实际存储路径` 核对替换路径确实位于预期磁盘上，再确认目标目录为空且 `tier` 用户可写；不要对缺失挂载点重新初始化。
 
-恢复主盘时，停止 SMB 访问，将配置的 `primary` 指向一个已挂载的空目录，保留其他副本路径，在 Web「存储维护」中选择「恢复主盘」。恢复要求所有配置的本地副本描述信息一致，并逐个校验、取回文件内容；需要能容纳全部恢复内容的空间。完成后检查数据，再恢复共享。失败时保留目标目录用于检查，重新尝试须使用空目录。更换副本盘时，在同一页面选择对应磁盘的「重建」。
+- **恢复主盘**：将配置的 `primary` 指向空白替换目录，保留其他副本路径，在 Web「存储维护」选择「恢复主盘」。所有配置的本地副本描述信息必须一致；恢复会逐个校验并取回内容，主盘空间须能容纳全部恢复内容。若主盘路径改变，同时修改 Samba 共享路径。
+- **重建副本盘**：把空白替换盘挂载到原副本路径，在 Web「存储维护」选择对应磁盘的「重建」。
+
+完成后检查 Web 磁盘状态，执行扫描并核对目录、文件数量及重要文件内容；运行 `sudo testparm`，确认无误后执行 `sudo systemctl start smbd` 恢复共享。恢复失败时保留目标目录用于检查，重新尝试须使用空目录。
 
 主盘恢复只能重建副本共同记录的最近状态，无法找回尚未复制的写入，也无法证明丢失主盘上的操作已经全部同步。若描述信息冲突，恢复被拒绝，需要人工核对。恢复期间必须保持 `smbd` 停止。

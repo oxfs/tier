@@ -9,7 +9,9 @@ const tab = ref("overview"),
   revision = ref(""),
   error = ref(""),
   notice = ref(""),
-  busy = ref(false);
+  noticeType = ref("success"),
+  activeAction = ref("");
+const busy = computed(() => activeAction.value !== "");
 const dirty = computed(() => content.value !== original.value);
 const connectionError = ref("");
 let refreshing = false;
@@ -58,7 +60,7 @@ async function load() {
 async function save(validate = false) {
   if (busy.value) return;
   const submitted = content.value;
-  busy.value = true;
+  activeAction.value = validate ? "validate" : "save";
   error.value = "";
   notice.value = "";
   try {
@@ -70,6 +72,7 @@ async function save(validate = false) {
       original.value = submitted;
       revision.value = data.revision;
     }
+    noticeType.value = "success";
     notice.value = validate
       ? "配置校验通过"
       : "已保存。后台将在下一轮扫描读取配置；Samba 配置变更需重启 smbd。";
@@ -77,20 +80,47 @@ async function save(validate = false) {
   } catch (e) {
     error.value = e.message;
   } finally {
-    busy.value = false;
+    activeAction.value = "";
   }
 }
 async function maintenance(action, name) {
   if (busy.value) return;
+  try {
+    status.value = await api("health", { signal: AbortSignal.timeout(10000) });
+    connectionError.value = "";
+  } catch (e) {
+    connectionError.value = e.message;
+    return;
+  }
+  if (busy.value) return;
+  const labels = {
+    init: "初始化存储",
+    scan: "扫描和校验",
+    "recover-primary": "恢复主盘",
+    "replace-replica": `重建副本 ${name}`,
+  };
+  const disks = status.value?.disks ?? [];
+  const target =
+    action === "init" || action === "scan"
+      ? disks.map((disk) => `${disk.name}：${disk.path}`).join("\n")
+      : disks.find((disk) => disk.name === (name ?? "主盘"))?.path;
+  if (!target) {
+    error.value = "无法确认操作目标，请刷新状态并检查配置。";
+    return;
+  }
+  const requirement =
+    action === "scan"
+      ? "将维护副本并校验内容，可能耗时较长。"
+      : action === "init"
+        ? "请确认已停止 SMB 访问且所有磁盘已挂载。仅用于新存储，不要初始化缺失的挂载点。"
+        : "请确认已停止 SMB 访问，目标为已挂载的空目录。失败后请保留目标用于检查。";
   if (
     !window.confirm(
-      action === "scan"
-        ? "立即执行扫描和校验？"
-        : "请确认已停止 SMB 访问。初始化仅用于新存储；恢复目标必须是已挂载的空目录。继续？",
+      `${labels[action]}\n目标：${target}\n\n${requirement}\n继续？`,
     )
   )
     return;
-  busy.value = true;
+  activeAction.value = name ? `${action}:${name}` : action;
   error.value = "";
   notice.value = "";
   try {
@@ -98,14 +128,23 @@ async function maintenance(action, name) {
       method: "POST",
       body: JSON.stringify({ confirmed: true, name }),
     });
-    notice.value = result.errors?.length
-      ? result.errors.join("; ")
-      : "操作完成";
+    const errors = result.errors ?? [];
+    noticeType.value = errors.length
+      ? "error"
+      : result.busy
+        ? "warning"
+        : "success";
+    notice.value =
+      action === "scan"
+        ? `扫描结束：完成 ${result.completed ?? 0} 个，跳过 ${result.busy ?? 0} 个，错误 ${errors.length} 个。${errors.join("；")}`
+        : action === "recover-primary"
+          ? `已恢复 ${result.recovered} 个文件。请检查数据后恢复 SMB 访问。`
+          : `${labels[action]}完成。`;
     await refresh();
   } catch (e) {
     error.value = e.message;
   } finally {
-    busy.value = false;
+    activeAction.value = "";
   }
 }
 const date = (value) =>
@@ -138,7 +177,6 @@ onUnmounted(() => {
         <div class="brand">
           <span class="logo">▤</span> tier<span class="brand-dot">.</span>
         </div>
-        <div class="subtitle">为珍贵记忆，留一份安心。</div>
         <nav>
           <button
             :class="{ active: tab === 'overview' }"
@@ -152,9 +190,6 @@ onUnmounted(() => {
             ⚙ &nbsp; 配置管理 <span v-if="dirty">•</span>
           </button>
         </nav>
-        <div class="aside-bottom">
-          PERSONAL STORAGE<br /><span>本地管理 · 无数据库</span>
-        </div>
       </aside>
       <main>
         <header>
@@ -168,7 +203,7 @@ onUnmounted(() => {
           error || status.error
         }}</n-alert><n-alert
           v-if="notice"
-          type="success"
+          :type="noticeType"
           class="message"
           closable
           @close="notice = ''"
@@ -177,8 +212,7 @@ onUnmounted(() => {
         <template v-if="tab === 'overview'"
           ><div class="heading">
             <div>
-              <div class="eyebrow">YOUR MEMORIES, PROTECTED</div>
-              <h1>每一份珍贵，都有归处。</h1>
+              <h1>存储概览</h1>
               <p>查看存储设备与后台维护的实际运行状态。</p>
             </div>
             <n-tag :type="status?.healthy ? 'success' : 'warning'" round>{{
@@ -219,8 +253,7 @@ onUnmounted(() => {
             <div v-for="disk in status?.disks" :key="disk.path" class="disk">
               <div class="disk-icon">▤</div>
               <div class="disk-info">
-                <b>{{ disk.name }}</b
-                ><code>{{ disk.path }}</code>
+                <b>{{ disk.name }}</b><code>{{ disk.path }}</code>
                 <p v-if="disk.error" class="failure">{{ disk.error }}</p>
               </div>
               <div class="capacity">
@@ -239,8 +272,7 @@ onUnmounted(() => {
             </div>
             <p v-if="!status?.archives?.length">尚未配置 WebDAV 目标。</p>
             <div v-for="name in status?.archives" :key="name" class="disk">
-              <b>{{ name }}</b
-              ><n-tag size="small">已配置</n-tag>
+              <b>{{ name }}</b><n-tag size="small">已配置</n-tag>
             </div>
           </section>
           <section class="panel">
@@ -262,8 +294,7 @@ onUnmounted(() => {
                     : kind === "audit"
                       ? "本地校验"
                       : "副本维护"
-                }}</b
-                ><span>{{ date(status?.history?.[kind]?.time) }}</span>
+                }}</b><span>{{ date(status?.history?.[kind]?.time) }}</span>
               </div>
               <template v-if="status?.history?.[kind]"
                 ><div class="task-counts">
@@ -299,20 +330,30 @@ onUnmounted(() => {
             <p>
               恢复仅使用已校验的副本。目标必须为空，失败后保留目标用于检查。
             </p>
-            <div class="task-counts">
-              <n-button :loading="busy" @click="maintenance('init')"
+            <div class="actions">
+              <n-button
+                :loading="activeAction === 'init'"
+                :disabled="busy"
+                @click="maintenance('init')"
                 >初始化存储</n-button
-              ><n-button :loading="busy" @click="maintenance('scan')"
+              ><n-button
+                :loading="activeAction === 'scan'"
+                :disabled="busy"
+                @click="maintenance('scan')"
                 >立即扫描</n-button
-              ><n-button :loading="busy" @click="maintenance('recover-primary')"
+              ><n-button
+                :loading="activeAction === 'recover-primary'"
+                :disabled="busy"
+                @click="maintenance('recover-primary')"
                 >恢复主盘</n-button
               >
             </div>
-            <div class="task-counts">
+            <div class="actions">
               <n-button
                 v-for="disk in status?.disks?.filter((d) => d.name !== '主盘')"
                 :key="disk.name"
-                :loading="busy"
+                :loading="activeAction === `replace-replica:${disk.name}`"
+                :disabled="busy"
                 @click="maintenance('replace-replica', disk.name)"
                 >重建 {{ disk.name }}</n-button
               >
@@ -321,8 +362,7 @@ onUnmounted(() => {
         ><template v-else
           ><div class="heading">
             <div>
-              <div class="eyebrow">CONFIGURATION</div>
-              <h1>按你的方式，保存。</h1>
+              <h1>配置管理</h1>
               <p>直接编辑本地 TOML 配置，保存前自动校验。</p>
             </div>
             <n-tag v-if="dirty" type="warning">未保存</n-tag>
@@ -342,11 +382,15 @@ onUnmounted(() => {
             <div class="editor-footer">
               <span>外部修改会触发冲突提示，请保留草稿后重新打开页面。</span>
               <div>
-                <n-button :loading="busy" @click="save(true)">校验配置</n-button
+                <n-button
+                  :loading="activeAction === 'validate'"
+                  :disabled="busy"
+                  @click="save(true)"
+                  >校验配置</n-button
                 ><n-button
                   type="primary"
-                  :loading="busy"
-                  :disabled="!dirty"
+                  :loading="activeAction === 'save'"
+                  :disabled="busy || !dirty"
                   @click="save(false)"
                   >保存配置</n-button
                 >
@@ -354,9 +398,7 @@ onUnmounted(() => {
             </div>
           </section></template
         >
-        <footer>
-          Tier · 让存储回归简单<span>健康状态不等同于完整数据校验</span>
-        </footer>
+        <footer>Tier<span>健康状态不等同于完整数据校验</span></footer>
       </main>
     </div></n-config-provider
   >

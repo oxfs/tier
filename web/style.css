@@ -41,11 +41,6 @@ aside {
   color: #519d81;
   margin-left: -9px;
 }
-.subtitle {
-  font-size: 11px;
-  color: #84938c;
-  margin-top: 13px;
-}
 nav {
   margin-top: 48px;
   display: grid;
@@ -65,17 +60,6 @@ nav button.active {
   background: #eaf3ee;
   color: #267560;
   font-weight: 600;
-}
-.aside-bottom {
-  position: absolute;
-  bottom: 32px;
-  font-size: 10px;
-  letter-spacing: 2px;
-  color: #83968b;
-  line-height: 2.4;
-}
-.aside-bottom span {
-  letter-spacing: 0;
 }
 main {
   margin-left: 240px;
@@ -98,12 +82,6 @@ header {
   align-items: center;
   margin: 42px 0 30px;
   gap: 20px;
-}
-.eyebrow {
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 2px;
-  color: #639581;
 }
 h1 {
   font-size: 30px;
@@ -306,10 +284,6 @@ footer {
   .brand {
     font-size: 27px;
   }
-  .subtitle,
-  .aside-bottom {
-    display: none;
-  }
   nav {
     margin-top: 18px;
     display: flex;
@@ -350,4 +324,11 @@ footer {
   .disk {
     gap: 10px;
   }
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 22px;
 }
