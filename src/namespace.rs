@@ -32,7 +32,7 @@ impl Store {
     // Namespace lookup/open holds SH briefly. Mutations hold EX and lock only
     // affected descriptors, leaving unrelated open files completely independent.
     pub(crate) fn namespace(&self, exclusive: bool) -> Result<File> {
-        self.verify_root(self.root())?;
+        self.verify_storage()?;
         let path = Self::path(self.root(), Path::new(".tier/namespace.lock"))?;
         create_parent(&path)?;
         let file = OpenOptions::new()
@@ -51,6 +51,14 @@ impl Store {
             );
         }
         Ok(file)
+    }
+
+    pub fn verify_storage(&self) -> Result<()> {
+        self.verify_root(self.root())?;
+        for root in self.config.replicas.values() {
+            self.verify_root(root)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn initialize_roots(&mut self) -> Result<()> {
@@ -180,16 +188,19 @@ impl Store {
         Ok(file)
     }
 
-    fn affected_locks(&self, relative: &Path) -> Result<Vec<File>> {
+    pub(crate) fn affected_locks(&self, relative: &Path) -> Result<Vec<File>> {
         fn collect(path: &Path, locks: &mut Vec<File>) -> Result<()> {
             if !path.exists() {
                 return Ok(());
             }
-            if path.is_dir() {
+            let kind = fs::symlink_metadata(path)?.file_type();
+            ensure!(!kind.is_symlink(), "symlink in affected metadata");
+            if kind.is_dir() {
                 for entry in fs::read_dir(path)? {
                     collect(&entry?.path(), locks)?;
                 }
             } else {
+                ensure!(kind.is_file(), "non-file affected metadata");
                 let file = OpenOptions::new().read(true).write(true).open(path)?;
                 FileExt::try_lock_exclusive(&file)?;
                 locks.push(file);
@@ -404,6 +415,15 @@ impl Store {
         if let Some(destination) = &change.destination {
             validate_relative(destination)?;
         }
+        // Survivors must retain evidence of an unfinished cross-disk mutation
+        // even when the primary and its authoritative journal are lost.
+        for root in self.config.replicas.values() {
+            self.verify_root(root)?;
+            copy_atomic(
+                bytes.as_slice(),
+                &Self::path(root, Path::new(".tier/namespace.json"))?,
+            )?;
+        }
         if !change.prepared {
             let destination = change
                 .destination
@@ -467,6 +487,11 @@ impl Store {
                 }
                 sync_parent(&source)?;
             }
+        }
+        for root in self.config.replicas.values() {
+            let mirrored = Self::path(root, Path::new(".tier/namespace.json"))?;
+            fs::remove_file(&mirrored)?;
+            sync_parent(&mirrored)?;
         }
         fs::remove_file(&journal)?;
         sync_parent(&journal)

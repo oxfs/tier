@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 
@@ -74,7 +75,45 @@ def run(*args, input=None):
     return result.stdout + result.stderr
 
 
-def test_archive(directory, first, second):
+@contextlib.contextmanager
+def management(binary, config):
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    process = subprocess.Popen(
+        [binary, str(config)],
+        env={**os.environ, "TIER_WEB_LISTEN": f"127.0.0.1:{port}"},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    def api(operation):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/{operation}",
+            data=b"{}",
+            headers={"X-Tier-Request": "1", "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            result = json.load(response)
+            assert not result.get("errors"), result
+            return result
+
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                api("init")
+                break
+            except OSError:
+                assert time.monotonic() < deadline, "Tier startup timeout"
+                time.sleep(0.05)
+        yield api
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+
+
+def test_archive(directory, first, second, stack):
     binary = os.environ.get(
         "TIER_BIN",
         str(Path(__file__).resolve().parents[1] / "target/release/tier"),
@@ -98,10 +137,9 @@ path = "archive"
 count = 2
 gc = true
 [backup.archive]
-targets = ["first", "second"]
 count = 2
 """)
-    run(binary, str(config), "init")
+    api = stack.enter_context(management(binary, config))
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -165,6 +203,7 @@ map archive = no
     with (directory / "process.log").open("w") as log:
         process = subprocess.Popen(
             ["smbd", "-F", "--no-process-group", "-s", str(smb)],
+            stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=log,
             start_new_session=True,
@@ -186,7 +225,8 @@ map archive = no
             smb_command(
                 f"mkdir archive; put {source} archive/file.bin; put {source} local.bin"
             )
-            run(binary, str(config), "scan")
+            api("scan")
+            api("scan")
             assert not (directory / "primary/archive/file.bin").exists()
             assert (directory / "replica/.tier/meta/archive/file.bin").is_file()
             assert len(first.objects) == len(second.objects) == 1
@@ -232,10 +272,11 @@ def main():
         tempfile.TemporaryDirectory(prefix="tier-archive-smb-") as temporary,
         webdav() as first,
         webdav() as second,
+        contextlib.ExitStack() as stack,
     ):
         directory = Path(temporary)
         try:
-            test_archive(directory, first, second)
+            test_archive(directory, first, second, stack)
         except Exception:
             for name in ("smb.log", "process.log"):
                 path = directory / name

@@ -11,6 +11,7 @@ trap 'rm -rf "$stage"' EXIT
 mkdir -p "$output" "$stage/tier/bin" "$stage/tier/lib" "$stage/tier/deploy"
 install -m 0755 "$binary" "$stage/tier/bin/tier"
 install -m 0755 "$module" "$stage/tier/lib/tier.so"
+cp -r "$root/web/dist" "$stage/tier/web"
 install -m 0755 "$root/deploy/install.sh" "$stage/tier/deploy/"
 install -m 0644 "$root/deploy/"{tier.service,config.toml.example,smb.conf.example} "$stage/tier/deploy/"
 dpkg-query -W -f='${Version}\n' samba >"$stage/tier/deploy/samba-version"

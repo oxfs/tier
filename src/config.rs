@@ -21,14 +21,20 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Background {
+    pub workers: usize,
+    pub archive_concurrency: usize,
     pub scan_interval_secs: u64,
     pub audit_interval_secs: u64,
+    pub archive_audit_interval_secs: u64,
 }
 impl Default for Background {
     fn default() -> Self {
         Self {
+            workers: 2,
+            archive_concurrency: 2,
             scan_interval_secs: 60,
             audit_interval_secs: 86400,
+            archive_audit_interval_secs: 604800,
         }
     }
 }
@@ -36,6 +42,10 @@ impl Default for Background {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArchiveTarget {
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
     pub url: String,
     pub username_env: Option<String>,
     pub password_env: Option<String>,
@@ -44,8 +54,30 @@ pub struct ArchiveTarget {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArchiveBackup {
-    pub targets: Vec<String>,
     pub count: usize,
+    #[serde(default)]
+    pub after_secs: u64,
+    #[serde(default)]
+    pub local_ttl_secs: u64,
+}
+
+fn default_concurrency() -> usize {
+    2
+}
+
+impl ArchiveTarget {
+    pub(crate) fn endpoint(&self) -> Result<String> {
+        let url = url::Url::parse(&self.url)?;
+        Ok(url
+            .as_str()
+            .strip_suffix('/')
+            .unwrap_or(url.as_str())
+            .to_owned())
+    }
+}
+
+fn default_timeout() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,12 +111,24 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         ensure!(
+            self.background.workers > 0 && self.background.archive_concurrency > 0,
+            "concurrency must be positive"
+        );
+        ensure!(
             self.background.scan_interval_secs > 0
-                && self.background.audit_interval_secs >= self.background.scan_interval_secs,
+                && self.background.audit_interval_secs >= self.background.scan_interval_secs
+                && self.background.archive_audit_interval_secs
+                    >= self.background.scan_interval_secs,
             "invalid background intervals"
         );
+        let mut urls = std::collections::BTreeSet::new();
         for target in self.archives.values() {
+            ensure!(
+                target.concurrency > 0 && target.timeout_secs > 0,
+                "archive concurrency must be positive"
+            );
             let url = url::Url::parse(&target.url)?;
+            ensure!(urls.insert(target.endpoint()?), "duplicate archive URL");
             ensure!(
                 matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
                 "invalid archive URL"
@@ -141,19 +185,17 @@ impl Config {
         );
         for (index, backup) in self.backup.iter().enumerate() {
             if let Some(archive) = &backup.archive {
-                let unique: std::collections::BTreeSet<_> = archive.targets.iter().collect();
                 ensure!(
-                    archive.count > 0
-                        && archive.count <= unique.len()
-                        && unique.len() == archive.targets.len(),
-                    "invalid archive replica count or duplicate targets"
+                    !self.replicas.is_empty(),
+                    "archive policies require a local replica disk to preserve filenames and descriptors"
                 );
                 ensure!(
-                    archive
-                        .targets
-                        .iter()
-                        .all(|name| self.archives.contains_key(name)),
-                    "unknown archive target"
+                    archive.count > 0 && archive.count <= self.archives.len(),
+                    "invalid archive replica count"
+                );
+                ensure!(
+                    backup.count.saturating_sub(1) <= self.replicas.len(),
+                    "archive waiting requires enough local replicas"
                 );
             }
             validate_relative(&backup.path)?;
@@ -291,12 +333,16 @@ mod tests {
 
     #[test]
     fn archive_backup_requires_distinct_known_targets_and_safe_urls() -> Result<()> {
-        let source = "primary='/primary'\n[replicas]\n[archives.remote]\nurl='https://example.test/dav/'\n[[backup]]\npath=''\ncount=1\ngc=true\n[backup.archive]\ntargets=['remote']\ncount=1\n";
+        let source = "primary='/primary'\n[replicas]\nmetadata='/metadata'\n[archives.remote]\nurl='https://example.test/dav/'\n[[backup]]\npath=''\ncount=1\ngc=true\n[backup.archive]\ncount=1\n";
         let config: Config = toml::from_str(source)?;
         config.validate()?;
         for invalid in [
-            source.replace("['remote']", "['remote','remote']"),
-            source.replace("['remote']", "['missing']"),
+            source.replace("metadata='/metadata'\n", ""),
+            source.replace(
+                "[[backup]]",
+                "[archives.duplicate]\nurl='https://example.test/dav'\n[[backup]]",
+            ),
+            source.replace("[archives.remote]", "[archives.remote]\nconcurrency=0"),
             source.replace("https://example.test", "https://user:secret@example.test"),
             source.replace("https://example.test", "file:///tmp"),
             source.replace("count=1", "count=2"),

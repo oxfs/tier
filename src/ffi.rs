@@ -63,6 +63,7 @@ unsafe fn path<'a>(value: *const libc::c_char) -> &'a Path {
 unsafe extern "C" fn tier_connect(config: *const libc::c_char, out: *mut *mut Store) -> i32 {
     call(|| {
         let store = Store::new(Config::load(unsafe { path(config) })?)?;
+        store.verify_storage()?;
         unsafe {
             *out = Box::into_raw(Box::new(store));
         }
@@ -74,6 +75,14 @@ unsafe extern "C" fn tier_disconnect(store: *mut Store) {
     if !store.is_null() {
         drop(unsafe { Box::from_raw(store) });
     }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn tier_verify_storage(store: *const Store) -> i32 {
+    call(|| {
+        unsafe { &*store }.verify_storage()?;
+        Ok(0)
+    })
 }
 
 #[unsafe(no_mangle)]

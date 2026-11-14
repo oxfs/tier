@@ -19,6 +19,10 @@ pub(crate) struct State {
     pub attributes: Option<FileAttributes>,
     #[serde(default)]
     pub archives: Vec<ArchiveCopy>,
+    #[serde(default)]
+    pub archived_at: Option<u64>,
+    #[serde(default)]
+    pub retiring: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -32,6 +36,7 @@ pub struct FileAttributes {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ArchiveCopy {
     pub target: String,
+    pub endpoint: String,
     pub key: String,
 }
 
@@ -44,6 +49,8 @@ impl State {
             size: 0,
             attributes: None,
             archives: Vec::new(),
+            archived_at: None,
+            retiring: Vec::new(),
         }
     }
 }

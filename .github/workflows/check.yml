@@ -17,6 +17,9 @@ jobs:
       CARGO_BUILD_JOBS: 4
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy, rust-analyzer

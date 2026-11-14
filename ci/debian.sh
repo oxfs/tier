@@ -6,7 +6,7 @@ if [[ ${1:-} == prepare ]]; then
     export DEBIAN_FRONTEND=noninteractive
     sed -i 's/Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources
     apt-get update -qq
-    apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates python3 samba samba-dev smbclient
+    apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates python3 python3-samba samba samba-dev smbclient
     apt-get build-dep -y samba
     dpkg-query -W | sha256sum | cut -d' ' -f1 >/build/environment-key
     exit 0

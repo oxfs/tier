@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "includes.h"
+#include "lib/util/tevent_unix.h"
 #include "smbd/globals.h"
 #include "smbd/smbd.h"
 #include <dirent.h>
 
 extern int tier_connect(const char *, void **);
 extern void tier_disconnect(void *);
+extern int tier_verify_storage(const void *);
 extern int tier_open(const void *, const char *, int, bool, void **);
 extern void tier_release(void *);
 extern int tier_stat(const void *, const char *, struct stat *);
@@ -176,6 +178,129 @@ static int close_file(struct vfs_handle_struct *h, struct files_struct *fsp) {
   errno = saved;
   return result;
 }
+/* Raw descriptors bypass Rust Reader/Writer, so guard every data entry point.
+ */
+static ssize_t tier_pread(struct vfs_handle_struct *h, struct files_struct *fsp,
+                          void *data, size_t n, off_t offset) {
+  if (tier_verify_storage(connection(h)->store) != 0)
+    return -1;
+  return SMB_VFS_NEXT_PREAD(h, fsp, data, n, offset);
+}
+static ssize_t tier_pwrite(struct vfs_handle_struct *h,
+                           struct files_struct *fsp, const void *data, size_t n,
+                           off_t offset) {
+  if (tier_verify_storage(connection(h)->store) != 0)
+    return -1;
+  return SMB_VFS_NEXT_PWRITE(h, fsp, data, n, offset);
+}
+static int truncate_file(struct vfs_handle_struct *h, struct files_struct *fsp,
+                         off_t offset) {
+  if (tier_verify_storage(connection(h)->store) != 0)
+    return -1;
+  return SMB_VFS_NEXT_FTRUNCATE(h, fsp, offset);
+}
+static int allocate_file(struct vfs_handle_struct *h, struct files_struct *fsp,
+                         uint32_t mode, off_t offset, off_t len) {
+  if (tier_verify_storage(connection(h)->store) != 0)
+    return -1;
+  return SMB_VFS_NEXT_FALLOCATE(h, fsp, mode, offset, len);
+}
+static ssize_t send_file(struct vfs_handle_struct *h, int fd,
+                         struct files_struct *fsp, const DATA_BLOB *header,
+                         off_t offset, size_t count) {
+  if (tier_verify_storage(connection(h)->store) != 0)
+    return -1;
+  return SMB_VFS_NEXT_SENDFILE(h, fd, fsp, header, offset, count);
+}
+static ssize_t receive_file(struct vfs_handle_struct *h, int fd,
+                            struct files_struct *fsp, off_t offset,
+                            size_t count) {
+  if (tier_verify_storage(connection(h)->store) != 0)
+    return -1;
+  return SMB_VFS_NEXT_RECVFILE(h, fd, fsp, offset, count);
+}
+enum io_operation { IO_READ, IO_WRITE, IO_SYNC };
+struct io_state {
+  enum io_operation operation;
+  ssize_t result;
+  struct vfs_aio_state aio;
+};
+static void io_done(struct tevent_req *subreq) {
+  struct tevent_req *req = tevent_req_callback_data(subreq, struct tevent_req);
+  struct io_state *state = tevent_req_data(req, struct io_state);
+  switch (state->operation) {
+  case IO_READ:
+    state->result = SMB_VFS_PREAD_RECV(subreq, &state->aio);
+    break;
+  case IO_WRITE:
+    state->result = SMB_VFS_PWRITE_RECV(subreq, &state->aio);
+    break;
+  case IO_SYNC:
+    state->result = SMB_VFS_FSYNC_RECV(subreq, &state->aio);
+    break;
+  }
+  TALLOC_FREE(subreq);
+  tevent_req_done(req);
+}
+static struct tevent_req *io_send(struct vfs_handle_struct *h, TALLOC_CTX *ctx,
+                                  struct tevent_context *ev,
+                                  struct files_struct *fsp, void *data,
+                                  size_t n, off_t offset,
+                                  enum io_operation operation) {
+  struct io_state *state;
+  struct tevent_req *req = tevent_req_create(ctx, &state, struct io_state);
+  struct tevent_req *subreq = NULL;
+  if (!req)
+    return NULL;
+  state->operation = operation;
+  if (tier_verify_storage(connection(h)->store) != 0) {
+    tevent_req_error(req, errno);
+    return tevent_req_post(req, ev);
+  }
+  switch (operation) {
+  case IO_READ:
+    subreq = SMB_VFS_NEXT_PREAD_SEND(state, ev, h, fsp, data, n, offset);
+    break;
+  case IO_WRITE:
+    subreq = SMB_VFS_NEXT_PWRITE_SEND(state, ev, h, fsp, data, n, offset);
+    break;
+  case IO_SYNC:
+    subreq = SMB_VFS_NEXT_FSYNC_SEND(state, ev, h, fsp);
+    break;
+  }
+  if (tevent_req_nomem(subreq, req))
+    return tevent_req_post(req, ev);
+  tevent_req_set_callback(subreq, io_done, req);
+  return req;
+}
+static ssize_t io_recv(struct tevent_req *req, struct vfs_aio_state *aio) {
+  struct io_state *state = tevent_req_data(req, struct io_state);
+  if (tevent_req_is_unix_error(req, &aio->error))
+    return -1;
+  *aio = state->aio;
+  return state->result;
+}
+static struct tevent_req *read_send(struct vfs_handle_struct *h,
+                                    TALLOC_CTX *ctx, struct tevent_context *ev,
+                                    struct files_struct *fsp, void *data,
+                                    size_t n, off_t offset) {
+  return io_send(h, ctx, ev, fsp, data, n, offset, IO_READ);
+}
+static struct tevent_req *write_send(struct vfs_handle_struct *h,
+                                     TALLOC_CTX *ctx, struct tevent_context *ev,
+                                     struct files_struct *fsp, const void *data,
+                                     size_t n, off_t offset) {
+  return io_send(h, ctx, ev, fsp, discard_const_p(void, data), n, offset,
+                 IO_WRITE);
+}
+static struct tevent_req *sync_send(struct vfs_handle_struct *h,
+                                    TALLOC_CTX *ctx, struct tevent_context *ev,
+                                    struct files_struct *fsp) {
+  return io_send(h, ctx, ev, fsp, NULL, 0, 0, IO_SYNC);
+}
+static int sync_recv(struct tevent_req *req, struct vfs_aio_state *aio) {
+  return io_recv(req, aio);
+}
 static DIR *open_directory(struct vfs_handle_struct *h,
                            struct files_struct *fsp, const char *mask,
                            uint32_t attrs) {
@@ -194,6 +319,8 @@ static DIR *open_directory(struct vfs_handle_struct *h,
 }
 static struct dirent *read_directory(struct vfs_handle_struct *h,
                                      struct files_struct *fsp, DIR *dir) {
+  if (tier_verify_storage(connection(h)->store) != 0)
+    return NULL;
   struct listing *listing = (struct listing *)dir;
   int result = tier_entry(listing->entries, listing->offset,
                           listing->entry.d_name, sizeof(listing->entry.d_name));
@@ -294,6 +421,22 @@ static struct vfs_fn_pointers operations = {
     .disconnect_fn = disconnect_share,
     .openat_fn = open_at,
     .close_fn = close_file,
+    .pread_fn = tier_pread,
+    .pwrite_fn = tier_pwrite,
+    .pread_send_fn = read_send,
+    .pread_recv_fn = io_recv,
+    .pwrite_send_fn = write_send,
+    .pwrite_recv_fn = io_recv,
+    .fsync_send_fn = sync_send,
+    .fsync_recv_fn = sync_recv,
+    .sendfile_fn = send_file,
+    .recvfile_fn = receive_file,
+    .ftruncate_fn = truncate_file,
+    .fallocate_fn = allocate_file,
+    .offload_read_send_fn = vfs_not_implemented_offload_read_send,
+    .offload_read_recv_fn = vfs_not_implemented_offload_read_recv,
+    .offload_write_send_fn = vfs_not_implemented_offload_write_send,
+    .offload_write_recv_fn = vfs_not_implemented_offload_write_recv,
     .stat_fn = stat_path,
     .lstat_fn = stat_path,
     .fstat_fn = stat_fd,

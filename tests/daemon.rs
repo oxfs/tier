@@ -59,7 +59,6 @@ fn service_skips_busy_files_reloads_backup_and_stops_cleanly() -> Result<()> {
     let mut service = Service(
         Command::new(env!("CARGO_BIN_EXE_tier"))
             .arg(&config)
-            .arg("run")
             .stdout(Stdio::null())
             .stderr(fs::File::create(&log_path)?)
             .spawn()?,
@@ -67,8 +66,13 @@ fn service_skips_busy_files_reloads_backup_and_stops_cleanly() -> Result<()> {
     wait_until(|| fs::read_to_string(&log_path).is_ok_and(|log| log.contains("replicate")))?;
     assert!(!replica.join("file").exists());
     drop(reader);
-    wait_until(|| replica.join("file").exists())?;
-    assert_eq!(fs::read(replica.join("file"))?, b"durable content");
+    wait_until(|| replica.join("file").exists() || second.join("file").exists())?;
+    let selected = if replica.join("file").exists() {
+        &replica
+    } else {
+        &second
+    };
+    assert_eq!(fs::read(selected.join("file"))?, b"durable content");
     // Atomic configuration replacement, as a deployment tool would perform.
     let replacement = directory.path().join("next.toml");
     fs::write(&replacement, settings(true))?;
