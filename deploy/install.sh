@@ -46,5 +46,5 @@ if [[ -d /run/systemd/system ]]; then
 fi
 echo 'Installed. Configure /etc/tier/config.toml (readable by tier), make storage roots writable by tier, then run:'
 echo '  systemctl enable --now tier'
-echo 'Initialize storage in the Web management page at http://127.0.0.1:8739.'
+echo 'Initialize storage in the Web management page at http://127.0.0.1:9999.'
 echo 'Configure the Samba share before starting tier and restarting smbd.'

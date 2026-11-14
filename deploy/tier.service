@@ -9,7 +9,7 @@ User=tier
 Group=tier
 ExecStart=/usr/local/bin/tier /etc/tier/config.toml
 EnvironmentFile=-/etc/tier/secrets
-Environment=TIER_WEB_LISTEN=127.0.0.1:8739
+Environment=TIER_WEB_LISTEN=0.0.0.0:9999
 Restart=on-failure
 RestartSec=5
 Nice=10

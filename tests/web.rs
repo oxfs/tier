@@ -8,6 +8,15 @@ use std::{
 
 #[test]
 fn management_survives_invalid_config_and_rejects_cross_origin_requests() -> Result<()> {
+    check_management(false)
+}
+
+#[test]
+fn management_supports_all_interfaces() -> Result<()> {
+    check_management(true)
+}
+
+fn check_management(all_interfaces: bool) -> Result<()> {
     let directory = tempfile::tempdir()?;
     let config = directory.path().join("config.toml");
     fs::write(&config, "invalid configuration")?;
@@ -16,7 +25,14 @@ fn management_survives_invalid_config_and_rejects_cross_origin_requests() -> Res
     drop(listener);
     let mut child = Command::new(env!("CARGO_BIN_EXE_tier"))
         .arg(&config)
-        .env("TIER_WEB_LISTEN", address.to_string())
+        .env(
+            "TIER_WEB_LISTEN",
+            if all_interfaces {
+                format!("0.0.0.0:{}", address.port())
+            } else {
+                address.to_string()
+            },
+        )
         .stderr(Stdio::null())
         .spawn()?;
     let outcome = (|| -> Result<()> {
@@ -103,9 +119,10 @@ fn management_survives_invalid_config_and_rejects_cross_origin_requests() -> Res
             agent
                 .get(&endpoint)
                 .set("X-Tier-Request", "1")
-                .set("Host", "attacker.example")
+                .set("Host", "nas.local")
                 .call()
-                .is_err()
+                .is_ok()
+                == all_interfaces
         );
         let mut draining = std::net::TcpStream::connect(address)?;
         draining.set_read_timeout(Some(Duration::from_secs(15)))?;
