@@ -129,6 +129,7 @@ impl MaintenancePlan {
                 .any(|name| !config.replicas.contains_key(name))
             || (state.local_primary.is_none() && primary_exists == self.remove_primary)
             || (state.local_primary.is_some() && primary_exists)
+            || (state.local_primary.is_none() && !primary_exists && !state.replicas.is_empty())
     }
 }
 
@@ -894,4 +895,37 @@ pub(crate) fn copy_file(source: &mut File, destination: &Path, root: &Path) -> R
     temporary.as_file().sync_all()?;
     temporary.persist(destination)?;
     sync_parent(destination)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maintenance_assigns_a_local_primary_to_older_gc_descriptors() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let primary = temporary.path().join("primary");
+        let replica = temporary.path().join("replica");
+        fs::create_dir(&primary)?;
+        fs::create_dir(&replica)?;
+        let store = Store::initialize(toml::from_str(&format!(
+            "primary={primary:?}\n[replicas]\nbackup={replica:?}\n[[backup]]\npath=''\ncount=1\ngc=true\n"
+        ))?)?;
+        let path = Path::new("file");
+        store.write(path)?.write_all(b"before")?;
+        store.reconcile(path)?;
+        let mut lock = store.lock(path)?;
+        let state = descriptor::load(&mut lock)?.unwrap().1;
+        let mut json = serde_json::to_value(state)?;
+        json.as_object_mut().unwrap().remove("local_primary");
+        let old: State = serde_json::from_value(json)?;
+        assert!(old.local_primary.is_none());
+        descriptor::save(&mut lock, &old)?;
+        drop(lock);
+        assert!(store.scan_pending()?.errors.is_empty());
+        store.write(path)?.write_all(b"after!")?;
+        assert!(!primary.join(path).exists());
+        assert_eq!(fs::read(replica.join(path))?, b"after!");
+        Ok(())
+    }
 }
