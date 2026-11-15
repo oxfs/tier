@@ -1,0 +1,41 @@
+services:
+  tier:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "445:445"
+      - "127.0.0.1:9999:9999"
+    volumes:
+      - type: bind
+        source: ${TIER_DISKS:?Set TIER_DISKS to the parent of mounted disks}
+        target: /srv/tier
+        bind:
+          create_host_path: false
+          propagation: rslave
+      - ./config:/etc/tier
+      - ./smb.conf:/etc/samba/smb.conf:ro
+      - samba:/var/lib/samba
+      - cache:/var/cache/tier
+    environment:
+      TIER_SMB_ENABLED: ${TIER_SMB_ENABLED:-1}
+    secrets:
+      - smb_password
+  openlist:
+    image: openlistteam/openlist:v4.2.9
+    user: '0:0'
+    profiles: [archive]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5244:5244"
+    volumes:
+      - openlist:/opt/openlist/data
+secrets:
+  smb_password:
+    file: ./smb_password
+volumes:
+  samba:
+  cache:
+  openlist:
+

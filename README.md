@@ -33,6 +33,41 @@ sudo systemctl enable --now tier
 sudo systemctl restart smbd
 ```
 
+### Docker（Linux）
+
+容器包含配套的 Samba 和 Tier。宿主机负责挂载磁盘；暂不支持容器内格式化、挂载和硬盘电源管理，也不采集 SMART。445 端口须未被其他 SMB 服务占用。
+
+推荐首次部署使用安装向导。需要 Linux amd64、Docker Compose、Python 3，以及两块已经持久挂载的独立空盘；向导不格式化磁盘、不覆盖已有安装、不递归修改权限。磁盘根目录必须为空；仅允许文件系统自动创建的空 `lost+found` 目录，向导会在预检通过后删除该空目录并记录日志。含有文件、符号链接或其他内容时拒绝安装，不递归删除，路径使用英文字母、数字、下划线、短横线和点。父挂载必须已配置 shared 传播，重启后磁盘仍应在 Docker 启动前挂载。
+
+```sh
+sudo bash tier/deploy/setup.sh
+```
+
+向导询问主盘、副本盘和 SMB 密码，使用发布包对应版本的预构建镜像，生成 `/opt/tier` 配置，先在维护模式初始化磁盘，再启动共享。账号为 `tier`。发布镜像尚未提供时，可显式传入 `--image 仓库:版本`；不使用 `latest`。非交互安装可传 `--primary /mnt/disk1 --replica /mnt/disk2 --password-file /安全路径/password --directory /opt/tier`，密码文件应为 0600。安装目录不可放在存储盘内。后续管理在安装目录运行 `docker compose`；保留该目录名称，以保持命名卷所属项目一致。
+
+以下是手动构建与配置方式：
+解压发布包后进入 `tier/deploy`。创建 `config` 目录，将 `config.toml.example` 复制为 `config/config.toml`，将 `smb.conf.example` 复制为 `smb.conf`，把其中的 `USERNAME` 替换为 `tier`。将 SMB 初始密码写入当前目录 `smb_password`（权限 0600）；账号保存到持久卷，修改密码使用 `docker compose exec tier smbpasswd tier`。
+
+将主盘、副本盘分别挂载为同一个父目录下的子挂载点，例如 `/mnt/tier/primary`、`/mnt/tier/disk1`。配置中的路径分别填写 `/srv/tier/primary`、`/srv/tier/disk1`，删除未使用的副本配置。每个根目录必须为挂载点；容器拒绝把普通空目录作为磁盘启动。构建镜像后，按下方步骤查询 `tier` 的 UID/GID，再赋予其对配置目录及存储目录的读写权限，不要递归修改已有数据的权限。
+
+```sh
+export TIER_DISKS=/mnt/tier
+sudo mount --rbind "$TIER_DISKS" "$TIER_DISKS"
+sudo mount --make-rshared "$TIER_DISKS"
+docker compose build
+docker compose run --rm --entrypoint id tier tier
+```
+
+父目录使用 shared 挂载，使新增和移除的子挂载传播到容器；以上挂载设置重启后失效，需在宿主机启动流程中先恢复磁盘挂载及传播设置，再启动容器。完成目录权限设置后运行 `docker compose up -d`。
+
+通过 SSH 转发 `9999` 端口访问管理页面，显式初始化磁盘身份后使用 SMB。配置目录需要允许 `tier` 用户原子替换文件。管理端口仅发布到宿主机回环地址，不带登录认证。容器内临时下载位于持久卷 `/var/cache/tier`，需预留足够空间；可将该卷改为独立磁盘目录。
+
+可选 OpenList 归档：运行 `docker compose --profile archive up -d`，通过 SSH 转发 `5244` 访问其独立管理页面，按 OpenList 提示设置管理员和存储。创建专用归档账号及远端目录，开启 WebDAV 读取、WebDAV 管理和上传权限（默认管理员也需要检查 WebDAV 管理权限），并使用代理下载以避免返回重定向。Tier 归档地址使用 `http://openlist:5244/dav/你的归档目录/`，凭据放在 `config/secrets`（权限 0600，纯 WEBDAV_NAME=value 格式，不使用引号或 Shell 表达式）。修改凭据后重启 Tier 容器。不要把 Tier 主盘直接挂给 OpenList，也不要让归档目标指回 Tier 的 SMB 共享。
+
+默认示例固定 OpenList 版本；其他后端须先验证上传、完整回读、故障与恢复，再开启本地 GC。停止服务用 `docker compose down`；不要添加 `-v`，该选项会删除账号、OpenList 配置等持久数据。升级前备份 `config`、`smb.conf` 和命名卷，停止共享后用新发布包重建镜像。若精确 Samba 版本已从软件源移除，构建会失败，应使用重新构建的配套发布包，不能强行替换 Samba 版本。
+
+磁盘故障需要管理恢复时，先运行 `docker compose stop tier`，再运行 `TIER_SMB_ENABLED=0 docker compose up -d tier`。维护模式仅启动 Tier 后台和管理页面，不启动 SMB，不要求缺失盘通过挂载检查。不要对丢失挂载点初始化。恢复主盘前，先在宿主机挂载一个有足够空间的空盘，确保其在容器中可见，再修改配置路径并按下文恢复流程操作。确认磁盘身份、数据与挂载正常后，运行 `TIER_SMB_ENABLED=1 docker compose up -d tier` 恢复共享。
+
 ## 升级
 
 升级前阅读对应版本的发布说明，确认配置和磁盘格式兼容。本次首次发布不提供旧开发版本的数据格式迁移；不要直接在旧开发数据上升级，也不要依靠替换旧二进制回滚磁盘格式。
