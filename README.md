@@ -53,7 +53,7 @@ docker compose run --rm --entrypoint id tier tier
 
 通过 SSH 转发 `9999` 端口访问管理页面，显式初始化磁盘身份后使用 SMB。配置目录需要允许 `tier` 用户原子替换文件。管理端口仅发布到宿主机回环地址，不带登录认证。容器内临时下载位于持久卷 `/var/cache/tier`，需预留足够空间；可将该卷改为独立磁盘目录。
 
-可选 OpenList 归档：运行 `docker compose --profile archive up -d`，通过 SSH 转发 `5244` 访问其独立管理页面，按 OpenList 提示设置管理员和存储。创建专用归档账号及远端目录，允许 WebDAV 读取和上传，并使用代理下载以避免返回重定向。Tier 归档地址使用 `http://openlist:5244/dav/你的归档目录/`，凭据放在 `config/secrets`（权限 0600，纯 WEBDAV_NAME=value 格式，不使用引号或 Shell 表达式）。修改凭据后重启 Tier 容器。不要把 Tier 主盘直接挂给 OpenList，也不要让归档目标指回 Tier 的 SMB 共享。
+可选 OpenList 归档：运行 `docker compose --profile archive up -d`，通过 SSH 转发 `5244` 访问其独立管理页面，按 OpenList 提示设置管理员和存储。创建专用归档账号及远端目录，开启 WebDAV 读取、WebDAV 管理和上传权限（默认管理员也需要检查 WebDAV 管理权限），并使用代理下载以避免返回重定向。Tier 归档地址使用 `http://openlist:5244/dav/你的归档目录/`，凭据放在 `config/secrets`（权限 0600，纯 WEBDAV_NAME=value 格式，不使用引号或 Shell 表达式）。修改凭据后重启 Tier 容器。不要把 Tier 主盘直接挂给 OpenList，也不要让归档目标指回 Tier 的 SMB 共享。
 
 默认示例固定 OpenList 版本；其他后端须先验证上传、完整回读、故障与恢复，再开启本地 GC。停止服务用 `docker compose down`；不要添加 `-v`，该选项会删除账号、OpenList 配置等持久数据。升级前备份 `config`、`smb.conf` 和命名卷，停止共享后用新发布包重建镜像。若精确 Samba 版本已从软件源移除，构建会失败，应使用重新构建的配套发布包，不能强行替换 Samba 版本。
 

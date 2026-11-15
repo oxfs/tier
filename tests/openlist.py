@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Real OpenList Local driver archive and SMB cold-read integration."""
 
+import base64
 import contextlib
+import hashlib
 import importlib.util
 import json
 import os
@@ -9,6 +11,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -26,7 +29,7 @@ def main():
     def request(path, body, token=""):
         req = urllib.request.Request(
             endpoint + path,
-            json.dumps(body).encode(),
+            None if body is None else json.dumps(body).encode(),
             {"Content-Type": "application/json", "Authorization": token},
         )
         with urllib.request.urlopen(req, timeout=30) as response:
@@ -44,6 +47,10 @@ def main():
         except OSError:
             assert time.monotonic() < deadline, "OpenList startup timeout"
             time.sleep(0.5)
+    user = request("/api/me", None, token)
+    # OpenList 4.2.9's initial admin has DAV read but not DAV write permission.
+    user["permission"] |= 1 << 9
+    request("/api/admin/user/update", user, token)
     storage = request(
         "/api/admin/storage/create",
         {
@@ -55,6 +62,26 @@ def main():
         },
         token,
     )
+    payload = b"OpenList direct protocol probe"
+    probe_url = endpoint + "/dav/archive/" + hashlib.sha256(payload).hexdigest()
+    authorization = "Basic " + base64.b64encode(f"admin:{password}".encode()).decode()
+
+    def dav(method, body=None):
+        req = urllib.request.Request(
+            probe_url, body, {"Authorization": authorization}, method=method
+        )
+        try:
+            response = urllib.request.urlopen(req, timeout=30)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            content = response.read()
+            print(f"OpenList probe {method}: HTTP {response.status}")
+            return response.status, content
+
+    assert dav("GET")[0] == 404, "Missing archive must report HTTP 404"
+    assert dav("PUT", payload)[0] in (200, 201, 204), "Archive PUT failed"
+    assert dav("GET") == (200, payload), "Archive read-after-write failed"
     os.environ["OPENLIST_TEST_USER"] = "admin"
     os.environ["OPENLIST_TEST_PASSWORD"] = password
     binary = os.environ.get("TIER_BIN", "/usr/local/bin/tier")
