@@ -78,8 +78,7 @@ jobs:
           docker network create tier-archive-test
           docker network connect tier-archive-test tier-builder
           docker volume create tier-openlist-data
-          docker run --rm --user 0:0 -v tier-openlist-data:/opt/openlist/data openlistteam/openlist:v4.2.9 admin set tier-test-password
-          docker run -d --name tier-openlist --network tier-archive-test --network-alias openlist --user 0:0 -v tier-openlist-data:/opt/openlist/data openlistteam/openlist:v4.2.9
+          docker run -d --name tier-openlist -e OPENLIST_ADMIN_PASSWORD=tier-test-password --network tier-archive-test --network-alias openlist --user 0:0 -v tier-openlist-data:/opt/openlist/data openlistteam/openlist:v4.2.9
           docker exec tier-openlist mkdir -p /archive
           docker exec -e OPENLIST_URL=http://openlist:5244 tier-builder python3 tests/openlist.py
       - uses: actions/cache/save@v4

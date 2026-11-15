@@ -24,6 +24,7 @@ services:
       - smb_password
   openlist:
     image: openlistteam/openlist:v4.2.9
+    user: '0:0'
     profiles: [archive]
     restart: unless-stopped
     ports:

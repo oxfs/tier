@@ -322,6 +322,10 @@ fn automatic_target_selection_skips_failed_verification() -> Result<()> {
     let store = Store::initialize(settings)?;
     let path = Path::new("photo");
     store.write(path)?.write_all(b"photo")?;
+    // This test exercises target selection, not wall-clock archive scheduling.
+    // Keep the filesystem timestamp away from the current second boundary.
+    std::fs::File::open(root.path().join("primary").join(path))?
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1))?;
     store.reconcile(path)?;
     store.reconcile(path)?;
     assert_eq!(good.puts.load(Ordering::Relaxed), 1);
