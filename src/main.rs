@@ -2,6 +2,7 @@ use anyhow::{Result, ensure};
 use std::path::Path;
 
 mod daemon;
+mod hardware;
 mod web;
 
 fn main() -> Result<()> {
@@ -10,6 +11,9 @@ fn main() -> Result<()> {
         println!("tier {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    ensure!(args.len() == 2, "usage: tier CONFIG");
+    if args.len() == 2 && args[1] == "--hardware" {
+        return hardware::run();
+    }
+    ensure!(args.len() == 2, "usage: tier CONFIG | --hardware");
     daemon::run(Path::new(&args[1]))
 }

@@ -332,3 +332,5 @@ footer {
   gap: 12px;
   margin-top: 22px;
 }
+
+.hardware { margin-top: 10px; font-size: 13px; overflow-wrap: anywhere; }

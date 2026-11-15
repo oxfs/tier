@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh Tier disk hardware information
+
+[Timer]
+OnBootSec=15
+OnUnitInactiveSec=120
+Unit=tier-hardware.service
+
+[Install]
+WantedBy=timers.target

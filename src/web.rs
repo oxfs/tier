@@ -67,6 +67,10 @@ fn health(path: &Path, state: &Health) -> Value {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
+    let hardware: Value = fs::read("/run/tier-hardware/status.json")
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
     let disks: Vec<_> = std::iter::once(("主盘", &config.primary))
         .chain(
             config
@@ -86,7 +90,7 @@ fn health(path: &Path, state: &Health) -> Value {
             })();
             match result {
                 Ok((total, available)) => {
-                    json!({"name":name,"path":root,"total":total,"available":available})
+                    json!({"name":name,"path":root,"total":total,"available":available,"hardware":disk_hardware(root, &hardware)})
                 }
                 Err(error) => json!({"name":name,"path":root,"error":format!("{error:#}")}),
             }
@@ -94,6 +98,27 @@ fn health(path: &Path, state: &Health) -> Value {
         .collect();
     let healthy = disks.iter().all(|disk| disk.get("error").is_none()) && reports_healthy(&history);
     json!({"healthy":healthy,"disks":disks,"archives":config.archives.keys().collect::<Vec<_>>(),"policies":config.backup.len(),"last":last,"history":history})
+}
+
+fn disk_hardware(root: &Path, snapshot: &Value) -> Value {
+    use std::os::unix::fs::MetadataExt;
+    let Some(updated) = snapshot["updated_at"].as_u64() else {
+        return json!({"error":"尚未采集硬件信息，请检查 tier-hardware.timer"});
+    };
+    let devices = fs::metadata(root)
+        .ok()
+        .and_then(|metadata| {
+            let device = metadata.dev();
+            let key = format!("{}:{}", libc::major(device), libc::minor(device));
+            snapshot["devices"][key].as_array().cloned()
+        })
+        .unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    json!({"updated_at":updated,"stale":now.saturating_sub(updated) > 600,
+        "devices":devices,"error":if devices.is_empty() { Some("无法映射物理硬盘，网络或虚拟文件系统可能不支持") } else { None }})
 }
 
 fn reports_healthy(history: &Value) -> bool {
@@ -325,6 +350,22 @@ pub fn start(path: &Path, stop: Arc<AtomicBool>) -> Result<Service> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hardware_mapping_and_expiry_are_explicit() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir()?;
+        let dev = fs::metadata(directory.path())?.dev();
+        let key = format!("{}:{}", libc::major(dev), libc::minor(dev));
+        let snapshot = json!({"updated_at":1,"devices":{key:[{"model":"disk","temperature":0,"passed":false}]}});
+        let result = disk_hardware(directory.path(), &snapshot);
+        assert_eq!(result["devices"][0]["temperature"], 0);
+        assert_eq!(result["devices"][0]["passed"], false);
+        assert_eq!(result["stale"], true);
+        assert!(disk_hardware(directory.path(), &Value::Null)["error"].is_string());
+        assert!(disk_hardware(directory.path(), &json!({"updated_at":1}))["error"].is_string());
+        Ok(())
+    }
+
     #[test]
     fn busy_mutation_rejects_immediately_without_blocking_health() -> Result<()> {
         let directory = tempfile::tempdir()?;
