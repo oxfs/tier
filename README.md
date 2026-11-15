@@ -37,6 +37,15 @@ sudo systemctl restart smbd
 
 容器包含配套的 Samba 和 Tier。宿主机负责挂载磁盘；暂不支持容器内格式化、挂载和硬盘电源管理，也不采集 SMART。445 端口须未被其他 SMB 服务占用。
 
+推荐首次部署使用安装向导。需要 Linux amd64、Docker Compose、Python 3，以及两块已经持久挂载的独立空盘；向导不格式化磁盘、不覆盖已有安装、不递归修改权限。磁盘根目录必须为空（包括不能残留 `lost+found`），路径使用英文字母、数字、下划线、短横线和点。父挂载必须已配置 shared 传播，重启后磁盘仍应在 Docker 启动前挂载。
+
+```sh
+sudo bash tier/deploy/setup.sh
+```
+
+向导询问主盘、副本盘和 SMB 密码，使用发布包对应版本的预构建镜像，生成 `/opt/tier` 配置，先在维护模式初始化磁盘，再启动共享。账号为 `tier`。发布镜像尚未提供时，可显式传入 `--image 仓库:版本`；不使用 `latest`。非交互安装可传 `--primary /mnt/disk1 --replica /mnt/disk2 --password-file /安全路径/password --directory /opt/tier`，密码文件应为 0600。安装目录不可放在存储盘内。后续管理在安装目录运行 `docker compose`；保留该目录名称，以保持命名卷所属项目一致。
+
+以下是手动构建与配置方式：
 解压发布包后进入 `tier/deploy`。创建 `config` 目录，将 `config.toml.example` 复制为 `config/config.toml`，将 `smb.conf.example` 复制为 `smb.conf`，把其中的 `USERNAME` 替换为 `tier`。将 SMB 初始密码写入当前目录 `smb_password`（权限 0600）；账号保存到持久卷，修改密码使用 `docker compose exec tier smbpasswd tier`。
 
 将主盘、副本盘分别挂载为同一个父目录下的子挂载点，例如 `/mnt/tier/primary`、`/mnt/tier/disk1`。配置中的路径分别填写 `/srv/tier/primary`、`/srv/tier/disk1`，删除未使用的副本配置。每个根目录必须为挂载点；容器拒绝把普通空目录作为磁盘启动。构建镜像后，按下方步骤查询 `tier` 的 UID/GID，再赋予其对配置目录及存储目录的读写权限，不要递归修改已有数据的权限。

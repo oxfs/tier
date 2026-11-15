@@ -73,6 +73,7 @@ jobs:
           cd ../../..
           sudo apt-get install -y smbclient
           bash tests/container.sh
+          bash tests/setup.sh
       - name: Test OpenList archive gateway
         run: |
           docker network create tier-archive-test
