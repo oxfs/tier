@@ -109,7 +109,8 @@ map archive = no
         )
         with helpers.management(binary, config) as api:
             process = subprocess.Popen(
-                ["smbd", "-F", "--no-process-group", "-s", str(smb)]
+                ["smbd", "-F", "--no-process-group", "-s", str(smb)],
+                start_new_session=True,
             )
             try:
                 deadline = time.monotonic() + 15
