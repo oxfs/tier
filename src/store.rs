@@ -693,9 +693,19 @@ impl Store {
             let current = descriptor::load(&mut lock)?.map(|(_, state)| state);
             let policy = self.config.backup_for(relative)?;
             let plan = MaintenancePlan::new(&self.config, policy, current.as_ref(), now_secs());
-            current
+            let mut pending = current
                 .as_ref()
-                .is_none_or(|state| plan.needs_work(&self.config, state, primary_exists))
+                .is_none_or(|state| plan.needs_work(&self.config, state, primary_exists));
+            if !pending {
+                for root in self.config.replicas.values() {
+                    self.verify_root(root)?;
+                    if !Self::metadata(root, relative)?.try_exists()? {
+                        pending = true;
+                        break;
+                    }
+                }
+            }
+            pending
         };
         let (completed, outcome) = if pending {
             (self.reconcile(relative)?, MaintenanceOutcome::Changed)
