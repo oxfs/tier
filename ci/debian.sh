@@ -23,5 +23,8 @@ bash /build/runtime/tier/deploy/install.sh
 export TIER_BIN=/usr/local/bin/tier
 "$TIER_BIN" --version
 test -s /usr/local/share/tier/web/index.html
+python3 /usr/local/libexec/tier-hardware.py
+runuser -u tier -- python3 -c 'import json; data=json.load(open("/run/tier-hardware/status.json")); assert data["updated_at"] > 0; assert isinstance(data["devices"], dict)'
+test -s /etc/systemd/system/tier-hardware.timer
 TIER_USER=tier TIER_TEST_CIFS=1 "$root/tests/smb.sh"
 python3 "$root/tests/archive-smb.py"

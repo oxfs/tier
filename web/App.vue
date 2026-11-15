@@ -255,6 +255,67 @@ onUnmounted(() => {
               <div class="disk-info">
                 <b>{{ disk.name }}</b><code>{{ disk.path }}</code>
                 <p v-if="disk.error" class="failure">{{ disk.error }}</p>
+                <template v-if="disk.hardware">
+                  <p v-if="disk.hardware.error">{{ disk.hardware.error }}</p>
+                  <p
+                    v-if="disk.hardware.updated_at"
+                    :class="{ failure: disk.hardware.stale }"
+                  >
+                    硬件采集：{{ date(disk.hardware.updated_at)
+                    }}{{ disk.hardware.stale ? "（已过期）" : "" }}
+                  </p>
+                  <div
+                    v-for="device in disk.hardware.devices"
+                    :key="device.device"
+                    class="hardware"
+                  >
+                    <b>{{ device.model ?? "未知型号" }}</b> ·
+                    {{ device.device }}
+                    <p>序列号：{{ device.serial ?? "—" }}</p>
+                    <p>
+                      温度：{{
+                        device.temperature == null
+                          ? "—"
+                          : `${device.temperature}°C`
+                      }}
+                      · 通电：{{
+                        device.power_on_hours == null
+                          ? "—"
+                          : `${device.power_on_hours} 小时`
+                      }}
+                    </p>
+                    <p
+                      :class="{
+                        failure: device.passed === false || device.warning,
+                      }"
+                    >
+                      SMART：{{
+                        device.passed === false
+                          ? "异常"
+                          : device.warning
+                            ? "存在告警"
+                            : device.passed === true
+                              ? "正常"
+                              : "未知"
+                      }}
+                    </p>
+                    <p v-if="device.percentage_used != null">
+                      已使用寿命：{{ device.percentage_used }}%
+                    </p>
+                    <p v-if="device.reallocated != null">
+                      重映射扇区：{{ device.reallocated }} · 待处理：{{
+                        device.pending ?? "—"
+                      }}
+                      · 不可校正：{{ device.uncorrectable ?? "—" }}
+                    </p>
+                    <p v-if="device.media_errors != null">
+                      介质错误：{{ device.media_errors }}
+                    </p>
+                    <p v-if="device.error" class="failure">
+                      {{ device.error }}
+                    </p>
+                  </div>
+                </template>
               </div>
               <div class="capacity">
                 <b>{{ bytes(disk.available) }} 可用</b
