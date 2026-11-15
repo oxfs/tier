@@ -175,6 +175,9 @@ api scan
 test ! -f "$tmp/primary/cold/warm/file.txt"
 cmp "$tmp/input" "$tmp/replica/cold/warm/file.txt"
 cmp "$tmp/input" "$tmp/replica2/cold/warm/file.txt"
+rm "$tmp/replica2/.tier/meta/cold/warm/file.txt"
+api scan
+test -s "$tmp/replica2/.tier/meta/cold/warm/file.txt"
 smb "get cold/warm/file.txt $tmp/cold-readback; del cold/warm/file.txt; rmdir cold/warm; rmdir cold"
 cmp "$tmp/input" "$tmp/cold-readback"
 echo 'PASS: move into cold reuses existing copy, verifies both copies, and supports further writes'

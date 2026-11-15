@@ -59,6 +59,57 @@ impl Fixture {
 }
 
 #[test]
+fn returning_replica_gets_missing_metadata_without_recopying_content() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let fixture = Fixture::new()?;
+    let mut config = fixture.config(false);
+    config.backup[0].count = 2;
+    fixture.store(false)?;
+    let mut offline = fixture.config(false);
+    offline.backup[0].count = 2;
+    offline.replicas.remove("a");
+    let store = Store::new(offline)?;
+    write(&store, "folder/file", b"contents")?;
+    assert!(store.scan_pending()?.errors.is_empty());
+    let mirror = fixture.replicas[0].join(".tier/meta/folder/file");
+    assert!(!mirror.exists());
+    let copy = fixture.replicas[1].join("folder/file");
+    let inode = fs::metadata(&copy)?.ino();
+    let store = Store::new(config)?;
+    let report = store.scan_pending()?;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.changed, 1);
+    assert!(mirror.is_file());
+    assert_eq!(fs::metadata(copy)?.ino(), inode);
+    assert!(!fixture.replicas[0].join("folder/file").exists());
+    assert!(store.check(Path::new("folder/file"))?);
+    assert_eq!(store.scan_pending()?.changed, 0);
+    Ok(())
+}
+
+#[test]
+fn missing_metadata_is_not_published_over_corrupt_content() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let store = fixture.store(false)?;
+    write(&store, "file", b"contents")?;
+    assert!(store.scan_pending()?.errors.is_empty());
+    let mirror = fixture.replicas[0].join(".tier/meta/file");
+    fs::remove_file(&mirror)?;
+    fs::write(fixture.replicas[1].join("file"), b"corrupt!")?;
+    let report = store.scan_pending()?;
+    assert_eq!(report.errors.len(), 1);
+    assert_eq!(report.changed, 0);
+    assert!(!mirror.exists());
+    assert_eq!(fs::read(fixture.primary.join("file"))?, b"contents");
+    fs::write(fixture.replicas[1].join("file"), b"contents")?;
+    let report = store.scan()?;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.changed, 1);
+    assert!(store.check(Path::new("file"))?);
+    Ok(())
+}
+
+#[test]
 fn namespace_survives_gc_rename_and_remove() -> Result<()> {
     let fixture = Fixture::new()?;
     let store = fixture.store(true)?;
