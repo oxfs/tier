@@ -34,6 +34,7 @@ if [[ -f /etc/tier/secrets ]]; then
         export "${line?}"
     done </etc/tier/secrets
 fi
+install -d -m 0700 /var/lib/samba/private
 if [[ ${TIER_SMB_ENABLED:-1} == 1 ]] && ! pdbedit -L | cut -d: -f1 | grep -qx tier; then
     [[ -s /run/secrets/smb_password ]] || {
         echo 'Missing SMB password secret' >&2
