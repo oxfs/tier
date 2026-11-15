@@ -3,6 +3,7 @@ set -euo pipefail
 root=$(mktemp -d)
 installer=${1:-target/docker-package/tier/deploy/setup.sh}
 cleanup() {
+    if [[ -f "$root/rejected" ]]; then cat "$root/rejected"; fi
     if [[ -f "$root/install/compose.yml" ]]; then
         sudo docker compose -f "$root/install/compose.yml" logs || true
         sudo docker compose -f "$root/install/compose.yml" down -v || true
@@ -44,7 +45,7 @@ if setup >"$root/rejected" 2>&1; then
     echo 'Installer accepted recovered filesystem data' >&2
     exit 1
 fi
-test -f "$root/disks/primary/lost+found/recovered-file"
+sudo test -f "$root/disks/primary/lost+found/recovered-file"
 test ! -e "$root/install"
 sudo rm "$root/disks/primary/lost+found/recovered-file"
 sudo touch "$root/disks/primary/keep"
