@@ -24,7 +24,7 @@ if [[ -f "$root/deploy/samba-version" ]]; then
         exit 1
     }
 fi
-apt-get install -y --no-install-recommends python3 smartmontools
+apt-get install -y --no-install-recommends smartmontools
 modules=$(smbd -b | awk '$1 == "MODULESDIR:" { print $2 }')
 [[ -d "$modules/vfs" ]]
 if ! id tier >/dev/null 2>&1; then
@@ -38,8 +38,6 @@ install -m 0755 "$module" "$modules/vfs/tier.so"
 install -d -m 0755 /usr/local/share/tier/web
 cp -r "$root/web/." /usr/local/share/tier/web/
 install -m 0644 "$root/deploy/tier.service" /etc/systemd/system/tier.service
-install -d -m 0755 /usr/local/libexec
-install -m 0755 "$root/deploy/hardware.py" /usr/local/libexec/tier-hardware.py
 install -m 0644 "$root/deploy/"tier-hardware.{service,timer} /etc/systemd/system/
 install -d -m 1770 -o root -g tier /etc/tier
 if [[ -f /etc/tier/config.toml ]]; then

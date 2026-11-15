@@ -11,6 +11,5 @@ check:
 	shellcheck samba/*.sh deploy/*.sh tests/*.sh ci/*.sh
 	shfmt -d -i 4 -ci samba/*.sh deploy/*.sh tests/*.sh ci/*.sh
 	clang-format --dry-run --Werror samba/*.c
-	ruff check --isolated tests/*.py deploy/*.py
-	ruff format --check --isolated tests/*.py deploy/*.py
-	python3 tests/hardware.py
+	ruff check --isolated tests/*.py
+	ruff format --check --isolated tests/*.py

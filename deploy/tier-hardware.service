@@ -4,7 +4,7 @@ After=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /usr/local/libexec/tier-hardware.py
+ExecStart=/usr/local/bin/tier --hardware
 RuntimeDirectory=tier-hardware
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
