@@ -87,10 +87,10 @@ def management(binary, config):
         stderr=subprocess.DEVNULL,
     )
 
-    def api(operation):
+    def api(operation, body=None):
         request = urllib.request.Request(
             f"http://127.0.0.1:{port}/api/{operation}",
-            data=b"{}",
+            data=json.dumps(body or {}).encode(),
             headers={"X-Tier-Request": "1", "Content-Type": "application/json"},
         )
         with urllib.request.urlopen(request, timeout=60) as response:
@@ -244,6 +244,22 @@ map archive = no
             smb_command(f"put {source} archive/file.bin", fail=True)
             smb_command(f"get archive/file.bin {destination}")
             assert destination.read_bytes() == b"archived through SMB\n" * 4096
+            # A successful HTTP response is not proof that an archive is intact.
+            with first.guard:
+                original_first = dict(first.objects)
+                first.objects = {key: b"corrupt" for key in first.objects}
+            smb_command(f"get archive/file.bin {destination}")
+            assert destination.read_bytes() == b"archived through SMB\n" * 4096
+            with second.guard:
+                original_second = dict(second.objects)
+                second.objects = {key: b"corrupt" for key in second.objects}
+            smb_command(f"get archive/file.bin {destination}", fail=True)
+            smb_command(f"get local.bin {destination}")
+            assert destination.read_bytes() == b"archived through SMB\n" * 4096
+            with first.guard:
+                first.objects = original_first
+            with second.guard:
+                second.objects = original_second
             with first.guard:
                 first.fail = True
             smb_command(f"get archive/file.bin {destination}")

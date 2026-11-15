@@ -63,6 +63,25 @@ jobs:
           key: samba-native-${{ steps.debian.outputs.key }}-${{ hashFiles('samba/build.sh', 'samba/wscript_build') }}
       - name: Build, install and test Samba package
         run: docker exec tier-builder bash ci/debian.sh
+      - name: Build and test NAS container
+        run: |
+          mkdir -p target/docker-package
+          tar -xzf "$RUNNER_TEMP/debian/artifacts/tier-debian13-amd64.tar.gz" -C target/docker-package
+          cd target/docker-package/tier
+          TIER_DISKS=/tmp docker compose -p tier-package -f deploy/compose.yml build tier
+          docker tag tier-package-tier tier:test
+          cd ../../..
+          sudo apt-get install -y smbclient
+          bash tests/container.sh
+      - name: Test OpenList archive gateway
+        run: |
+          docker network create tier-archive-test
+          docker network connect tier-archive-test tier-builder
+          docker volume create tier-openlist-data
+          docker run --rm --user 0:0 -v tier-openlist-data:/opt/openlist/data openlistteam/openlist:v4.2.9 admin set tier-test-password
+          docker run -d --name tier-openlist --network tier-archive-test --network-alias openlist --user 0:0 -v tier-openlist-data:/opt/openlist/data openlistteam/openlist:v4.2.9
+          docker exec tier-openlist mkdir -p /archive
+          docker exec -e OPENLIST_URL=http://openlist:5244 tier-builder python3 tests/openlist.py
       - uses: actions/cache/save@v4
         if: always() && steps.samba-cache.outcome == 'success' && steps.samba-cache.outputs.cache-hit != 'true'
         with:
@@ -74,4 +93,8 @@ jobs:
           path: ${{ runner.temp }}/debian/artifacts/*
       - name: Remove test container
         if: always()
-        run: docker rm -f tier-builder || true
+        run: |
+          docker logs tier-openlist || true
+          docker rm -f tier-builder tier-openlist || true
+          docker network rm tier-archive-test || true
+          docker volume rm tier-openlist-data || true
