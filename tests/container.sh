@@ -59,7 +59,7 @@ docker rm "$name"
 docker run -d --name "$name" -e TIER_SMB_ENABLED=0 -p 127.0.0.1:19999:9999 \
     -v "$root/config:/etc/tier" -v "$root/disks:/srv/tier:rslave" tier:test
 for _ in $(seq 1 30); do
-    if curl -fsS http://127.0.0.1:19999/api/health >"$root/health"; then
+    if curl --fail-with-body -sS -H 'X-Tier-Request: 1' http://127.0.0.1:19999/api/health >"$root/health"; then
         break
     fi
     sleep 1
