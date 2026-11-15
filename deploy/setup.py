@@ -289,9 +289,20 @@ def main():
     )
     for attempt in range(60):
         try:
-            with socket.create_connection(("127.0.0.1", 445), timeout=2):
-                break
-        except OSError:
+            run(
+                "docker",
+                "compose",
+                "exec",
+                "-T",
+                "tier",
+                "smbcontrol",
+                "smbd",
+                "ping",
+                cwd=destination,
+                capture_output=True,
+            )
+            break
+        except (OSError, subprocess.CalledProcessError):
             if attempt == 59:
                 raise SystemExit("SMB did not start; inspect docker compose logs")
             time.sleep(1)

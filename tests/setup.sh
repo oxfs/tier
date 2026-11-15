@@ -4,7 +4,7 @@ root=$(mktemp -d)
 installer=${1:-target/docker-package/tier/deploy/setup.sh}
 cleanup() {
     if [[ -f "$root/rejected" ]]; then cat "$root/rejected"; fi
-    if [[ -f "$root/install/compose.yml" ]]; then
+    if sudo test -f "$root/install/compose.yml"; then
         sudo docker compose -f "$root/install/compose.yml" logs || true
         sudo docker compose -f "$root/install/compose.yml" down -v || true
     fi
