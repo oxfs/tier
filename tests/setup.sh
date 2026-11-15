@@ -38,8 +38,15 @@ for disk in primary replica; do
     truncate -s 128M "$root/$disk.img"
     mkfs.ext4 -q "$root/$disk.img"
     sudo mount -o loop "$root/$disk.img" "$root/disks/$disk"
-    sudo rmdir "$root/disks/$disk/lost+found"
 done
+sudo touch "$root/disks/primary/lost+found/recovered-file"
+if setup >"$root/rejected" 2>&1; then
+    echo 'Installer accepted recovered filesystem data' >&2
+    exit 1
+fi
+test -f "$root/disks/primary/lost+found/recovered-file"
+test ! -e "$root/install"
+sudo rm "$root/disks/primary/lost+found/recovered-file"
 sudo touch "$root/disks/primary/keep"
 if setup >"$root/rejected" 2>&1; then
     echo 'Installer accepted existing data' >&2

@@ -77,14 +77,21 @@ def main():
             or not disk.is_mount()
         ):
             parser.error(f"Not a mounted data disk: {disk}")
-        if any(disk.iterdir()):
-            parser.error(f"Disk is not empty: {disk}")
+        for item in disk.iterdir():
+            if (
+                item.name != "lost+found"
+                or item.is_symlink()
+                or not item.is_dir()
+                or any(item.iterdir())
+            ):
+                parser.error(f"Disk is not empty: {disk}")
     if disks[0].stat().st_dev == disks[1].stat().st_dev:
         parser.error("Primary and replica must be separate filesystems")
     ancestors = []
     for disk in disks:
         source = run(
             "findmnt",
+            "--first-only",
             "-n",
             "-o",
             "SOURCE",
@@ -144,7 +151,14 @@ def main():
     )
     for parent in dict.fromkeys(d.parent for d in disks):
         propagation = run(
-            "findmnt", "-n", "-o", "PROPAGATION", "-T", str(parent), capture_output=True
+            "findmnt",
+            "--first-only",
+            "-n",
+            "-o",
+            "PROPAGATION",
+            "-T",
+            str(parent),
+            capture_output=True,
         ).stdout.strip()
         if "shared" not in propagation.split(","):
             parser.error(
@@ -214,6 +228,12 @@ def main():
         f"/mnt/{name}/{disk.name}" for name, disk in zip(("primary", "replica"), disks)
     ]
     for disk in disks:
+        lost_found = disk / "lost+found"
+        if lost_found.exists() or lost_found.is_symlink():
+            if lost_found.is_symlink() or not lost_found.is_dir():
+                raise SystemExit(f"Refusing changed lost+found: {lost_found}")
+            lost_found.rmdir()
+            print(f"Removed empty filesystem directory: {lost_found}")
         os.chown(disk, uid, gid)
         os.chmod(disk, 0o770)
     (config / "config.toml").write_text(
