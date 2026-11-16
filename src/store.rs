@@ -1,4 +1,5 @@
 use crate::{
+    background::RateLimit,
     config::{Backup, Config, validate_relative},
     descriptor::{self, FileAttributes, State},
 };
@@ -79,6 +80,7 @@ pub struct Report {
     pub completed: usize,
     pub changed: usize,
     pub busy: usize,
+    pub interrupted: bool,
     pub errors: Vec<String>,
 }
 
@@ -238,12 +240,13 @@ impl Store {
     }
 
     pub fn read(&self, relative: &Path) -> Result<Reader> {
+        self.interrupt_scan()?;
         let _namespace = self.namespace(false)?;
         if !self.content(relative)?.exists() && !Self::metadata(self.root(), relative)?.is_file() {
             return Err(io::Error::from(io::ErrorKind::NotFound).into());
         }
         let mut lock = self.lock(relative)?;
-        FileExt::try_lock_shared(&lock)?;
+        self.foreground_lock(&lock, false)?;
         let _state = self.state_lock(relative, false)?;
         let state = descriptor::load(&mut lock)?.map(|(_, state)| state);
         drop(_namespace);
@@ -268,6 +271,7 @@ impl Store {
         exclusive: bool,
         truncate: bool,
     ) -> Result<Writer> {
+        self.interrupt_scan()?;
         let _namespace = self.namespace(false)?;
         if !create
             && !self.content(relative)?.exists()
@@ -276,7 +280,7 @@ impl Store {
             return Err(io::Error::from(io::ErrorKind::NotFound).into());
         }
         let mut lock = self.lock(relative)?;
-        FileExt::try_lock_shared(&lock)?;
+        self.foreground_lock(&lock, false)?;
         let _state = self.state_lock(relative, true)?;
         let state = descriptor::load(&mut lock)?.map(|(_, state)| state);
         drop(_namespace);
@@ -512,9 +516,9 @@ impl Store {
         }
         state.retiring.retain(|name| !state.replicas.contains(name));
         if gc || !state.retiring.is_empty() {
-            self.verify_local_content(relative, &state)?;
+            self.verify_local_content(relative, &state, None)?;
             if !plan.archive_due {
-                crate::archive::verify(&self.config, &state)?;
+                crate::archive::verify(&self.config, &state, None)?;
             }
         }
         // Publish local protection before any remote I/O. A failed upload must
@@ -633,6 +637,13 @@ impl Store {
     }
 
     fn scan_with_audit(&self, audit: bool, remote: bool) -> Result<Report> {
+        let Some(scan) = self.begin_scan()? else {
+            return Ok(Report {
+                interrupted: true,
+                ..Report::default()
+            });
+        };
+        let limit = RateLimit::new(self.config.background.audit_bytes_per_sec);
         let namespace = self.namespace(false)?;
         let mut files = BTreeSet::new();
         self.walk(&self.config.primary, Path::new(""), &mut files, true)?;
@@ -647,10 +658,21 @@ impl Store {
             for _ in 0..self.config.background.workers {
                 scope.spawn(|| {
                     loop {
+                        match scan.interrupted() {
+                            Ok(false) => {}
+                            result => {
+                                let mut report = report.lock().unwrap();
+                                report.interrupted = true;
+                                if let Err(error) = result {
+                                    report.errors.push(format!("{error:#}"));
+                                }
+                                break;
+                            }
+                        }
                         let Some(relative) = queue.lock().unwrap().next() else {
                             break;
                         };
-                        let result = self.maintain_file(&relative, audit, remote);
+                        let result = self.maintain_file(&relative, audit, remote, &limit);
                         let mut report = report.lock().unwrap();
                         match result {
                             Ok(MaintenanceOutcome::Changed) => {
@@ -676,6 +698,7 @@ impl Store {
         relative: &Path,
         audit: bool,
         remote: bool,
+        limit: &RateLimit,
     ) -> Result<MaintenanceOutcome> {
         let pending = {
             let _namespace = self.namespace(false)?;
@@ -711,7 +734,7 @@ impl Store {
             (self.reconcile(relative)?, MaintenanceOutcome::Changed)
         } else if audit {
             (
-                self.check_with_remote(relative, remote)?,
+                self.check_with_remote(relative, remote, Some(limit))?,
                 MaintenanceOutcome::Checked,
             )
         } else {
@@ -762,10 +785,15 @@ impl Store {
 
     // Inspection never repairs or deletes: inconsistencies are explicit alerts.
     pub fn check(&self, relative: &Path) -> Result<bool> {
-        self.check_with_remote(relative, true)
+        self.check_with_remote(relative, true, None)
     }
 
-    fn check_with_remote(&self, relative: &Path, remote: bool) -> Result<bool> {
+    fn check_with_remote(
+        &self,
+        relative: &Path,
+        remote: bool,
+        limit: Option<&RateLimit>,
+    ) -> Result<bool> {
         let _namespace = self.namespace(false)?;
         if !self.content(relative)?.exists() && !Self::metadata(self.root(), relative)?.exists() {
             return Ok(false);
@@ -781,14 +809,20 @@ impl Store {
             .context("file has not been replicated")?
             .1;
         drop(_namespace);
-        self.verify(relative, &state, remote)?;
+        self.verify(relative, &state, remote, limit)?;
         Ok(true)
     }
 
-    fn verify(&self, relative: &Path, state: &State, remote: bool) -> Result<()> {
-        self.verify_local_content(relative, state)?;
+    fn verify(
+        &self,
+        relative: &Path,
+        state: &State,
+        remote: bool,
+        limit: Option<&RateLimit>,
+    ) -> Result<()> {
+        self.verify_local_content(relative, state, limit)?;
         if remote {
-            crate::archive::verify(&self.config, state)?;
+            crate::archive::verify(&self.config, state, limit)?;
         }
         for (name, root) in &self.config.replicas {
             self.verify_root(root)?;
@@ -805,11 +839,16 @@ impl Store {
     }
 
     fn verify_content(&self, relative: &Path, state: &State) -> Result<()> {
-        self.verify_local_content(relative, state)?;
-        crate::archive::verify(&self.config, state)
+        self.verify_local_content(relative, state, None)?;
+        crate::archive::verify(&self.config, state, None)
     }
 
-    fn verify_local_content(&self, relative: &Path, state: &State) -> Result<()> {
+    fn verify_local_content(
+        &self,
+        relative: &Path,
+        state: &State,
+        limit: Option<&RateLimit>,
+    ) -> Result<()> {
         let digest = state.digest.as_ref().context("file awaits replication")?;
         let primary = self.content(relative)?;
         ensure!(
@@ -819,7 +858,7 @@ impl Store {
         if state.local_primary.is_none() && primary.exists() {
             let mut file = File::open(primary)?;
             ensure!(
-                checksum(&mut file)? == (digest.clone(), state.size),
+                checksum_limited(&mut file, limit)? == (digest.clone(), state.size),
                 "primary content mismatch"
             );
         }
@@ -832,7 +871,7 @@ impl Store {
             self.verify_root(root)?;
             let mut file = File::open(Self::path(root, relative)?)?;
             ensure!(
-                checksum(&mut file)? == (digest.clone(), state.size),
+                checksum_limited(&mut file, limit)? == (digest.clone(), state.size),
                 "content mismatch on {name}"
             );
         }
@@ -870,6 +909,10 @@ fn now_secs() -> u64 {
 }
 
 pub(crate) fn checksum(file: &mut File) -> Result<(String, u64)> {
+    checksum_limited(file, None)
+}
+
+fn checksum_limited(file: &mut File, limit: Option<&RateLimit>) -> Result<(String, u64)> {
     file.rewind()?;
     let mut digest = Sha256::new();
     let mut buffer = [0; 64 * 1024];
@@ -878,6 +921,9 @@ pub(crate) fn checksum(file: &mut File) -> Result<(String, u64)> {
         let count = file.read(&mut buffer)?;
         if count == 0 {
             break;
+        }
+        if let Some(limit) = limit {
+            limit.consume(count);
         }
         digest.update(&buffer[..count]);
         size += count as u64;

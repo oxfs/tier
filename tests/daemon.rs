@@ -30,6 +30,93 @@ fn wait_until(mut condition: impl FnMut() -> bool) -> Result<()> {
 }
 
 #[test]
+fn foreground_interrupts_at_file_boundaries_and_next_round_retries() -> Result<()> {
+    use fs2::FileExt;
+    let root = tempfile::tempdir()?;
+    let primary = root.path().join("primary");
+    let replica = root.path().join("replica");
+    fs::create_dir(&primary)?;
+    fs::create_dir(&replica)?;
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "primary={primary:?}\n[replicas]\na={replica:?}\n[[backup]]\npath=''\ncount=1\ngc=true\n[background]\nworkers=2\nscan_interval_secs=1\naudit_interval_secs=3600\narchive_audit_interval_secs=3600\naudit_bytes_per_sec=262144\n"
+        ),
+    )?;
+    let store = Store::initialize(Config::load(&config)?)?;
+    store.mkdir(Path::new("source"))?;
+    for index in 0..5 {
+        store
+            .write(Path::new(&format!("source/{index}")))?
+            .write_all(&[42; 128 * 1024])?;
+    }
+    assert_eq!(store.scan_pending()?.changed, 5);
+    let log = root.path().join("daemon.log");
+    let _service = Service(
+        Command::new(env!("CARGO_BIN_EXE_tier"))
+            .arg(&config)
+            .env_remove("TIER_WEB_LISTEN")
+            .stderr(fs::File::create(&log)?)
+            .spawn()?,
+    );
+    // Observe both workers through the actual cross-process descriptor locks.
+    wait_until(|| {
+        (0..2).all(|index| {
+            let file = fs::File::open(primary.join(format!(".tier/meta/source/{index}"))).unwrap();
+            FileExt::try_lock_shared(&file)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+        })
+    })?;
+    let started = Instant::now();
+    assert!(
+        store
+            .rename(Path::new("source"), Path::new("moved"))
+            .is_err()
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "foreground waited for audit"
+    );
+    let reports = || -> Vec<serde_json::Value> {
+        fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|r| r["event"] == "archive_audit")
+            .collect()
+    };
+    wait_until(|| !reports().is_empty())?;
+    let first = reports().remove(0);
+    assert_eq!(first["details"]["interrupted"], true);
+    assert_eq!(first["details"]["completed"], 2);
+    assert_eq!(first["details"]["errors"], serde_json::json!([]));
+    store.rename(Path::new("source"), Path::new("moved"))?;
+    // Interrupted audits must not advance the weekly/monthly completion clocks.
+    wait_until(|| {
+        reports()
+            .iter()
+            .any(|r| r["details"]["interrupted"] == false)
+    })?;
+    let final_report = reports().pop().unwrap();
+    assert_eq!(final_report["details"]["completed"], 5);
+    assert_eq!(final_report["details"]["errors"], serde_json::json!([]));
+    for index in 0..5 {
+        let relative = format!("moved/{index}");
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut store.read(Path::new(&relative))?, &mut bytes)?;
+        assert_eq!(bytes, vec![42; 128 * 1024]);
+        store.remove(Path::new(&relative), false)?;
+    }
+    store.remove(Path::new("moved"), true)?;
+    for disk in [&primary, &replica] {
+        assert!(!disk.join("moved").exists());
+        assert!(!disk.join(".tier/meta/moved").exists());
+    }
+    Ok(())
+}
+
+#[test]
 fn service_skips_busy_files_reloads_backup_and_stops_cleanly() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let primary = directory.path().join("primary");

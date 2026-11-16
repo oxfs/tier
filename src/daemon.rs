@@ -40,19 +40,23 @@ pub fn run(path: &Path) -> Result<()> {
             } else {
                 store.scan_pending()?
             };
-            if report.changed > 0 && report.errors.is_empty() {
+            if report.changed > 0 && report.errors.is_empty() && !report.interrupted {
                 interval = Duration::ZERO;
             }
             let mut details = serde_json::to_value(&report)?;
             if audit {
                 if remote {
-                    last_archive_audit = Some(Instant::now());
+                    if !report.interrupted {
+                        last_archive_audit = Some(Instant::now());
+                    }
                     crate::web::record(&health, "audit", &details);
                 }
                 let event = if remote { "archive_audit" } else { "audit" };
                 crate::web::record(&health, event, &details);
                 log(event, &details);
-                last_audit = Some(Instant::now());
+                if !report.interrupted {
+                    last_audit = Some(Instant::now());
+                }
             }
             details["completed"] = report.changed.into();
             crate::web::record(&health, "replicate", &details);

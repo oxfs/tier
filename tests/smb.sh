@@ -110,6 +110,7 @@ test ! -d "$tmp/primary/documents"
 test ! -d "$tmp/primary/renamed"
 test ! -d "$tmp/replica/documents"
 test ! -d "$tmp/replica/renamed"
+python3 "$root/tests/background-smb.py" "$tmp"
 if [[ ${TIER_TEST_CIFS:-0} == 1 ]]; then
     mkdir "$tmp/mount"
     mount -t cifs //127.0.0.1/tier "$tmp/mount" -o port=14447,username=root,password=test-password,vers=3.0,cache=none,actimeo=0,closetimeo=0

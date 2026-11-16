@@ -1,4 +1,5 @@
 use crate::{
+    background::RateLimit,
     config::{ArchiveBackup, ArchiveTarget, Config},
     descriptor::{ArchiveCopy, State},
 };
@@ -29,7 +30,12 @@ impl std::fmt::Display for RemoteBodyRead {
 }
 impl std::error::Error for RemoteBodyRead {}
 
-fn request(target: &ArchiveTarget, method: &str, key: &str) -> Result<ureq::Request> {
+fn request(
+    target: &ArchiveTarget,
+    method: &str,
+    key: &str,
+    rate_limited: bool,
+) -> Result<ureq::Request> {
     ensure!(
         key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()),
         "invalid archive object key"
@@ -39,10 +45,18 @@ fn request(target: &ArchiveTarget, method: &str, key: &str) -> Result<ureq::Requ
         .map_err(|_| anyhow::anyhow!("invalid archive base URL"))?
         .pop_if_empty()
         .push(key);
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout(Duration::from_secs(target.timeout_secs))
-        .build();
+    let timeout = Duration::from_secs(target.timeout_secs);
+    let agent = ureq::AgentBuilder::new().redirects(0);
+    // Audit pacing must not consume the network's timeout budget.
+    let agent = if rate_limited {
+        agent
+            .timeout_connect(timeout)
+            .timeout_read(timeout)
+            .timeout_write(timeout)
+    } else {
+        agent.timeout(timeout)
+    }
+    .build();
     let mut request = agent.request(method, url.as_str());
     if let (Some(user), Some(password)) = (&target.username_env, &target.password_env) {
         let credentials = format!(
@@ -60,7 +74,7 @@ fn request(target: &ArchiveTarget, method: &str, key: &str) -> Result<ureq::Requ
 
 fn download(config: &Config, copy: &ArchiveCopy, digest: &str, size: u64) -> Result<File> {
     let mut file = tempfile::tempfile()?;
-    download_to(config, copy, digest, size, &mut file)?;
+    download_to(config, copy, digest, size, &mut file, None)?;
     file.rewind()?;
     Ok(file)
 }
@@ -71,6 +85,7 @@ fn download_to(
     digest: &str,
     size: u64,
     destination: &mut dyn std::io::Write,
+    limit: Option<&RateLimit>,
 ) -> Result<()> {
     let _permit = permits(config, &copy.target)?;
     let target = config
@@ -82,7 +97,7 @@ fn download_to(
         "archive target endpoint changed"
     );
     remote_call(config, target, || {
-        let response = request(target, "GET", &copy.key)?.call()?;
+        let response = request(target, "GET", &copy.key, limit.is_some())?.call()?;
         let mut source = response
             .into_reader()
             .take(size.checked_add(1).context("archive size overflow")?);
@@ -93,6 +108,9 @@ fn download_to(
             let n = source.read(&mut buffer).map_err(RemoteBodyRead)?;
             if n == 0 {
                 break;
+            }
+            if let Some(limit) = limit {
+                limit.consume(n);
             }
             destination.write_all(&buffer[..n])?;
             hash.update(&buffer[..n]);
@@ -139,7 +157,7 @@ pub(crate) fn upload(
                 1,
                 Duration::from_secs(target.timeout_secs),
             )?;
-            match download_to(config, &copy, digest, size, &mut std::io::sink()) {
+            match download_to(config, &copy, digest, size, &mut std::io::sink(), None) {
                 Ok(_) => return Ok(()),
                 Err(error)
                     if error.is::<CorruptArchive>()
@@ -152,13 +170,13 @@ pub(crate) fn upload(
             {
                 let _permit = permits(config, name)?;
                 remote_call(config, target, || {
-                    request(target, "PUT", digest)?
+                    request(target, "PUT", digest, false)?
                         .set("Content-Length", &size.to_string())
                         .send(&mut *source)
                         .map_err(Into::into)
                 })?;
             }
-            download_to(config, &copy, digest, size, &mut std::io::sink())?;
+            download_to(config, &copy, digest, size, &mut std::io::sink(), None)?;
             Ok(())
         })();
         if result.is_ok() {
@@ -228,13 +246,20 @@ pub(crate) fn read(config: &Config, state: &State) -> Result<File> {
     bail!("no verified archive copy available")
 }
 
-pub(crate) fn verify(config: &Config, state: &State) -> Result<()> {
+pub(crate) fn verify(config: &Config, state: &State, limit: Option<&RateLimit>) -> Result<()> {
     let digest = state
         .digest
         .as_deref()
         .context("archive has no content digest")?;
     for copy in &state.archives {
-        download_to(config, copy, digest, state.size, &mut std::io::sink())?;
+        download_to(
+            config,
+            copy,
+            digest,
+            state.size,
+            &mut std::io::sink(),
+            limit,
+        )?;
     }
     Ok(())
 }
@@ -404,7 +429,7 @@ mod tests {
     #[test]
     fn interrupted_and_stalled_response_bodies_activate_cooldown() -> Result<()> {
         use std::io::Write;
-        for interrupted in [true, false] {
+        for (interrupted, limited) in [(true, false), (false, false), (true, true), (false, true)] {
             let directory = tempfile::tempdir()?;
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
             let address = listener.local_addr()?;
@@ -435,13 +460,28 @@ mod tests {
                 endpoint: config.archives["remote"].endpoint()?,
                 key: "0".repeat(64),
             };
-            let error =
-                download_to(&config, &copy, &copy.key, 4096, &mut std::io::sink()).unwrap_err();
+            let limit = limited.then(|| RateLimit::new(20 * 1024 * 1024));
+            let error = download_to(
+                &config,
+                &copy,
+                &copy.key,
+                4096,
+                &mut std::io::sink(),
+                limit.as_ref(),
+            )
+            .unwrap_err();
             let _ = release.send(());
             server.join().unwrap();
             assert!(error.is::<RemoteBodyRead>(), "{error:#}");
-            let retry =
-                download_to(&config, &copy, &copy.key, 4096, &mut std::io::sink()).unwrap_err();
+            let retry = download_to(
+                &config,
+                &copy,
+                &copy.key,
+                4096,
+                &mut std::io::sink(),
+                limit.as_ref(),
+            )
+            .unwrap_err();
             assert!(retry.to_string().contains("cooling down"), "{retry:#}");
         }
         Ok(())

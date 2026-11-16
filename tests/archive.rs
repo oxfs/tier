@@ -126,6 +126,30 @@ fn config(root: &Path, servers: &[&Webdav]) -> Config {
 }
 
 #[test]
+fn archive_audit_limits_reads_and_still_checks_the_digest() -> Result<()> {
+    let server = Webdav::start(false);
+    let root = tempfile::tempdir()?;
+    let mut config = config(root.path(), &[&server]);
+    config.background.audit_bytes_per_sec = 128 * 1024;
+    config.archives.get_mut("dav0").unwrap().timeout_secs = 1;
+    let store = Store::initialize(config)?;
+    store
+        .write(Path::new("photo"))?
+        .write_all(&[42; 256 * 1024])?;
+    assert_eq!(store.scan_pending()?.changed, 1);
+    assert_eq!(store.scan_pending()?.changed, 1);
+    assert!(!store.root().join("photo").exists());
+    let started = std::time::Instant::now();
+    let report = store.scan()?;
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(report.completed, 1);
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    server.corrupt.store(true, Ordering::Relaxed);
+    assert_eq!(store.scan()?.errors.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn daemon_reloads_archive_delay_and_retention_without_restart() -> Result<()> {
     use std::{fs, process::Command, time::Instant};
     struct Service(std::process::Child);
