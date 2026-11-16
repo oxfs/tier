@@ -147,12 +147,12 @@ async function maintenance(action, name) {
     const errors = result.errors ?? [];
     noticeType.value = errors.length
       ? "error"
-      : result.busy
+      : result.busy || result.interrupted
         ? "warning"
         : "success";
     notice.value =
       action === "scan"
-        ? `扫描结束：完成 ${result.completed ?? 0} 个，跳过 ${result.busy ?? 0} 个，错误 ${errors.length} 个。${errors.join("；")}`
+        ? `${result.interrupted ? "扫描已中断，可稍后重试" : "扫描结束"}：完成 ${result.completed ?? 0} 个，跳过 ${result.busy ?? 0} 个，错误 ${errors.length} 个。${errors.join("；")}`
         : action === "recover-primary"
           ? `已恢复 ${result.recovered} 个文件。请检查数据后恢复 SMB 访问。`
           : `${labels[action]}完成。`;
@@ -387,6 +387,9 @@ onUnmounted(() => {
                     }}</b></span
                   >
                 </div>
+                <p v-if="status.history[kind].details.interrupted">
+                  本轮已中断，等待下一轮扫描。
+                </p>
                 <p
                   v-for="item in status.history[kind].details.errors"
                   class="failure"

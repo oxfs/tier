@@ -16,8 +16,9 @@ gc = true
 
 [background]
 scan_interval_secs = 60
-audit_interval_secs = 86400
-archive_audit_interval_secs = 604800
+audit_interval_secs = 604800
+archive_audit_interval_secs = 2592000
+audit_bytes_per_sec = 20971520
 workers = 2
 archive_concurrency = 2
 

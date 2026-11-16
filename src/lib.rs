@@ -1,4 +1,5 @@
 mod archive;
+mod background;
 pub mod config;
 mod descriptor;
 #[cfg(target_os = "linux")]

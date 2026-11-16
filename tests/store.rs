@@ -59,6 +59,29 @@ impl Fixture {
 }
 
 #[test]
+fn audit_workers_share_one_read_budget() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut config = fixture.config(true);
+    config.background.workers = 4;
+    config.background.audit_bytes_per_sec = 256 * 1024;
+    let store = Store::initialize(config)?;
+    for index in 0..4 {
+        store
+            .write(Path::new(&format!("file-{index}")))?
+            .write_all(&[42; 64 * 1024])?;
+    }
+    assert_eq!(store.scan_pending()?.changed, 4);
+    let started = std::time::Instant::now();
+    let report = store.scan_local_audit()?;
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(report.completed, 4);
+    assert!(!report.interrupted);
+    // Four files with two retained copies total 512 KiB, regardless of workers.
+    assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+    Ok(())
+}
+
+#[test]
 fn returning_replica_gets_missing_metadata_without_recopying_content() -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let fixture = Fixture::new()?;

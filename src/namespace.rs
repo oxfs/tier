@@ -42,7 +42,7 @@ impl Store {
             .truncate(false)
             .open(path)?;
         if exclusive {
-            FileExt::try_lock_exclusive(&file)?;
+            self.foreground_lock(&file, true)?;
         } else {
             FileExt::lock_shared(&file)?;
             ensure!(
@@ -189,7 +189,7 @@ impl Store {
     }
 
     pub(crate) fn affected_locks(&self, relative: &Path) -> Result<Vec<File>> {
-        fn collect(path: &Path, locks: &mut Vec<File>) -> Result<()> {
+        fn collect(store: &Store, path: &Path, locks: &mut Vec<File>) -> Result<()> {
             if !path.exists() {
                 return Ok(());
             }
@@ -197,18 +197,18 @@ impl Store {
             ensure!(!kind.is_symlink(), "symlink in affected metadata");
             if kind.is_dir() {
                 for entry in fs::read_dir(path)? {
-                    collect(&entry?.path(), locks)?;
+                    collect(store, &entry?.path(), locks)?;
                 }
             } else {
                 ensure!(kind.is_file(), "non-file affected metadata");
                 let file = OpenOptions::new().read(true).write(true).open(path)?;
-                FileExt::try_lock_exclusive(&file)?;
+                store.foreground_lock(&file, true)?;
                 locks.push(file);
             }
             Ok(())
         }
         let mut locks = Vec::new();
-        collect(&Self::metadata(self.root(), relative)?, &mut locks)?;
+        collect(self, &Self::metadata(self.root(), relative)?, &mut locks)?;
         Ok(locks)
     }
 
@@ -235,7 +235,7 @@ impl Store {
             return Err(io::Error::from(io::ErrorKind::NotFound).into());
         }
         let mut lock = self.lock(relative)?;
-        FileExt::try_lock_shared(&lock)?;
+        self.foreground_lock(&lock, false)?;
         let _state = self.state_lock(relative, false)?;
         let identity = lock.metadata()?.ino();
         let state = descriptor::load(&mut lock)?.map(|(_, state)| state);
@@ -307,6 +307,7 @@ impl Store {
     }
 
     pub fn mkdir(&self, relative: &Path) -> Result<()> {
+        self.interrupt_scan()?;
         validate_relative(relative)?;
         let _namespace = self.namespace(true)?;
         self.recover_namespace()?;
@@ -319,6 +320,7 @@ impl Store {
     }
 
     pub fn rename(&self, source: &Path, destination: &Path) -> Result<()> {
+        self.interrupt_scan()?;
         validate_relative(source)?;
         validate_relative(destination)?;
         ensure!(
@@ -377,6 +379,7 @@ impl Store {
     }
 
     pub fn remove(&self, relative: &Path, directory: bool) -> Result<()> {
+        self.interrupt_scan()?;
         self.verify_storage()?;
         validate_relative(relative)?;
         ensure!(!relative.as_os_str().is_empty(), "cannot remove root");

@@ -26,6 +26,7 @@ pub struct Background {
     pub scan_interval_secs: u64,
     pub audit_interval_secs: u64,
     pub archive_audit_interval_secs: u64,
+    pub audit_bytes_per_sec: u64,
 }
 impl Default for Background {
     fn default() -> Self {
@@ -33,8 +34,9 @@ impl Default for Background {
             workers: 2,
             archive_concurrency: 2,
             scan_interval_secs: 60,
-            audit_interval_secs: 86400,
-            archive_audit_interval_secs: 604800,
+            audit_interval_secs: 604800,
+            archive_audit_interval_secs: 2592000,
+            audit_bytes_per_sec: 20 * 1024 * 1024,
         }
     }
 }
@@ -110,6 +112,10 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.background.audit_bytes_per_sec > 0,
+            "audit rate must be positive"
+        );
         ensure!(
             self.background.workers > 0 && self.background.archive_concurrency > 0,
             "concurrency must be positive"
