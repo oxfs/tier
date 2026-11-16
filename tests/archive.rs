@@ -131,6 +131,7 @@ fn archive_audit_limits_reads_and_still_checks_the_digest() -> Result<()> {
     let root = tempfile::tempdir()?;
     let mut config = config(root.path(), &[&server]);
     config.background.audit_bytes_per_sec = 128 * 1024;
+    config.archives.get_mut("dav0").unwrap().timeout_secs = 1;
     let store = Store::initialize(config)?;
     store
         .write(Path::new("photo"))?
