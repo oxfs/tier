@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A missing replica must not interrupt healthy primary SMB access."""
+"""Exercise SMB handle lifetimes and access during replica outages."""
 
 import multiprocessing
 import select
@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from samba.credentials import Credentials
+from samba.dcerpc import security
 from samba.samba3 import libsmb_samba_internal as libsmb
 from samba.samba3 import param
 
@@ -32,6 +33,22 @@ class ForwardServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+def check_delete_on_close(connection):
+    path = "copy-retry"
+    access = security.SEC_STD_DELETE | security.SEC_FILE_WRITE_DATA
+    handle = connection.create(path, DesiredAccess=access, CreateDisposition=2)
+    connection.write(handle, b"\0", 4095)
+    connection.delete_on_close(handle, True)
+    connection.close(handle)
+
+    # FILE_CREATE fails if the abandoned allocation is still present.
+    handle = connection.create(path, DesiredAccess=access, CreateDisposition=2)
+    connection.write(handle, b"replacement data", 0)
+    connection.close(handle)
+    assert connection.loadfile(path) == b"replacement data"
+    connection.unlink(path)
+
+
 def main():
     replica = Path(sys.argv[1])
     disconnected = replica.with_name("detached-replica")
@@ -50,6 +67,7 @@ def main():
             credentials.set_password("test-password")
             credentials.set_domain("WORKGROUP")
             connection = libsmb.Conn("127.0.0.2", "tier", settings, credentials)
+            check_delete_on_close(connection)
             handle = connection.create(
                 "detach-test", DesiredAccess=0x0012019F, CreateDisposition=3
             )
