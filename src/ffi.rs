@@ -233,9 +233,14 @@ unsafe extern "C" fn tier_remove(
     store: *const Store,
     name: *const libc::c_char,
     directory: bool,
+    owner: *const Handle,
 ) -> i32 {
     call(|| {
-        unsafe { &*store }.remove(unsafe { path(name) }, directory)?;
+        let lock = unsafe { owner.as_ref() }.map(|handle| match handle {
+            Handle::Read(reader) => &reader.lock,
+            Handle::Write(writer) => &writer.lock,
+        });
+        unsafe { &*store }.remove_locked(unsafe { path(name) }, directory, lock)?;
         Ok(0)
     })
 }

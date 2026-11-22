@@ -23,11 +23,11 @@ pub struct Store {
 // The lock lives at least as long as the content fd, including caller reads.
 pub struct Reader {
     file: File,
-    _lock: File,
+    pub(crate) lock: File,
 }
 pub struct Writer {
     file: File,
-    _lock: File,
+    pub(crate) lock: File,
 }
 
 impl AsRawFd for Reader {
@@ -255,7 +255,7 @@ impl Store {
             Some(state) => self.read_content(relative, state)?,
             None => File::open(primary)?,
         };
-        Ok(Reader { file, _lock: lock })
+        Ok(Reader { file, lock })
     }
 
     // All modifications must go through this entry, including after primary GC.
@@ -324,7 +324,7 @@ impl Store {
             .truncate(truncate)
             .open(&primary)?;
         FileExt::lock_shared(&lock)?;
-        Ok(Writer { file, _lock: lock })
+        Ok(Writer { file, lock })
     }
 
     pub(crate) fn local_content(&self, relative: &Path, state: Option<&State>) -> Result<PathBuf> {
@@ -982,6 +982,42 @@ pub(crate) fn copy_file(source: &mut File, destination: &Path, root: &Path) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_handle_cannot_delete_a_different_or_busy_file() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let primary = temporary.path().join("primary");
+        fs::create_dir(&primary)?;
+        let store = Store::initialize(toml::from_str(&format!(
+            "primary={primary:?}\n[replicas]\n[[backup]]\npath=''\ncount=1\n"
+        ))?)?;
+        let path = Path::new("file");
+        let closing = store.write(path)?;
+        let other = store.write(Path::new("other"))?;
+        assert_eq!(
+            store
+                .remove_locked(path, false, Some(&other.lock))
+                .unwrap_err()
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::raw_os_error),
+            Some(libc::ESTALE)
+        );
+        let reader = store.read(path)?;
+        assert_eq!(
+            store
+                .remove_locked(path, false, Some(&closing.lock))
+                .unwrap_err()
+                .downcast_ref::<io::Error>()
+                .map(io::Error::kind),
+            Some(io::ErrorKind::WouldBlock)
+        );
+        drop(reader);
+        assert!(!store.reconcile(path)?);
+        store.remove_locked(path, false, Some(&closing.lock))?;
+        assert!(!primary.join(path).exists());
+        assert!(primary.join("other").exists());
+        Ok(())
+    }
 
     #[test]
     fn maintenance_assigns_a_local_primary_to_older_gc_descriptors() -> Result<()> {

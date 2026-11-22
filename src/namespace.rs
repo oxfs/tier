@@ -379,13 +379,26 @@ impl Store {
     }
 
     pub fn remove(&self, relative: &Path, directory: bool) -> Result<()> {
+        self.remove_locked(relative, directory, None)
+    }
+
+    pub(crate) fn remove_locked(
+        &self,
+        relative: &Path,
+        directory: bool,
+        closing_lock: Option<&File>,
+    ) -> Result<()> {
         self.interrupt_scan()?;
         self.verify_storage()?;
         validate_relative(relative)?;
         ensure!(!relative.as_os_str().is_empty(), "cannot remove root");
         let _namespace = self.namespace(true)?;
         self.recover_namespace()?;
-        let _files = self.affected_locks(relative)?;
+        let _files = if closing_lock.is_none() {
+            Some(self.affected_locks(relative)?)
+        } else {
+            None
+        };
         let content = self.content(relative)?;
         let metadata = Self::metadata(self.root(), relative)?;
         if directory {
@@ -405,12 +418,30 @@ impl Store {
                 return Err(io::Error::from(io::ErrorKind::NotFound).into());
             }
         }
-        self.commit_namespace(Change {
+        let change = Change {
             source: relative.into(),
             destination: None,
             directory,
             prepared: true,
-        })
+        };
+        if let Some(lock) = closing_lock {
+            ensure!(!directory, "closing handle must refer to a file");
+            let current = fs::symlink_metadata(&metadata)?;
+            let held = lock.metadata()?;
+            if !current.is_file() || (current.dev(), current.ino()) != (held.dev(), held.ino()) {
+                return Err(io::Error::from_raw_os_error(libc::ESTALE).into());
+            }
+            // Convert this open description only. Other handles still block
+            // deletion. flock can drop the shared lock on failed conversion.
+            let result = FileExt::try_lock_exclusive(lock)
+                .map_err(anyhow::Error::from)
+                .and_then(|()| self.commit_namespace(change));
+            if result.is_err() {
+                FileExt::lock_shared(lock)?;
+            }
+            return result;
+        }
+        self.commit_namespace(change)
     }
 
     fn commit_namespace(&self, change: Change) -> Result<()> {

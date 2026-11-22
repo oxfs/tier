@@ -19,7 +19,7 @@ extern int tier_list(const void *, const char *, void **);
 extern int tier_entry(const void *, size_t, char *, size_t);
 extern void tier_list_free(void *);
 extern int tier_mkdir(const void *, const char *);
-extern int tier_remove(const void *, const char *, bool);
+extern int tier_remove(const void *, const char *, bool, const void *);
 extern int tier_rename(const void *, const char *, const char *);
 extern int tier_setattr(const void *, const char *, int,
                         const struct timespec *);
@@ -228,12 +228,41 @@ static int mkdir_at(struct vfs_handle_struct *h, struct files_struct *dir,
   char *path = relative(h, dir, name);
   return path ? tier_mkdir(connection(h)->store, path) : -1;
 }
+struct closing_file {
+  struct vfs_handle_struct *handle;
+  const char *path;
+  const void *owner;
+};
+static struct files_struct *find_closing_file(struct files_struct *fsp,
+                                              void *private_data) {
+  struct closing_file *closing = private_data;
+  if (fsp->conn != closing->handle->conn || !fsp->fsp_flags.is_fsa ||
+      !fsp->fsp_flags.delete_on_close)
+    return NULL;
+  struct opened *opened = VFS_FETCH_FSP_EXTENSION(closing->handle, fsp);
+  if (!opened || !opened->owner || strcmp(opened->path, closing->path) != 0)
+    return NULL;
+  closing->owner = opened->owner;
+  return fsp;
+}
 static int unlink_at(struct vfs_handle_struct *h, struct files_struct *dir,
                      const struct smb_filename *name, int flags) {
   char *path = relative(h, dir, name);
-  return path ? tier_remove(connection(h)->store, path,
-                            (flags & AT_REMOVEDIR) != 0)
-              : -1;
+  if (!path)
+    return -1;
+  bool directory = (flags & AT_REMOVEDIR) != 0;
+  int result = tier_remove(connection(h)->store, path, directory, NULL);
+  if (result == 0 || errno != EAGAIN || directory)
+    return result;
+
+  // Samba unlinks delete-on-close files before closing their data handles.
+  // Retry with only the matching handle's lock eligible for promotion.
+  struct closing_file closing = {.handle = h, .path = path};
+  if (!files_forall(h->conn->sconn, find_closing_file, &closing)) {
+    errno = EAGAIN;
+    return -1;
+  }
+  return tier_remove(connection(h)->store, path, false, closing.owner);
 }
 static int rename_at(struct vfs_handle_struct *h, struct files_struct *srcdir,
                      const struct smb_filename *src,
